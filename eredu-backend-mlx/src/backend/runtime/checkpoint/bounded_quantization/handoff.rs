@@ -16,9 +16,9 @@ impl ConvertedQuantization {
     pub(super) fn new(
         source: RetainedCheckpointSource,
         plan: BoundedQuantizationPlan,
-        store: BoundedQuantizedWeightStore,
+        store: QuantizedCheckpoint,
     ) -> Self {
-        let report = store.report().clone();
+        let (store, report) = store.into_parts();
         Self {
             source,
             plan,

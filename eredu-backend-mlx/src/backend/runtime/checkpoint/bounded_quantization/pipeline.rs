@@ -3,51 +3,20 @@ use super::{
     layout::{BoundedAllocatorCache, OutputLayout, OutputShard},
     preflight::{quantization_error, report_source_bytes},
 };
-mod producer;
 pub(super) mod controls;
+mod producer;
 use controls::{PipelineAdmissionError, TileWindow};
 use producer::{OrdinaryTileProducer, TileCompletion, TileProducer};
 
-/// A source checkpoint overlaid with memory-backed, load-time-quantized weights.
-///
-/// The packed store lives as long as this value. Runtime acquisitions of
-/// transformed keys use bounded in-memory leases; all other keys delegate to
-/// the original store.
-pub struct BoundedQuantizedWeightStore {
-    source: eredu_checkpoint::store::RetainedCheckpointSource,
-    transformed: MemoryWeightStore,
-    transformed_keys: BTreeSet<String>,
-    materialized_source_keys: BTreeSet<String>,
-    materialized_source_shards: BTreeSet<PathBuf>,
+/// A completed quantization result and its conversion telemetry.
+#[derive(Debug)]
+pub struct QuantizedCheckpoint {
+    source: eredu_checkpoint::store::MaterializedCheckpointSource,
     report: WeightMaterializationReport,
 }
-
-impl std::fmt::Debug for BoundedQuantizedWeightStore {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BoundedQuantizedWeightStore")
-            .field(
-                "backend",
-                &self
-                    .source
-                    .source_diagnostics()
-                    .map(|report| report.backend),
-            )
-            .field("transformed_keys", &self.transformed_keys)
-            .field("report", &self.report)
-            .finish_non_exhaustive()
-    }
-}
-
-impl BoundedQuantizedWeightStore {
-    /// Executes `plan` without materializing a complete dense source matrix.
-    ///
-    /// Conversion runs on the supplied stream's device, allowing model loads
-    /// to use the accelerator quantizer while retaining CPU fallback. Source
-    /// and packed tile storage remain covered by the admitted working set.
-    ///
-    /// A second same-device stream is used only when two minimum tiles fit the
-    /// admitted bound.
+impl QuantizedCheckpoint {
+    /// Execute bounded conversion on the supplied stream's device. A second
+    /// same-device stream is used when two minimum tiles fit the working set.
     pub fn create(
         source: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         plan: BoundedQuantizationPlan,
@@ -57,15 +26,22 @@ impl BoundedQuantizedWeightStore {
             .allocate_ordinary(conversion_stream)?
             .materialize(conversion_stream)
     }
-
-    /// Returns conversion telemetry captured before runtime materialization.
+    /// The backend-neutral completed checkpoint source.
+    pub fn source(&self) -> &eredu_checkpoint::store::MaterializedCheckpointSource {
+        &self.source
+    }
+    /// Conversion telemetry recorded by the shared tile driver.
     pub const fn report(&self) -> &WeightMaterializationReport {
         &self.report
     }
-
-    /// Returns whether `key` is supplied by the packed overlay.
-    pub fn is_transformed(&self, key: &str) -> bool {
-        self.transformed_keys.contains(key)
+    /// Move the completed checkpoint and telemetry into model preparation.
+    pub fn into_parts(
+        self,
+    ) -> (
+        eredu_checkpoint::store::MaterializedCheckpointSource,
+        WeightMaterializationReport,
+    ) {
+        (self.source, self.report)
     }
 }
 
@@ -73,7 +49,7 @@ impl super::preparation::PreparedQuantization {
     pub(crate) fn materialize(
         self,
         conversion_stream: &Stream,
-    ) -> Result<BoundedQuantizedWeightStore, Error> {
+    ) -> Result<QuantizedCheckpoint, Error> {
         self.materialize_with_plan(conversion_stream)
             .map(|(store, _)| store)
     }
@@ -91,7 +67,7 @@ impl super::preparation::PreparedQuantization {
     fn materialize_with_plan(
         self,
         conversion_stream: &Stream,
-    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), Error> {
+    ) -> Result<(QuantizedCheckpoint, BoundedQuantizationPlan), Error> {
         let device = conversion_stream.get_device()?;
         let device_type = device.get_type()?;
         if self.workspace
@@ -116,7 +92,7 @@ impl super::preparation::PreparedQuantization {
         self,
         device_type: safemlx::DeviceType,
         producer: &mut P,
-    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), P::Error> {
+    ) -> Result<(QuantizedCheckpoint, BoundedQuantizationPlan), P::Error> {
         self.validate_workspace(device_type)?;
         let allocator_cache = BoundedAllocatorCache::new(self.plan.max_working_set_bytes);
         self.materialize_with_controls(producer, allocator_cache)
@@ -130,14 +106,18 @@ impl super::preparation::PreparedQuantization {
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         device_type: safemlx::DeviceType,
         producer: &mut P,
-    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), PipelineAdmissionError<P::Error>> {
+    ) -> Result<(QuantizedCheckpoint, BoundedQuantizationPlan), PipelineAdmissionError<P::Error>>
+    {
         self.validate_workspace(device_type)
             .map_err(|cause| PipelineAdmissionError::Producer(P::Error::from(cause)))?;
-        let controls = controls::required_bytes::<P::Completion>()
-            .map_err(PipelineAdmissionError::Policy)?;
+        let controls =
+            controls::required_bytes::<P::Completion>().map_err(PipelineAdmissionError::Policy)?;
         let allocator_cache = BoundedAllocatorCache::prepare_original(
-            pool, self.plan.max_working_set_bytes, controls,
-        ).map_err(PipelineAdmissionError::Admission)?;
+            pool,
+            self.plan.max_working_set_bytes,
+            controls,
+        )
+        .map_err(PipelineAdmissionError::Admission)?;
         self.materialize_with_controls(producer, allocator_cache)
             .map_err(PipelineAdmissionError::Producer)
     }
@@ -157,13 +137,12 @@ impl super::preparation::PreparedQuantization {
         self,
         producer: &mut P,
         mut allocator_cache: BoundedAllocatorCache,
-    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), P::Error> {
+    ) -> Result<(QuantizedCheckpoint, BoundedQuantizationPlan), P::Error> {
         let Self {
             workspace: _,
             source,
             plan,
             mut output_shards,
-            transformed_keys,
             materialized_source_keys,
             materialized_source_shards,
         } = self;
@@ -191,9 +170,11 @@ impl super::preparation::PreparedQuantization {
         while !pending_tiles.is_empty() {
             write_oldest_tile(&mut pending_tiles, &mut output_shards, &mut allocator_cache)?;
         }
-        debug_assert!(output_shards
-            .iter()
-            .all(|shard| shard.sealed && shard.pending_tiles == 0));
+        debug_assert!(
+            output_shards
+                .iter()
+                .all(|shard| shard.sealed && shard.pending_tiles == 0)
+        );
         allocator_cache.finish()?;
 
         let transformed = MemoryWeightStore::from_buffers(
@@ -201,204 +182,17 @@ impl super::preparation::PreparedQuantization {
         )
         .map_err(|cause| Error::Other(Box::new(cause)))?;
         Ok((
-            BoundedQuantizedWeightStore {
-                source,
-                transformed,
-                transformed_keys,
-                materialized_source_keys,
-                materialized_source_shards,
+            QuantizedCheckpoint {
+                source: eredu_checkpoint::store::MaterializedCheckpointSource::new(
+                    source,
+                    transformed,
+                    materialized_source_keys,
+                    materialized_source_shards,
+                ),
                 report,
             },
             plan,
         ))
-    }
-}
-
-impl CheckpointSource for BoundedQuantizedWeightStore {
-    fn prepare_encoded_read(
-        &self,
-        keys: &[String],
-    ) -> Result<Option<eredu_checkpoint::store::EncodedReadBatch>, StoreError> {
-        // A batch has one exact retained source, matching the existing composed
-        // source contract. Per-binding materialization reaches one of these.
-        if keys.iter().all(|key| self.is_transformed(key)) {
-            self.transformed.prepare_encoded_read(keys)
-        } else if keys.iter().all(|key| !self.is_transformed(key)) {
-            self.source.prepare_encoded_read(keys)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn source_lease_controls<'a>(
-        &'a self,
-        key: &'a str,
-    ) -> Result<
-        eredu_checkpoint::store::SourceLeaseControls<'a>,
-        eredu_checkpoint::store::LeaseControlBorrowError<'a>,
-    > {
-        if self.is_transformed(key) {
-            self.transformed.source_lease_controls(key)
-        } else {
-            self.source.source_lease_controls(key)
-        }
-    }
-
-    fn source_metadata_borrowed(
-        &self,
-        key: &str,
-    ) -> eredu_checkpoint::store::SourceMetadataLoan<'_> {
-        if self.is_transformed(key) {
-            self.transformed.source_metadata_borrowed(key)
-        } else {
-            self.source.source_metadata_borrowed(key)
-        }
-    }
-    fn source_key_authority_borrowed(
-        &self,
-        key: &str,
-    ) -> Result<
-        eredu_checkpoint::store::SourceKeyAuthority,
-        eredu_checkpoint::store::SourceMetadataBorrowError<'_>,
-    > {
-        use eredu_checkpoint::store::SourceKeyAuthority;
-        Ok(if self.is_transformed(key) {
-            SourceKeyAuthority::Materialized
-        } else {
-            SourceKeyAuthority::Ordinary
-        })
-    }
-
-    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
-        match (
-            self.source.source_storage_slot_bound()?,
-            self.transformed.source_storage_slot_bound()?,
-        ) {
-            (Some(source), Some(transformed)) => source
-                .checked_add(transformed)
-                .map(Some)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: "transformed source storage slots".into(),
-                }),
-            _ => Ok(None),
-        }
-    }
-
-    fn visit_source_storage(
-        &self,
-        visitor: &mut dyn FnMut(eredu_checkpoint::store::SourceStorageRef<'_>),
-    ) -> Result<bool, StoreError> {
-        // Hidden original owners remain live beneath the overlay. Visit both
-        // physical branches even when one reports incomplete coverage.
-        let source = self.source.visit_source_storage(visitor)?;
-        let transformed = self.transformed.visit_source_storage(visitor)?;
-        Ok(source && transformed)
-    }
-
-    fn source_storage(&self) -> Result<Option<eredu_checkpoint::store::SourceStorage>, StoreError> {
-        eredu_checkpoint::store::SourceStorage::collect([
-            self.source.as_ref(),
-            &self.transformed as &dyn CheckpointSource,
-        ])
-    }
-
-    fn source_keys(&self) -> Vec<String> {
-        self.source
-            .source_keys()
-            .into_iter()
-            .chain(self.transformed_keys.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    fn materialized_source_keys(&self) -> Vec<String> {
-        self.source
-            .materialized_source_keys()
-            .into_iter()
-            .chain(self.materialized_source_keys.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    fn materialized_source_shards(&self) -> Vec<PathBuf> {
-        self.materialized_source_shards.iter().cloned().collect()
-    }
-
-    fn unclaimed_checkpoint_keys(&self) -> Vec<String> {
-        self.source.unclaimed_checkpoint_keys()
-    }
-
-    fn is_authoritative_materialized_key(&self, key: &str) -> bool {
-        self.is_transformed(key)
-    }
-
-    fn is_checkpoint_contract_resolved(&self) -> bool {
-        self.source.is_checkpoint_contract_resolved()
-    }
-
-    fn source_metadata(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
-        if self.is_transformed(key) {
-            CheckpointSource::source_metadata(&self.transformed, key)
-        } else {
-            self.source.source_metadata(key)
-        }
-    }
-
-    fn source_provenance(
-        &self,
-        key: &str,
-    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, StoreError> {
-        if self.is_transformed(key) {
-            self.transformed.source_provenance(key)
-        } else {
-            self.source.source_provenance(key)
-        }
-    }
-
-    fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
-        if self.is_transformed(&request.key) {
-            CheckpointSource::acquire_lease(&self.transformed, request)
-        } else {
-            self.source.acquire_lease(request)
-        }
-    }
-
-    fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
-        let source = self.source.source_diagnostics()?;
-        let transformed = CheckpointSource::source_diagnostics(&self.transformed)?;
-        let mut touched = source.touched_shard_paths;
-        touched.extend(transformed.touched_shard_paths);
-        touched.sort();
-        touched.dedup();
-        let mut payloads = source.payload_shard_paths;
-        payloads.extend(transformed.payload_shard_paths);
-        payloads.sort();
-        payloads.dedup();
-        Ok(WeightStoreDiagnostics {
-            backend: source.backend,
-            cache_hits: source.cache_hits.saturating_add(transformed.cache_hits),
-            cache_misses: source.cache_misses.saturating_add(transformed.cache_misses),
-            evictions: source.evictions.saturating_add(transformed.evictions),
-            currently_cached_shards: source
-                .currently_cached_shards
-                .saturating_add(transformed.currently_cached_shards),
-            touched_shard_paths: touched,
-            payload_shard_paths: payloads,
-            physical_reads: source
-                .physical_reads
-                .saturating_add(transformed.physical_reads),
-            physical_read_bytes: source
-                .physical_read_bytes
-                .saturating_add(transformed.physical_read_bytes),
-            coalesced_group_hits: source
-                .coalesced_group_hits
-                .saturating_add(transformed.coalesced_group_hits),
-        })
     }
 }
 
@@ -511,7 +305,9 @@ fn transform_target<P: TileProducer>(
                 .checked_add(
                     live_output_row_bytes
                         .checked_mul(batch_rows as u64)
-                        .ok_or_else(|| quantization_error("leading batch live output size overflow"))?,
+                        .ok_or_else(|| {
+                            quantization_error("leading batch live output size overflow")
+                        })?,
                 )
                 .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                 .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
@@ -664,7 +460,11 @@ fn submit_quantization_tile<P: TileProducer>(
         planned_working_set_bytes,
     )?;
     let (completion, source_bytes) = producer.submit(
-        source, recipe, target, quantization, report.source_tiles % tile_buffers,
+        source,
+        recipe,
+        target,
+        quantization,
+        report.source_tiles % tile_buffers,
     )?;
     output_shards[output_shard].tile_submitted();
     pending_tiles.push_back(SubmittedQuantizationTile {
@@ -746,7 +546,9 @@ fn prepare_quantized_outputs_with(
     if !matches!(quantization, WeightQuantization::MxFp4) {
         let construction = original
             .and_then(|(layout, observer)| {
-                layout.companion_construction().map(|layout| (layout, observer))
+                layout
+                    .companion_construction()
+                    .map(|layout| (layout, observer))
             })
             .map(|(layout, observer)| {
                 safemlx::OperationEvent::prepare_resident_graph(layout, observer)
@@ -816,9 +618,7 @@ fn write_oldest_tile<C: TileCompletion>(
     Ok(())
 }
 
-fn queued_working_set_bytes<C>(
-    pending_tiles: &TileWindow<C>,
-) -> Result<u64, Error> {
+fn queued_working_set_bytes<C>(pending_tiles: &TileWindow<C>) -> Result<u64, Error> {
     pending_tiles.iter().try_fold(0u64, |total, tile| {
         total
             .checked_add(tile.planned_working_set_bytes)
@@ -879,209 +679,4 @@ fn write_tile(
         .try_copy_native_bytes_into(destination)
         .map_err(|cause| Error::Other(Box::new(cause)))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod provenance_tests {
-    use super::*;
-    #[test]
-    fn borrowed_overlay_metadata_keeps_real_materialized_authority_through_resolved_view() {
-        use eredu_checkpoint::{
-            schema::{
-                CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-                StoredDtypeConstraint,
-            },
-            store::{ResolvedCheckpointSource, SourceKeyAuthority, SourceMetadataBorrowError},
-            validation::resolve_safetensors_plan,
-            StoredDtype,
-        };
-        let source: eredu_checkpoint::store::RetainedCheckpointSource = (Arc::new(
-            MemoryWeightStore::from_safetensors([
-                (
-                    "weight".into(),
-                    SafeDtype::F32,
-                    vec![1],
-                    0.75f32.to_le_bytes().to_vec(),
-                ),
-                (
-                    "unchanged".into(),
-                    SafeDtype::F32,
-                    vec![1],
-                    (-2.5f32).to_le_bytes().to_vec(),
-                ),
-            ])
-            .unwrap(),
-        ))
-        .into();
-        let plan = SafetensorsCheckpointPlan::new(
-            "selected",
-            vec![SafetensorsTensorConstraint::required(
-                "unchanged",
-                vec![1],
-                StoredDtypeConstraint::Exact(StoredDtype::F32),
-            )],
-            Vec::new(),
-            CatalogPolicy::non_strict(),
-        )
-        .unwrap();
-        let contract = resolve_safetensors_plan(source.as_ref(), &plan).unwrap();
-        let overlay = Arc::new(BoundedQuantizedWeightStore {
-            source,
-            transformed: MemoryWeightStore::from_safetensors([(
-                "packed".into(),
-                SafeDtype::U32,
-                vec![1],
-                0x76543210u32.to_le_bytes().to_vec(),
-            )])
-            .unwrap(),
-            transformed_keys: BTreeSet::from(["packed".into()]),
-            materialized_source_keys: BTreeSet::new(),
-            materialized_source_shards: BTreeSet::new(),
-            report: WeightMaterializationReport::default(),
-        });
-        let resolved = ResolvedCheckpointSource::new(overlay.clone(), contract);
-        // This exact transformed memory source must qualify the same original
-        // manager reader; no file descriptor or ordinary lease is substituted.
-        let packed_read = DerivedWeightRecipe::source("packed", TensorSelection::Full)
-            .prepare_encoded_read(&resolved)
-            .unwrap()
-            .unwrap();
-        let mut packed_bytes = [0; 4];
-        eredu_checkpoint::recipe::EncodedRecipeRead::read_many_borrowed_into(
-            std::iter::once(&packed_read),
-            &mut [&mut packed_bytes],
-        )
-        .unwrap();
-        assert_eq!(packed_bytes, 0x76543210u32.to_le_bytes());
-        let unchanged_read = DerivedWeightRecipe::source("unchanged", TensorSelection::Full)
-            .prepare_encoded_read(&resolved)
-            .unwrap()
-            .unwrap();
-        let mut unchanged_bytes = [0; 4];
-        eredu_checkpoint::recipe::EncodedRecipeRead::read_many_borrowed_into(
-            std::iter::once(&unchanged_read),
-            &mut [&mut unchanged_bytes],
-        )
-        .unwrap();
-        assert_eq!(unchanged_bytes, (-2.5f32).to_le_bytes());
-        let packed = overlay
-            .transformed
-            .source_metadata_borrowed("packed")
-            .unwrap();
-        assert!(std::ptr::eq(
-            packed,
-            resolved.source_metadata_borrowed("packed").unwrap()
-        ));
-        let packed_loan = resolved.source_lease_controls("packed").unwrap();
-        assert!(
-            packed_loan.same_entry(&overlay.transformed.source_lease_controls("packed").unwrap())
-        );
-        assert!(!packed_loan.same_entry(&overlay.source.source_lease_controls("weight").unwrap()));
-        assert!(resolved
-            .source_lease_controls("unchanged")
-            .unwrap()
-            .same_entry(&overlay.source.source_lease_controls("unchanged").unwrap()));
-        assert!(matches!(
-            resolved.source_lease_controls("weight"),
-            Err(eredu_checkpoint::store::LeaseControlBorrowError::Source(
-                SourceMetadataBorrowError::UnauthorizedTensor
-            ))
-        ));
-        assert_eq!(packed.stored_dtype, StoredDtype::U32);
-        assert_eq!(resolved.source_metadata("packed").unwrap(), *packed);
-        assert_eq!(
-            resolved.source_key_authority_borrowed("packed").unwrap(),
-            SourceKeyAuthority::Materialized
-        );
-        let unchanged = overlay
-            .source
-            .source_metadata_borrowed("unchanged")
-            .unwrap();
-        assert!(std::ptr::eq(
-            unchanged,
-            resolved.source_metadata_borrowed("unchanged").unwrap()
-        ));
-        for key in ["weight", "absent"] {
-            assert!(matches!(
-                resolved.source_metadata_borrowed(key),
-                Err(SourceMetadataBorrowError::UnauthorizedTensor)
-            ));
-            assert!(matches!(
-                resolved.source_metadata(key),
-                Err(StoreError::UnauthorizedTensor { .. })
-            ));
-        }
-    }
-
-    struct Renamed(MemoryWeightStore);
-    impl CheckpointSource for Renamed {
-        fn source_keys(&self) -> Vec<String> {
-            self.0.source_keys()
-        }
-        fn source_metadata(
-            &self,
-            key: &str,
-        ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
-            self.0.source_metadata(key)
-        }
-        fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
-            self.0.acquire_lease(request)
-        }
-        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
-            self.0.source_diagnostics()
-        }
-        fn source_provenance(
-            &self,
-            key: &str,
-        ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, StoreError> {
-            let mut provenance = self.0.source_provenance(key)?;
-            provenance.physical_tensor = format!("checkpoint.prefix.{key}");
-            provenance.output = format!("selected.{key}");
-            Ok(provenance)
-        }
-    }
-    #[test]
-    fn bounded_overlay_preserves_original_passthrough_and_actual_output_provenance() {
-        let source: eredu_checkpoint::store::RetainedCheckpointSource = (Arc::new(Renamed(
-            MemoryWeightStore::from_safetensors(["weight", "unchanged"].map(|key| {
-                (
-                    key.to_owned(),
-                    SafeDtype::F32,
-                    vec![1],
-                    0.75f32.to_le_bytes().to_vec(),
-                )
-            }))
-            .unwrap(),
-        )))
-        .into();
-        let transformed = MemoryWeightStore::from_safetensors([(
-            "weight".to_owned(),
-            SafeDtype::U32,
-            vec![1],
-            0x76543210u32.to_le_bytes().to_vec(),
-        )])
-        .unwrap();
-        let expected_output = transformed.source_provenance("weight").unwrap();
-        let expected_passthrough = source.source_provenance("unchanged").unwrap();
-        let overlay = BoundedQuantizedWeightStore {
-            source,
-            transformed,
-            transformed_keys: BTreeSet::from(["weight".to_owned()]),
-            materialized_source_keys: BTreeSet::new(),
-            materialized_source_shards: BTreeSet::new(),
-            report: WeightMaterializationReport::default(),
-        };
-        assert_eq!(
-            overlay.source_provenance("unchanged").unwrap(),
-            expected_passthrough
-        );
-        assert_eq!(
-            overlay.source_provenance("weight").unwrap(),
-            expected_output
-        );
-        assert_eq!(
-            overlay.source_provenance("weight").unwrap().source_encoding,
-            eredu_checkpoint::SourceTensorEncoding::Safetensors(eredu_checkpoint::StoredDtype::U32)
-        );
-    }
 }

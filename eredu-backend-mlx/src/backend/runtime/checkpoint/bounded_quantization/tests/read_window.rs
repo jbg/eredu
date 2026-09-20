@@ -81,7 +81,7 @@ fn rejected_row_and_leading_candidates_never_acquire_payloads() {
         )
         .unwrap();
         let transformed =
-            BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+            QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
         assert_eq!(transformed.report().source_tiles, tiles);
         assert_eq!(transformed.report().peak_in_flight_tiles, slots);
         assert!(transformed.report().peak_planned_working_set_bytes <= budget);
@@ -91,7 +91,7 @@ fn rejected_row_and_leading_candidates_never_acquire_payloads() {
             *source.requests.lock().unwrap(),
             vec![max_source_bytes; tiles * 2]
         );
-        let lease = transformed
+        let lease = transformed.source()
             .acquire_lease(TensorReadRequest {
                 key: "model.proj.weight".into(),
                 selection: TensorSelection::Full,
@@ -121,7 +121,7 @@ fn bounded_read_refusal_survives_a_pending_conversion() {
             [direct_test_target("model.proj.weight")],
         )
         .unwrap();
-        let error = BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream())
+        let error = QuantizedCheckpoint::create(source.clone(), plan, context.stream())
             .unwrap_err();
         assert_eq!(*source.requests.lock().unwrap(), vec![256; refused]);
         let cause = match &error {

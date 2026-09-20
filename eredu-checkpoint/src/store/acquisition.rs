@@ -19,6 +19,7 @@ pub(super) enum Route<'a> {
     Prepared(&'a PreparedCheckpointSource),
     Restricted(&'a RestrictedCheckpointSource),
     Composite(&'a CompositeCheckpointSource),
+    Materialized(&'a MaterializedCheckpointSource),
     Resolved(&'a ResolvedCheckpointSource),
 }
 impl<'a> PreparedAcquisitionSource<'a> {
@@ -222,6 +223,10 @@ fn step_route<'a>(route: Route<'a>, request: &TensorReadRequest) -> Result<Step<
         Route::Safetensors(store) => Step::Leaf(Leaf::Safetensors(store)),
         Route::Memory(store) => Step::Leaf(Leaf::Memory(store)),
         Route::Gguf(store) => Step::Leaf(Leaf::Gguf(store)),
+        Route::Materialized(owner) => Step::Child {
+            source: owner.source_for(&request.key).as_ref(),
+            validate: None,
+        },
         Route::Prepared(owner) => {
             owner.expected(&request.key)?;
             Step::Child {

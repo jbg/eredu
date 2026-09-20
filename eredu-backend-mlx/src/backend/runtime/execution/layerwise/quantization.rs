@@ -388,13 +388,13 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    let transformed = QuantizedCheckpoint::create(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: RetainedCheckpointSource = transformed.into();
+    )?;
+    let (transformed, report) = transformed.into_parts();
+    let transformed: RetainedCheckpointSource = Arc::new(transformed).into();
     Ok((transformed, report))
 }
 
@@ -505,13 +505,13 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    let transformed = QuantizedCheckpoint::create(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: RetainedCheckpointSource = transformed.into();
+    )?;
+    let (transformed, report) = transformed.into_parts();
+    let transformed: RetainedCheckpointSource = Arc::new(transformed).into();
     Ok((transformed, report))
 }
 
@@ -755,13 +755,13 @@ where
         .collect::<Result<Vec<_>, Error>>()?;
     let working_set_bytes =
         bounded_quantization_working_set(store.as_ref(), &targets, quantization)?;
-    let transformed = Arc::new(BoundedQuantizedWeightStore::create(
+    let transformed = QuantizedCheckpoint::create(
         store,
         BoundedQuantizationPlan::new(quantization, working_set_bytes, targets)?,
         stream,
-    )?);
-    let report = transformed.report().clone();
-    let transformed: RetainedCheckpointSource = transformed.into();
+    )?;
+    let (transformed, report) = transformed.into_parts();
+    let transformed: RetainedCheckpointSource = Arc::new(transformed).into();
     Ok((transformed, report))
 }
 

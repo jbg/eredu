@@ -122,7 +122,8 @@ fn companion_cast_minimum_precedes_output_allocation_and_source_reads() {
     }
 }
 
-fn check_outputs(store: &BoundedQuantizedWeightStore, rows: usize, dtype: &RecipeDtype) {
+fn check_outputs(result: &QuantizedCheckpoint, rows: usize, dtype: &RecipeDtype) {
+    let store = result.source();
     for (name, expected) in [
         (
             "model.proj.weight",
@@ -177,7 +178,7 @@ fn companion_cast_tiles_preserve_precision_and_count_live_original_outputs() {
             BoundedQuantizationPlan::new(AffineQuantization::default(), one_row_peak * 2, [target])
                 .unwrap();
         let result =
-            BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+            QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
         assert_eq!(result.report().source_tiles, 8);
         assert_eq!(result.report().peak_in_flight_tiles, 2);
         assert_eq!(
@@ -213,7 +214,7 @@ fn companion_cast_sizing_covers_complete_leading_and_row_candidates() {
         )
         .unwrap();
         let result =
-            BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+            QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
         assert_eq!(result.report().source_tiles, tiles, "{shape:?}, {budget}");
         assert_eq!(result.report().peak_in_flight_tiles, slots);
         assert_eq!(result.report().peak_planned_working_set_bytes, peak);

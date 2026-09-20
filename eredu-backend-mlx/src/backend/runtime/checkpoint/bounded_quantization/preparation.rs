@@ -1,7 +1,7 @@
 //! Cold source and geometry preflight and final output allocation before conversion.
 use super::layout::{output_layouts, OutputLayout, OutputShard};
 use super::preflight::{
-    checked_product, output_names_for, preflight_source_collisions, quantization_error,
+    checked_product, preflight_source_collisions, quantization_error,
 };
 use super::workspace::QuantizerWorkspace;
 use super::*;
@@ -37,7 +37,6 @@ pub(crate) struct ColdQuantization {
     source: eredu_checkpoint::store::RetainedCheckpointSource,
     plan: BoundedQuantizationPlan,
     targets: Vec<TargetOutputs>,
-    transformed_keys: BTreeSet<String>,
     materialized_source_keys: BTreeSet<String>,
     materialized_source_shards: BTreeSet<PathBuf>,
 }
@@ -48,7 +47,6 @@ pub(crate) struct PreparedQuantization {
     pub(super) source: eredu_checkpoint::store::RetainedCheckpointSource,
     pub(super) plan: BoundedQuantizationPlan,
     pub(super) output_shards: Vec<OutputShard>,
-    pub(super) transformed_keys: BTreeSet<String>,
     pub(super) materialized_source_keys: BTreeSet<String>,
     pub(super) materialized_source_shards: BTreeSet<PathBuf>,
 }
@@ -108,18 +106,15 @@ impl ColdQuantization {
                 materialized_source_shards.insert(path);
             }
         }
-        let mut transformed_keys = BTreeSet::new();
         let mut targets = Vec::with_capacity(plan.targets.len());
         for target in &plan.targets {
             targets.push(prepare_target(source.as_ref(), target, &plan, workspace)?);
-            transformed_keys.extend(output_names_for(target, plan.quantization)?);
         }
         Ok(Self {
             workspace,
             source,
             plan,
             targets,
-            transformed_keys,
             materialized_source_keys,
             materialized_source_shards,
         })
@@ -208,7 +203,6 @@ impl ColdQuantization {
             source: qualified.source,
             plan: qualified.plan,
             output_shards,
-            transformed_keys: qualified.transformed_keys,
             materialized_source_keys: qualified.materialized_source_keys,
             materialized_source_shards: qualified.materialized_source_shards,
         })

@@ -162,7 +162,7 @@ fn exercise(
     )
     .unwrap();
     let ordinary =
-        BoundedQuantizedWeightStore::create(source.clone(), plan.clone(), &streams[0]).unwrap();
+        QuantizedCheckpoint::create(source.clone(), plan.clone(), &streams[0]).unwrap();
     let prepared = ColdQuantization::prepare(source.into(), plan)
         .unwrap()
         .allocate_ordinary(&streams[0])
@@ -222,8 +222,8 @@ fn exercise(
             (format!("scales{target}"), expected_scales),
             (format!("biases{target}"), expected_biases),
         ] {
-            assert_eq!(bytes(&result, &key), expected);
-            assert_eq!(bytes(&ordinary, &key), expected);
+            assert_eq!(bytes(result.source(), &key), expected);
+            assert_eq!(bytes(ordinary.source(), &key), expected);
         }
     }
 }
@@ -655,15 +655,15 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                         .to_le_bytes()
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(bytes(&result, "weight"), expected_words);
+                assert_eq!(bytes(result.source(), "weight"), expected_words);
                 assert_eq!(
-                    bytes(&result, "scales"),
+                    bytes(result.source(), "scales"),
                     (0..16)
                         .flat_map(|_| encode(companion_dtype, -1.0))
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
-                    bytes(&result, "biases"),
+                    bytes(result.source(), "biases"),
                     (0..16)
                         .flat_map(|_| encode(companion_dtype, 15.0))
                         .collect::<Vec<_>>()
@@ -673,7 +673,17 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                     pool.used_bytes() == Ok(with_outputs)
                 });
                 assert_eq!(pool.used_bytes().unwrap(), with_outputs);
-                drop(result);
+                let (source, _) = result.into_parts();
+                let source = Arc::new(source).into();
+                let keys = [String::from("weight")];
+                let read = eredu_checkpoint::store::MemoryEncodedReadPlan::from_source(&source, &keys)
+                    .unwrap().unwrap().construct(()).unwrap();
+                drop(source);
+                let mut output = vec![0; expected_words.len()];
+                read.read_into(&mut output).unwrap();
+                assert_eq!(output, expected_words);
+                assert!(pool.used_bytes().unwrap() > persistent);
+                drop(read);
                 safemlx::reclaim_allocation_owners();
                 assert_eq!(pool.used_bytes().unwrap(), persistent);
             }

@@ -13,6 +13,7 @@ enum Owner {
     RetainedGguf(SourceHandle<crate::gguf_store::GgufWeightStore>),
     RetainedComposite(SourceHandle<CompositeCheckpointSource>),
     Memory(Arc<MemoryWeightStore>),
+    Materialized(Arc<MaterializedCheckpointSource>),
     Safetensors(Arc<SafetensorsWeightStore>),
     Gguf(Arc<crate::gguf_store::GgufWeightStore>),
     Prepared(Arc<PreparedCheckpointSource>),
@@ -60,6 +61,7 @@ impl PreparedAcquisitionOwner {
             Owner::RetainedGguf(owner) => &**owner,
             Owner::RetainedComposite(owner) => &**owner,
             Owner::Memory(owner) => owner.as_ref(),
+            Owner::Materialized(owner) => owner.as_ref(),
             Owner::Safetensors(owner) => owner.as_ref(),
             Owner::Gguf(owner) => owner.as_ref(),
             Owner::RetainedPrepared(owner) => &**owner,
@@ -76,6 +78,7 @@ impl PreparedAcquisitionOwner {
             Owner::RetainedGguf(owner) => Route::Gguf(owner),
             Owner::RetainedComposite(owner) => Route::Composite(owner),
             Owner::Memory(owner) => Route::Memory(owner),
+            Owner::Materialized(owner) => Route::Materialized(owner),
             Owner::Safetensors(owner) => Route::Safetensors(owner),
             Owner::Gguf(owner) => Route::Gguf(owner),
             Owner::RetainedPrepared(owner) => Route::Prepared(owner),
@@ -86,6 +89,9 @@ impl PreparedAcquisitionOwner {
             Owner::Resolved(owner) => Route::Resolved(owner),
         }
     }
+}
+pub(in crate::store) fn owner_materialized(owner: Arc<MaterializedCheckpointSource>) -> PreparedAcquisitionOwner {
+    PreparedAcquisitionOwner(Owner::Materialized(owner))
 }
 pub(in crate::store) fn owner_memory(owner: Arc<MemoryWeightStore>) -> PreparedAcquisitionOwner {
     PreparedAcquisitionOwner(Owner::Memory(owner))
@@ -124,6 +130,7 @@ fn concrete_owner(source: &RetainedCheckpointSource) -> Option<PreparedAcquisiti
 fn stable_recipe_presence(source: &RetainedCheckpointSource) -> Option<bool> {
     match concrete_owner(source)?.route() {
         Route::Unavailable => None,
+        Route::Materialized(_) => Some(false),
         Route::Gguf(_) | Route::Prepared(_) | Route::Memory(_) | Route::Safetensors(_) => {
             Some(true)
         }
@@ -141,6 +148,7 @@ fn stable_recipe_presence(source: &RetainedCheckpointSource) -> Option<bool> {
 fn stable_materialized_key(source: &RetainedCheckpointSource, key: &str) -> Option<bool> {
     match concrete_owner(source)?.route() {
         Route::Unavailable => None,
+        Route::Materialized(owner) => Some(owner.is_materialized(key)),
         Route::Gguf(_) | Route::Memory(_) | Route::Safetensors(_) => Some(false),
         Route::Prepared(owner) => stable_materialized_key(&owner.source, key),
         Route::Resolved(owner) => stable_materialized_key(&owner.source, key),
@@ -190,6 +198,7 @@ impl RetainedGgufRoute {
             let child = match owner.route() {
                 Route::Unavailable => return Ok(None),
                 Route::Gguf(_) => None,
+                Route::Materialized(owner) => Some(owner.source_for(&request.key).clone()),
                 Route::Memory(_) | Route::Safetensors(_) => return Ok(None),
                 Route::Prepared(owner) => {
                     owner.expected(&request.key)?;
@@ -253,7 +262,7 @@ impl RetainedGgufRoute {
                 }
                 Route::Resolved(owner) if !step.materialized => owner.authorize(&request.key)?,
                 Route::Unavailable => unreachable!("concrete owner"),
-                Route::Resolved(_) | Route::Gguf(_) | Route::Memory(_) | Route::Safetensors(_) => {}
+                Route::Resolved(_) | Route::Gguf(_) | Route::Memory(_) | Route::Safetensors(_) | Route::Materialized(_) => {}
             }
         }
         Ok(())

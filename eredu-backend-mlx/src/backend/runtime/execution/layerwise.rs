@@ -29,7 +29,7 @@ use crate::{
     backend::error::Error,
     backend::runtime::checkpoint::binding::ModuleBindingError,
     backend::runtime::checkpoint::bounded_quantization::{
-        BoundedQuantizationPlan, BoundedQuantizationTarget, BoundedQuantizedWeightStore,
+        BoundedQuantizationPlan, BoundedQuantizationTarget, QuantizedCheckpoint,
     },
     backend::runtime::residency::dense_stream::BackgroundLayerPrefetch,
     backend::runtime::residency::manager::{

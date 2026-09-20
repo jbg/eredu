@@ -1144,6 +1144,16 @@ shared tile driver. One prepared tile retains its compiled read and native shape
 until input construction returns; each queued native completion then keeps its
 own input account. Input and companion dtypes select the actual native layout.
 Failure-injection fixtures use this same tile preparation and submission worker.
+
+Completed tensor replacement is owned by checkpoint's `MaterializedCheckpointSource`.
+Its memory tensors override matching original keys while both physical stores
+remain retained for storage accounting. Ordinary reads and concrete prepared
+routes select the same source; enclosing restrictions still authorize every key.
+The MLX `QuantizedCheckpoint` result moves that neutral source and its conversion
+report into loading, without implementing a second checkpoint source. Output
+buffers retain their payload reservations and estimated catalog metadata headroom;
+this source type does not itself grant allocation authority.
+
 Cold declarations, candidate recipes, overlay/result storage and the enclosing
 prepared-manager handoff remain separate admission responsibilities.
 

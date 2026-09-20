@@ -99,7 +99,7 @@ fn conversion_fills_the_original_destinations_and_readers_retain_their_custody()
     let transformed = prepared.materialize(context.stream()).unwrap();
     assert_eq!(transformed.report().transformed_weights, 1);
     assert_eq!(transformed.report().output_bytes, 320);
-    let lease = transformed
+    let lease = transformed.source()
         .acquire_lease(TensorReadRequest {
             key: "model.proj.weight".into(),
             selection: TensorSelection::Full,
@@ -217,7 +217,7 @@ fn conversion_preserves_the_pools_original_payload_inventory() {
     let context = cpu_context();
     let transformed = prepared.materialize(context.stream()).unwrap();
     let mut inventories = Vec::new();
-    assert!(transformed
+    assert!(transformed.source()
         .visit_source_storage(&mut |row| {
             inventories.push((row.identity(), row.bytes()));
         })
@@ -233,7 +233,7 @@ fn conversion_preserves_the_pools_original_payload_inventory() {
         pool.validate_original_source_inventory(identity, *bytes)
             .unwrap();
     }
-    let lease = transformed
+    let lease = transformed.source()
         .acquire_lease(TensorReadRequest {
             key: "model.proj.weight".into(),
             selection: TensorSelection::Full,

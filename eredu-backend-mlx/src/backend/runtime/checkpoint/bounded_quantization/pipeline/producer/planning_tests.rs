@@ -145,7 +145,7 @@ fn shared_planning_avoids_source_cache_for_complete_leading_and_row_tiles() {
             .flat_map(|_| half::f16::from_f32(15.0).to_le_bytes())
             .collect::<Vec<_>>();
         for (key, expected) in [("weight", words), ("scales", scales), ("biases", biases)] {
-            let lease = result
+            let lease = result.source()
                 .acquire_lease(TensorReadRequest {
                     key: key.into(),
                     selection: TensorSelection::Full,

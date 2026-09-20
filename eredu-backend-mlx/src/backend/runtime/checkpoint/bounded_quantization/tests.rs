@@ -130,16 +130,16 @@ fn materialize(
 }
 
 fn assert_affine_outputs_match_reference(
-    transformed: &BoundedQuantizedWeightStore,
+    transformed: &QuantizedCheckpoint,
     values: &[f32],
     quantization: AffineQuantization,
     context: &ExecutionContext,
 ) {
     let dense = Array::from_slice(values, &[8, 64]);
     let expected = quantize_tensor(&dense, quantization, context.stream()).unwrap();
-    let weight = materialize(transformed, "model.proj.weight", context.stream());
-    let scales = materialize(transformed, "model.proj.scales", context.stream());
-    let biases = materialize(transformed, "model.proj.biases", context.stream());
+    let weight = materialize(transformed.source(), "model.proj.weight", context.stream());
+    let scales = materialize(transformed.source(), "model.proj.scales", context.stream());
+    let biases = materialize(transformed.source(), "model.proj.biases", context.stream());
     assert_eq!(
         weight.evaluated().unwrap().as_slice::<u32>(),
         expected.weight.evaluated().unwrap().as_slice::<u32>()
@@ -160,14 +160,14 @@ fn assert_affine_outputs_match_reference(
 }
 
 fn assert_mxfp4_outputs_match_reference(
-    transformed: &BoundedQuantizedWeightStore,
+    transformed: &QuantizedCheckpoint,
     values: &[f32],
     context: &ExecutionContext,
 ) {
     let dense = Array::from_slice(values, &[8, 64]);
     let expected = quantize_tensor(&dense, WeightQuantization::MxFp4, context.stream()).unwrap();
-    let weight = materialize(transformed, "model.proj.weight", context.stream());
-    let scales = materialize(transformed, "model.proj.scales", context.stream());
+    let weight = materialize(transformed.source(), "model.proj.weight", context.stream());
+    let scales = materialize(transformed.source(), "model.proj.scales", context.stream());
     assert_eq!(
         weight.evaluated().unwrap().as_slice::<u32>(),
         expected.weight.evaluated().unwrap().as_slice::<u32>()
@@ -200,12 +200,12 @@ fn source_storage_includes_dense_memory_and_quantized_overlay_without_reconversi
     )
     .unwrap();
     let transformed =
-        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+        QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
     let before = transformed.report().clone();
     let storage = eredu_checkpoint::store::SourceStorage::collect([
         source.as_ref(),
-        &transformed as &dyn CheckpointSource,
-        &transformed,
+        transformed.source() as &dyn CheckpointSource,
+        transformed.source(),
     ])
     .unwrap()
     .unwrap();
@@ -217,7 +217,7 @@ fn source_storage_includes_dense_memory_and_quantized_overlay_without_reconversi
     assert!(storage.bytes().unwrap() >= source_capacity + before.output_bytes);
     assert_eq!(transformed.report(), &before);
     let view = eredu_checkpoint::store::RestrictedCheckpointSource::including(
-        Arc::new(transformed),
+        Arc::new(transformed.into_parts().0),
         "weight only",
         std::collections::BTreeSet::from(["model.proj.weight".into()]),
     )
@@ -240,7 +240,7 @@ fn affine_conversion_is_row_bounded_and_matches_the_canonical_quantizer() {
     // sufficient to convert the 2,048-byte dense source.
     let plan = BoundedQuantizationPlan::new(quantization, 320, [target]).unwrap();
     let transformed =
-        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+        QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
 
     assert_eq!(
         transformed.report(),
@@ -260,21 +260,21 @@ fn affine_conversion_is_row_bounded_and_matches_the_canonical_quantizer() {
         transformed.report().peak_planned_working_set_bytes <= transformed.report().output_bytes
     );
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.proj.weight")
             .unwrap()
             .encoded_byte_len,
         256
     );
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.proj.scales")
             .unwrap()
             .encoded_byte_len,
         32
     );
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.proj.biases")
             .unwrap()
             .encoded_byte_len,
@@ -292,7 +292,7 @@ fn affine_conversion_double_buffers_two_cpu_tiles_within_the_bound() {
     let plan =
         BoundedQuantizationPlan::new(quantization, 640, [direct_test_target("model.proj.weight")])
             .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     let report = transformed.report();
     assert_eq!(report.source_tiles, 8);
@@ -320,7 +320,7 @@ fn mxfp4_conversion_double_buffers_across_target_boundaries() {
         ],
     )
     .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     let report = transformed.report();
     assert_eq!(report.transformed_weights, 2);
@@ -333,8 +333,8 @@ fn mxfp4_conversion_double_buffers_across_target_boundaries() {
     for (name, values) in [("model.first", &values[0]), ("model.second", &values[1])] {
         let dense = Array::from_slice(values, &[8, 64]);
         let expected = quantize_tensor(&dense, quantization, context.stream()).unwrap();
-        let weight = materialize(&transformed, &format!("{name}.weight"), context.stream());
-        let scales = materialize(&transformed, &format!("{name}.scales"), context.stream());
+        let weight = materialize(transformed.source(), &format!("{name}.weight"), context.stream());
+        let scales = materialize(transformed.source(), &format!("{name}.scales"), context.stream());
         assert_eq!(
             weight.evaluated().unwrap().as_slice::<u32>(),
             expected.weight.evaluated().unwrap().as_slice::<u32>()
@@ -343,7 +343,7 @@ fn mxfp4_conversion_double_buffers_across_target_boundaries() {
             scales.evaluated().unwrap().as_slice::<u8>(),
             expected.scales.evaluated().unwrap().as_slice::<u8>()
         );
-        assert!(!transformed
+        assert!(!transformed.source()
             .source_keys()
             .contains(&format!("{name}.biases")));
     }
@@ -358,7 +358,7 @@ fn affine_gpu_conversion_matches_the_canonical_gpu_quantizer() {
     let plan =
         BoundedQuantizationPlan::new(quantization, 640, [direct_test_target("model.proj.weight")])
             .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     assert_affine_outputs_match_reference(&transformed, &values, quantization, &context);
 }
@@ -374,7 +374,7 @@ fn insufficient_bound_fails_before_a_source_array_is_materialized() {
     )
     .unwrap();
     let error =
-        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap_err();
+        QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap_err();
     assert!(error
         .to_string()
         .contains("requires at least 296 working-set bytes for one row, but the plan permits 295"));
@@ -403,14 +403,14 @@ fn semantic_expert_recipe_is_quantized_under_its_local_target_name() {
     let recipe = DerivedWeightRecipe::source("checkpoint.expert_1.weight", TensorSelection::Full);
     let target = test_target("local.expert.weight", recipe);
     let plan = BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
     assert_eq!(transformed.report().source_tiles, 4);
     assert_eq!(transformed.report().source_bytes_read, 1_024);
 
     let dense = Array::from_slice(&values, &[4, 64]);
     let expected =
         quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
-    let actual = materialize(&transformed, "local.expert.weight", context.stream());
+    let actual = materialize(transformed.source(), "local.expert.weight", context.stream());
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
         expected.weight.evaluated().unwrap().as_slice::<u32>()
@@ -450,7 +450,7 @@ fn expert_ownership_and_tp_row_tile_compose_into_bounded_reads() {
     };
     let target = test_target("rank.expert.weight", recipe);
     let plan = BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     assert_eq!(transformed.report().source_tiles, 2);
     assert_eq!(transformed.report().source_bytes_read, 512);
@@ -461,7 +461,7 @@ fn expert_ownership_and_tp_row_tile_compose_into_bounded_reads() {
     let dense = Array::from_slice(selected, &[1, 2, 64]);
     let expected =
         quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
-    let actual = materialize(&transformed, "rank.expert.weight", context.stream());
+    let actual = materialize(transformed.source(), "rank.expert.weight", context.stream());
     assert_eq!(actual.shape(), &[1, 2, 8]);
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
@@ -491,13 +491,13 @@ fn complete_rank_three_expert_bank_is_tiled_without_flattening_its_output() {
         [direct_test_target("model.experts.weight")],
     )
     .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     assert_eq!(transformed.report().source_tiles, 8);
     assert_eq!(transformed.report().source_bytes_read, 2_048);
     assert_eq!(transformed.report().output_bytes, 320);
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.experts.weight")
             .unwrap()
             .logical_shape,
@@ -509,7 +509,7 @@ fn complete_rank_three_expert_bank_is_tiled_without_flattening_its_output() {
         context.stream(),
     )
     .unwrap();
-    let actual = materialize(&transformed, "model.experts.weight", context.stream());
+    let actual = materialize(transformed.source(), "model.experts.weight", context.stream());
     assert_eq!(actual.shape(), &[2, 4, 8]);
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
@@ -539,7 +539,7 @@ fn complete_rank_three_expert_bank_uses_one_submission_when_admitted() {
         [direct_test_target("model.experts.weight")],
     )
     .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     assert_eq!(transformed.report().source_tiles, 1);
     assert_eq!(transformed.report().source_bytes_read, 2_048);
@@ -549,7 +549,7 @@ fn complete_rank_three_expert_bank_uses_one_submission_when_admitted() {
         context.stream(),
     )
     .unwrap();
-    let actual = materialize(&transformed, "model.experts.weight", context.stream());
+    let actual = materialize(transformed.source(), "model.experts.weight", context.stream());
     assert_eq!(actual.shape(), &[2, 4, 8]);
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
@@ -584,24 +584,24 @@ fn complete_rank_three_bank_preserves_exact_runtime_companion_names() {
     assert_eq!(target.biases_name(), Some("architecture.zero-points"));
     let plan = BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
     let transformed =
-        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+        QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
 
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.experts.down_proj")
             .unwrap()
             .logical_shape,
         vec![2, 4, 8]
     );
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("architecture.scale-table")
             .unwrap()
             .logical_shape,
         vec![2, 4, 1]
     );
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("architecture.zero-points")
             .unwrap()
             .logical_shape,
@@ -646,7 +646,7 @@ fn dense_gguf_expert_and_row_selections_compose_without_full_bank_reads() {
     let target = test_target("rank.expert.weight", recipe);
     let plan = BoundedQuantizationPlan::new(AffineQuantization::default(), 296, [target]).unwrap();
     let transformed =
-        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+        QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
 
     assert_eq!(transformed.report().source_tiles, 2);
     assert_eq!(transformed.report().source_bytes_read, 512);
@@ -663,7 +663,7 @@ fn dense_gguf_expert_and_row_selections_compose_without_full_bank_reads() {
         context.stream(),
     )
     .unwrap();
-    let actual = materialize(&transformed, "rank.expert.weight", context.stream());
+    let actual = materialize(transformed.source(), "rank.expert.weight", context.stream());
     assert_eq!(actual.shape(), &[1, 2, 8]);
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
@@ -694,7 +694,7 @@ fn complete_rank_three_dense_gguf_bank_is_read_one_matrix_row_at_a_time() {
     )
     .unwrap();
     let transformed =
-        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+        QuantizedCheckpoint::create(source.clone(), plan, context.stream()).unwrap();
 
     assert_eq!(transformed.report().source_tiles, 8);
     assert_eq!(transformed.report().source_bytes_read, 2_048);
@@ -703,7 +703,7 @@ fn complete_rank_three_dense_gguf_bank_is_read_one_matrix_row_at_a_time() {
     assert_eq!(diagnostics.physical_reads, 8);
     assert_eq!(diagnostics.physical_read_bytes, 2_048);
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.experts.weight")
             .unwrap()
             .logical_shape,
@@ -711,7 +711,7 @@ fn complete_rank_three_dense_gguf_bank_is_read_one_matrix_row_at_a_time() {
     );
     let expected =
         quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
-    let actual = materialize(&transformed, "model.experts.weight", context.stream());
+    let actual = materialize(transformed.source(), "model.experts.weight", context.stream());
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
         expected.weight.evaluated().unwrap().as_slice::<u32>()
@@ -728,17 +728,17 @@ fn mxfp4_layout_has_byte_scales_and_no_biases() {
         [direct_test_target("model.proj.weight")],
     )
     .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
     assert_eq!(transformed.report().source_tiles, 8);
     assert_eq!(transformed.report().output_bytes, 272);
     assert_eq!(
-        transformed
+        transformed.source()
             .source_metadata("model.proj.scales")
             .unwrap()
             .stored_dtype,
         eredu_checkpoint::StoredDtype::U8
     );
-    assert!(!transformed
+    assert!(!transformed.source()
         .source_keys()
         .contains(&"model.proj.biases".into()));
 
@@ -756,7 +756,7 @@ fn mxfp4_gpu_conversion_matches_the_canonical_gpu_quantizer() {
         [direct_test_target("model.proj.weight")],
     )
     .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
 
     assert_mxfp4_outputs_match_reference(&transformed, &values, &context);
 }
@@ -783,20 +783,20 @@ fn dense_gguf_source_is_read_and_quantized_in_bounded_rows() {
         [direct_test_target("model.proj.weight")],
     )
     .unwrap();
-    let transformed = BoundedQuantizedWeightStore::create(source, plan, context.stream()).unwrap();
+    let transformed = QuantizedCheckpoint::create(source, plan, context.stream()).unwrap();
     assert_eq!(
-        transformed.source_diagnostics().unwrap().backend,
+        transformed.source().source_diagnostics().unwrap().backend,
         WeightStoreBackend::Gguf
     );
     assert_eq!(transformed.report().source_tiles, 8);
     assert_eq!(transformed.report().source_bytes_read, 2_048);
-    let diagnostics = transformed.source_diagnostics().unwrap();
+    let diagnostics = transformed.source().source_diagnostics().unwrap();
     assert_eq!(diagnostics.physical_reads, 8);
     assert_eq!(diagnostics.physical_read_bytes, 2_048);
 
     let expected =
         quantize_tensor(&dense, AffineQuantization::default(), context.stream()).unwrap();
-    let actual = materialize(&transformed, "model.proj.weight", context.stream());
+    let actual = materialize(transformed.source(), "model.proj.weight", context.stream());
     assert_eq!(
         actual.evaluated().unwrap().as_slice::<u32>(),
         expected.weight.evaluated().unwrap().as_slice::<u32>()
@@ -814,7 +814,7 @@ fn residency_budgets_and_arrays_use_only_packed_bytes() {
     )
     .unwrap();
     let transformed = Arc::new(
-        BoundedQuantizedWeightStore::create(source, plan, conversion_context.stream()).unwrap(),
+        QuantizedCheckpoint::create(source, plan, conversion_context.stream()).unwrap().into_parts().0,
     );
     let id = OffloadUnitId::new("projection").unwrap();
     let bindings = [

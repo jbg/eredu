@@ -624,6 +624,8 @@ pub use retained_source::{
 pub(crate) mod acquisition;
 mod memory_destination;
 mod memory_buffer;
+mod materialized;
+pub use materialized::MaterializedCheckpointSource;
 pub use memory_buffer::{MemoryTensorBuffer, MemoryTensorBufferError, MemoryWeightStoreBuildError};
 pub use acquisition::{
     PreparedAcquisitionBank, PreparedAcquisitionBankError, PreparedAcquisitionFailure,

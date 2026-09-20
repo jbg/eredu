@@ -214,7 +214,7 @@ fn cpu_mxfp4_tiled_payloads_preserve_the_independent_codebook() {
     ] {
         for (shape, minimum, rows) in [(vec![8, 64], one_row, 8), (vec![8, 2, 64], two_rows, 16)] {
             let source = fixture(dtype, &shape);
-            let converted = BoundedQuantizedWeightStore::create(
+            let converted = QuantizedCheckpoint::create(
                 source.clone(),
                 plan(2 * minimum),
                 context.stream(),
@@ -241,7 +241,7 @@ fn cpu_mxfp4_tiled_payloads_preserve_the_independent_codebook() {
                 ),
                 ("model.proj.scales", vec![127; rows * 2]),
             ] {
-                let lease = converted
+                let lease = converted.source()
                     .acquire_lease(TensorReadRequest {
                         key: key.into(),
                         selection: TensorSelection::Full,

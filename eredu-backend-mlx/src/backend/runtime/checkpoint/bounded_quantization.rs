@@ -1,8 +1,8 @@
 //! Bounded load-time weight quantization into resident memory.
 
 //!
-//! A [`BoundedQuantizedWeightStore`](crate::backend::runtime::checkpoint::bounded_quantization::BoundedQuantizedWeightStore)
-//! overlays packed tensors on an existing
+//! A [`QuantizedCheckpoint`](crate::backend::runtime::checkpoint::bounded_quantization::QuantizedCheckpoint)
+//! owns a neutral source overlaying packed tensors on an existing
 //! checkpoint store. Source matrices are selected in row tiles, quantized on
 //! explicit conversion streams, and written directly into final in-memory
 //! encoded tensors. A fixed two-slot completion window spans tensor boundaries and
@@ -15,9 +15,10 @@
 //! geometry.
 
 use eredu_checkpoint::store::{
-    CheckpointLease, CheckpointSource, MemoryWeightStore, StoreError, TensorReadRequest,
-    TensorSelection, WeightStoreDiagnostics,
+    CheckpointSource, MemoryWeightStore, TensorSelection,
 };
+#[cfg(test)]
+use eredu_checkpoint::store::{CheckpointLease, StoreError, TensorReadRequest, WeightStoreDiagnostics};
 use eredu_checkpoint::{
     recipe::{DerivedWeightRecipe, RecipeDtype},
     WeightQuantization,
@@ -55,7 +56,7 @@ mod preparation;
 mod workspace;
 pub(crate) use workspace::cpu_quantization_temporary_row_bytes;
 
-pub use pipeline::BoundedQuantizedWeightStore;
+pub use pipeline::QuantizedCheckpoint;
 pub(crate) use pipeline::submit_original_affine_tile;
 pub(crate) use handoff::ConvertedQuantization;
 pub(crate) use preparation::{ColdQuantization, PreparedQuantization};

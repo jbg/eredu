@@ -105,7 +105,7 @@ impl super::super::preparation::PreparedQuantization {
         pool: &eredu_runtime::working_memory::WorkingMemoryPool,
         resources: &cpu_resources::CpuTileResources,
     ) -> Result<
-        (BoundedQuantizedWeightStore, BoundedQuantizationPlan),
+        (QuantizedCheckpoint, BoundedQuantizationPlan),
         PipelineAdmissionError<encoded_affine::TileError<()>>,
     > {
         resources.validate_pool(pool).map_err(|cause| {

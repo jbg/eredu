@@ -23,6 +23,7 @@ fn child<'a>(
 ) -> Result<Option<&'a RetainedCheckpointSource>, Refusal> {
     Ok(match route {
         Route::Unavailable | Route::Memory(_) | Route::Safetensors(_) | Route::Gguf(_) => None,
+        Route::Materialized(owner) => owner.encoded_read_owner(keys),
         Route::Prepared(owner) => {
             // The ordinary encoded path delegates immediately when its child
             // promises a fixed catalog. Authenticate all concrete dependencies
@@ -88,6 +89,7 @@ fn borrowed_route<'a>(
     let loan = source.prepared_acquisition_source().0;
     let same = match (owner.route(), loan) {
         (Route::Memory(a), Route::Memory(b)) => std::ptr::eq(a, b),
+        (Route::Materialized(a), Route::Materialized(b)) => std::ptr::eq(a, b),
         (Route::Safetensors(a), Route::Safetensors(b)) => std::ptr::eq(a, b),
         (Route::Gguf(a), Route::Gguf(b)) => std::ptr::eq(a, b),
         (Route::Prepared(a), Route::Prepared(b)) => std::ptr::eq(a, b),
