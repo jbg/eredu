@@ -1139,6 +1139,14 @@ producers own ordinary lease preflight and metadata inference after the tile fit
 admitted encoded producers validate/read through their funded source records.
 Source/header birth, candidate recipe and overlay storage, numerical producers
 and complete prepared-manager handoff retain separate responsibilities.
+Encoded CPU affine materialization uses the admitted resource owner and the
+shared tile driver. One prepared tile retains its compiled read and native shape
+until input construction returns; each queued native completion then keeps its
+own input account. Input and companion dtypes select the actual native layout.
+Failure-injection fixtures use this same tile preparation and submission worker.
+Cold declarations, candidate recipes, overlay/result storage and the enclosing
+prepared-manager handoff remain separate admission responsibilities.
+
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

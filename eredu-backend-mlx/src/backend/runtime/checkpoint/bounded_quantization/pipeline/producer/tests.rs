@@ -1,11 +1,10 @@
 use super::*;
 use crate::backend::runtime::checkpoint::store::{
-    ColdMaterializationSlot, MaterializationPayloadShape, PreparedEncodedInputPlan,
+    ColdMaterializationSlot, MaterializationPayloadShape,
 };
-use crate::backend::submission_recovery::native_role::NativeRoleCapacity;
-use eredu_checkpoint::{AffineQuantization, recipe::EncodedRecipeRead};
+use eredu_checkpoint::{recipe::EncodedRecipeRead, AffineQuantization};
 use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
-use safemlx::{Device, DeviceType, OperationEvent, PrefillRootsRuntime, PreparedInputRuntime};
+use safemlx::{Device, DeviceType, PrefillRootsRuntime, PreparedInputRuntime};
 use std::{cell::Cell, rc::Rc};
 
 #[derive(Debug)]
@@ -16,38 +15,7 @@ impl Drop for Invocation {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-enum ProducerFailure {
-    #[error("tile source read: {0}")]
-    Read(#[from] eredu_runtime::working_memory::EncodedRecipeSourceError),
-    #[error("tile source requires numerical or unsupported read construction")]
-    ReadUnavailable,
-    #[error("tile pipeline: {0}")]
-    Backend(#[from] Error),
-    #[error("tile output metadata: {0}")]
-    Metadata(
-        #[source]
-        eredu_runtime::working_memory::SharedNativeInitializationFailure<
-            metadata::Metadata,
-            metadata::ConstructionError,
-        >,
-    ),
-    #[error("cold tile admission: {0}")]
-    Admission(
-        #[source]
-        eredu_runtime::working_memory::SharedNativeInitializationFailure<
-            cold::Output<Invocation, WeightMaterialization, encoded_affine::ConstructionError>,
-            eredu_core::BackendFailure,
-        >,
-    ),
-    #[error("cold tile invocation: {0}")]
-    Invocation(#[source] cold::FailedSubmission<Invocation, encoded_affine::ConstructionError>),
-}
-impl From<eredu_checkpoint::recipe::RecipeError> for ProducerFailure {
-    fn from(value: eredu_checkpoint::recipe::RecipeError) -> Self {
-        Self::Backend(value.into())
-    }
-}
+use encoded_affine::TileError;
 
 // Runtime/stream/source birth, recipe declarations and final output are fixture
 // prerequisites. The pool funds metadata, keys, compiled reads, native work,
@@ -66,7 +34,7 @@ struct FundedProducer<'a> {
 }
 impl TileProducer for FundedProducer<'_> {
     type Completion = cold::Submission<Invocation, WeightMaterialization, Infallible>;
-    type Error = ProducerFailure;
+    type Error = TileError<Invocation>;
 
     fn submit(
         &mut self,
@@ -75,65 +43,28 @@ impl TileProducer for FundedProducer<'_> {
         target: &BoundedQuantizationTarget,
         quantization: WeightQuantization,
         slot: usize,
-    ) -> Result<(Self::Completion, u64), ProducerFailure> {
+    ) -> Result<(Self::Completion, u64), TileError<Invocation>> {
         self.slots.push(slot);
         if self.fail_at == Some(self.slots.len() - 1) {
             return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound).into());
         }
-        let WeightQuantization::Affine(quantization) = quantization else {
-            panic!("affine fixture");
-        };
-        let metadata = metadata::MetadataPlan::new(recipe, source.as_ref())
-            .map_err(Error::PrefillControl)?
-            .prepare(&self.pool)
-            .map_err(|error| {
-                let (uncalled, failure) = error.into_parts();
-                drop(uncalled);
-                ProducerFailure::Metadata(failure)
-            })?;
-        metadata
-            .validate_pool(&self.pool)
-            .map_err(Error::PrefillControl)?;
-        let before_read = self.pool.used_bytes().unwrap();
-        let read = self
-            .pool
-            .prepare_encoded_recipe(source, recipe)?
-            .ok_or(ProducerFailure::ReadUnavailable)?;
-        let read_bytes = self.pool.used_bytes().unwrap() - before_read;
-        let source_bytes = read.output().byte_len();
-        assert_eq!(read.output().shape(), metadata.output().inferred().shape());
-        assert_eq!(
-            read.output().byte_len(),
-            metadata.output().inferred().byte_len()
-        );
-        let shape = metadata.output().shape();
-        let columns = *shape.last().unwrap() as usize;
-        let rows = shape[..shape.len() - 1]
-            .iter()
-            .map(|&n| n as usize)
-            .product();
-        let layout = OperationEvent::cpu_affine_quantize_submission_layout(
-            Dtype::Float32,
-            Dtype::Float16,
-            shape.len(),
-            rows,
-            columns,
-            quantization.group_size,
-            quantization.bits,
-        )
-        .expect("qualified CPU affine layout");
-        let capacity = NativeRoleCapacity {
-            graph: layout.graph_capacity(),
-            records: layout.record_capacity(),
-            backing: layout.physical_capacity(self.runtime).unwrap(),
-        };
+        let before_host = self.pool.used_bytes().unwrap();
+        let tile = encoded_affine::Tile::prepare::<Invocation>(
+            &self.pool,
+            self.runtime,
+            source,
+            recipe,
+            target,
+            quantization,
+        )?;
+        let host_bytes = self.pool.used_bytes().unwrap() - before_host;
+        let source_bytes = tile.source_bytes();
         let payload = MaterializationPayloadShape {
             inputs: 1,
             outputs: 3,
             pending_sources: 0,
         };
-        let input =
-            PreparedEncodedInputPlan::new(&read, self.runtime, shape, Dtype::Float32).unwrap();
+        let input = tile.input().unwrap();
         let input_bytes = input.required_bytes().unwrap();
         let slot_bytes = ColdMaterializationSlot::required_bytes(payload).unwrap();
         self.live.set(self.live.get() + 1);
@@ -151,34 +82,20 @@ impl TileProducer for FundedProducer<'_> {
                     .unwrap();
             }
         }
-        let plan = encoded_affine::plan(
-            pool,
-            self.runtime,
-            capacity,
-            Invocation(self.live.clone()),
-            input,
-            quantization,
-            target,
-            stream,
-            layout,
-        );
-        self.largest_tile = self.largest_tile.max(
-            plan.required_bytes().unwrap()
-                + input_bytes
-                + slot_bytes
-                + metadata.original_bytes()
-                + read_bytes,
-        );
+        let plan = tile.plan(Invocation(self.live.clone()), stream)?;
+        self.largest_tile = self
+            .largest_tile
+            .max(plan.required_bytes().unwrap() + input_bytes + slot_bytes + host_bytes);
         let submitted = plan.submit(pool).map_err(|failure| {
             let (uncalled, failure) = failure.into_parts();
             drop(uncalled);
-            ProducerFailure::Admission(failure)
+            TileError::Admission(failure)
         })?;
         peak_used.set(peak_used.get().max(pool.used_bytes().unwrap()));
         submitted
             .into_result()
             .map(|completion| (completion, source_bytes))
-            .map_err(ProducerFailure::Invocation)
+            .map_err(TileError::Invocation)
     }
 }
 
@@ -371,7 +288,7 @@ fn producer_failure_retires_the_already_queued_cold_submission() {
         .unwrap_err();
     assert!(matches!(
         error,
-        PipelineAdmissionError::Producer(ProducerFailure::Backend(Error::PrefillControl(
+        PipelineAdmissionError::Producer(TileError::Backend(Error::PrefillControl(
             WorkingMemoryError::UnknownBound
         )))
     ));
@@ -385,7 +302,7 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
     use eredu_checkpoint::store::{
         EncodedReadFailure, EncodedReadFailureCause, SafetensorsWeightStore,
     };
-    use safetensors::tensor::{TensorView, serialize_to_file};
+    use safetensors::tensor::{serialize_to_file, TensorView};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.safetensors");
     let values = (0..512)
@@ -440,7 +357,7 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
         .unwrap_err();
     assert!(matches!(
         &error,
-        PipelineAdmissionError::Producer(ProducerFailure::Invocation(_))
+        PipelineAdmissionError::Producer(TileError::Invocation(_))
     ));
     assert_eq!(producer.slots, [0, 1]);
     assert_eq!(producer.peak_live, 2);
@@ -534,7 +451,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
-    let ProducerFailure::Metadata(failure) = error else {
+    let TileError::Metadata(failure) = error else {
         panic!("metadata admission must refuse before inference")
     };
     let Some(WorkingMemoryError::BudgetExceeded {
@@ -553,9 +470,8 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
-    let ProducerFailure::Read(eredu_runtime::working_memory::EncodedRecipeSourceError::Keys(
-        failure,
-    )) = error
+    let TileError::Read(eredu_runtime::working_memory::EncodedRecipeSourceError::Keys(failure)) =
+        error
     else {
         panic!("key admission must refuse after the funded metadata");
     };
@@ -574,58 +490,30 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let sizing = WorkingMemoryPool::new(1 << 20, 0).unwrap();
     let target = &plan.targets[0];
     let root: eredu_checkpoint::store::RetainedCheckpointSource = source.clone().into();
-    let metadata = metadata::MetadataPlan::new(&target.source, root.as_ref())
-        .unwrap()
-        .prepare(&sizing)
-        .unwrap();
-    let read = sizing
-        .prepare_encoded_recipe(&root, &target.source)
-        .unwrap()
-        .unwrap();
-    let prerequisites = sizing.used_bytes().unwrap();
-    let construction_peak = sizing.peak_bytes().unwrap();
-    let WeightQuantization::Affine(quantization) = plan.quantization else {
-        unreachable!()
-    };
-    let layout = OperationEvent::cpu_affine_quantize_submission_layout(
-        Dtype::Float32,
-        Dtype::Float16,
-        2,
-        8,
-        64,
-        quantization.group_size,
-        quantization.bits,
-    )
-    .unwrap();
-    let capacity = NativeRoleCapacity {
-        graph: layout.graph_capacity(),
-        records: layout.record_capacity(),
-        backing: layout.physical_capacity(&runtime).unwrap(),
-    };
-    let input =
-        PreparedEncodedInputPlan::new(&read, &runtime, metadata.output().shape(), Dtype::Float32)
-            .unwrap();
-    let role = encoded_affine::plan(
+    let tile = encoded_affine::Tile::prepare::<Invocation>(
         &sizing,
         &runtime,
-        capacity,
-        Invocation(Rc::new(Cell::new(1))),
-        input,
-        quantization,
+        &root,
+        &target.source,
         target,
-        &streams[0],
-        layout,
-    );
+        plan.quantization,
+    )
+    .unwrap();
+    let prerequisites = sizing.used_bytes().unwrap();
+    let construction_peak = sizing.peak_bytes().unwrap();
+    let role = tile
+        .plan(Invocation(Rc::new(Cell::new(1))), &streams[0])
+        .unwrap();
     let role_bytes = role.required_bytes().unwrap();
     drop(role);
-    drop((read, metadata));
+    drop(tile);
     assert_eq!(sizing.used_bytes().unwrap(), 0);
     assert!(prerequisites + role_bytes - 1 >= construction_peak);
     producer.pool = WorkingMemoryPool::new(prerequisites + role_bytes - 1, 0).unwrap();
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
-    let ProducerFailure::Admission(failure) = error else {
+    let TileError::Admission(failure) = error else {
         panic!("role comparison must precede native callback")
     };
     assert!(
@@ -645,7 +533,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
-    assert!(matches!(&error, ProducerFailure::Invocation(_)));
+    assert!(matches!(&error, TileError::Invocation(_)));
     let mut cause: &(dyn std::error::Error + 'static) = &error;
     let refusal = loop {
         if let Some(cause) = cause.downcast_ref::<WorkingMemoryError>() {
@@ -704,96 +592,92 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
         resources.streams()[0].get_index().unwrap(),
         resources.streams()[1].get_index().unwrap()
     );
-    for (budget, expected_slots) in [(320, 1), (640, 2)] {
-        let source = Arc::new(
-            MemoryWeightStore::from_safetensors([(
-                "weight".into(),
-                SafeDtype::F32,
-                vec![8, 64],
-                (0..512)
-                    .flat_map(|n| ((n % 16) as f32).to_le_bytes())
-                    .collect(),
-            )])
-            .unwrap(),
-        );
-        let plan = BoundedQuantizationPlan::new(
-            AffineQuantization::new(32, 4).unwrap(),
-            budget,
-            [
-                BoundedQuantizationTarget::direct("weight", "scales", Some("biases"))
-                    .unwrap()
-                    .with_affine_companion_dtype(RecipeDtype::F16)
+    fn encode(dtype: SafeDtype, value: f32) -> Vec<u8> {
+        match dtype {
+            SafeDtype::F32 => value.to_le_bytes().to_vec(),
+            SafeDtype::F16 => half::f16::from_f32(value).to_le_bytes().to_vec(),
+            SafeDtype::BF16 => half::bf16::from_f32(value).to_le_bytes().to_vec(),
+            _ => unreachable!(),
+        }
+    }
+    for input_dtype in [SafeDtype::F32, SafeDtype::F16, SafeDtype::BF16] {
+        for (companion_dtype, companion) in [
+            (SafeDtype::F16, RecipeDtype::F16),
+            (SafeDtype::BF16, RecipeDtype::BF16),
+            (SafeDtype::F32, RecipeDtype::F32),
+        ] {
+            for (budget, expected_slots) in [(320, 1), (640, 2)] {
+                let source = Arc::new(
+                    MemoryWeightStore::from_safetensors([(
+                        "weight".into(),
+                        input_dtype,
+                        vec![8, 64],
+                        (0..512)
+                            .flat_map(|n| encode(input_dtype, (n % 16) as f32))
+                            .collect(),
+                    )])
                     .unwrap(),
-            ],
-        )
-        .unwrap();
-        let prepared = ColdQuantization::prepare(source.into(), plan)
-            .unwrap()
-            .allocate_original(
-                &pool,
-                eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
-                resources.streams()[0],
-            )
-            .unwrap();
-        let with_outputs = pool.used_bytes().unwrap();
-        assert!(with_outputs > persistent);
-        // Source birth, recipe and overlay metadata remain fixture prerequisites.
-        // Runtime, workers, compiled reads, native tiles, queue/cleanup and final
-        // memory-tensor buffers use their admitted constructors here.
-        let mut producer = FundedProducer {
-            pool: pool.clone(),
-            runtime: resources.runtime(),
-            streams: resources.streams(),
-            slots: Vec::new(),
-            live: Rc::new(Cell::new(0)),
-            peak_live: 0,
-            peak_used: Cell::new(0),
-            largest_tile: 0,
-            fail_at: None,
-            truncate_at: None,
-        };
-        let (result, _) = prepared
-            .materialize_with_admitted_producer(&pool, DeviceType::Cpu, &mut producer)
-            .unwrap();
-        assert_eq!(result.report().source_tiles, 8);
-        assert_eq!(result.report().peak_in_flight_tiles, expected_slots);
-        assert_eq!(producer.peak_live, expected_slots);
-        assert_eq!(
-            producer.slots,
-            (0..8).map(|i| i % expected_slots).collect::<Vec<_>>()
-        );
-        let expected_words = (0..64)
-            .flat_map(|n| {
-                (if n % 2 == 0 {
-                    0x89abcdef_u32
-                } else {
-                    0x01234567_u32
-                })
-                .to_le_bytes()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(bytes(&result, "weight"), expected_words);
-        assert_eq!(
-            bytes(&result, "scales"),
-            (0..16)
-                .flat_map(|_| half::f16::from_f32(-1.0).to_le_bytes())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            bytes(&result, "biases"),
-            (0..16)
-                .flat_map(|_| half::f16::from_f32(15.0).to_le_bytes())
-                .collect::<Vec<_>>()
-        );
-        crate::backend::submission_recovery::wait_for_retirement(|| {
-            safemlx::reclaim_allocation_owners();
-            pool.used_bytes() == Ok(with_outputs)
-        });
-        assert_eq!(producer.live.get(), 0);
-        assert_eq!(pool.used_bytes().unwrap(), with_outputs);
-        drop(result);
-        safemlx::reclaim_allocation_owners();
-        assert_eq!(pool.used_bytes().unwrap(), persistent);
+                );
+                let plan = BoundedQuantizationPlan::new(
+                    AffineQuantization::new(32, 4).unwrap(),
+                    budget,
+                    [
+                        BoundedQuantizationTarget::direct("weight", "scales", Some("biases"))
+                            .unwrap()
+                            .with_affine_companion_dtype(companion.clone())
+                            .unwrap(),
+                    ],
+                )
+                .unwrap();
+                let prepared = ColdQuantization::prepare(source.into(), plan)
+                    .unwrap()
+                    .allocate_original(
+                        &pool,
+                        eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+                        resources.streams()[0],
+                    )
+                    .unwrap();
+                let with_outputs = pool.used_bytes().unwrap();
+                assert!(with_outputs > persistent);
+                // Source birth, recipe and overlay metadata remain fixture prerequisites.
+                // Runtime, workers, compiled reads, native tiles, queue/cleanup and final
+                // memory-tensor buffers use their admitted constructors here.
+                let (result, _) = prepared.materialize_cpu_encoded(&pool, &resources).unwrap();
+                assert_eq!(result.report().source_tiles, 8);
+                assert_eq!(result.report().peak_in_flight_tiles, expected_slots);
+                let expected_words = (0..64)
+                    .flat_map(|n| {
+                        (if n % 2 == 0 {
+                            0x89abcdef_u32
+                        } else {
+                            0x01234567_u32
+                        })
+                        .to_le_bytes()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(bytes(&result, "weight"), expected_words);
+                assert_eq!(
+                    bytes(&result, "scales"),
+                    (0..16)
+                        .flat_map(|_| encode(companion_dtype, -1.0))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    bytes(&result, "biases"),
+                    (0..16)
+                        .flat_map(|_| encode(companion_dtype, 15.0))
+                        .collect::<Vec<_>>()
+                );
+                crate::backend::submission_recovery::wait_for_retirement(|| {
+                    safemlx::reclaim_allocation_owners();
+                    pool.used_bytes() == Ok(with_outputs)
+                });
+                assert_eq!(pool.used_bytes().unwrap(), with_outputs);
+                drop(result);
+                safemlx::reclaim_allocation_owners();
+                assert_eq!(pool.used_bytes().unwrap(), persistent);
+            }
+        }
     }
     drop(resources);
     safemlx::reclaim_allocation_owners();

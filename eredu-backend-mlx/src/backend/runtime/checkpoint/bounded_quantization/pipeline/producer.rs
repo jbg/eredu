@@ -95,3 +95,26 @@ mod tests;
 
 #[cfg(test)]
 mod planning_tests;
+
+impl super::super::preparation::PreparedQuantization {
+    /// Submit encoded CPU affine tiles through their admitted runtime, streams,
+    /// read constructors and native owners. Cold declarations and output/overlay
+    /// construction remain separately owned prerequisites of this prepared value.
+    fn materialize_cpu_encoded(
+        self,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        resources: &cpu_resources::CpuTileResources,
+    ) -> Result<
+        (BoundedQuantizedWeightStore, BoundedQuantizationPlan),
+        PipelineAdmissionError<encoded_affine::TileError<()>>,
+    > {
+        resources.validate_pool(pool).map_err(|cause| {
+            PipelineAdmissionError::Producer(encoded_affine::TileError::Resources(cause))
+        })?;
+        self.materialize_with_admitted_producer(
+            pool,
+            safemlx::DeviceType::Cpu,
+            &mut encoded_affine::CpuEncodedAffineProducer { pool, resources },
+        )
+    }
+}
