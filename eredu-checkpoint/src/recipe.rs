@@ -10,6 +10,8 @@ use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection
 use crate::StoredDtype;
 
 mod encoded_projection;
+mod read_catalog;
+use read_catalog::ReadBatchCatalogPlan;
 mod finite_inference;
 mod uncached_catalog;
 pub use uncached_catalog::UncachedRecipeCatalog;
@@ -1070,15 +1072,6 @@ impl DerivedWeightRecipe {
         let Some(batch) = source.prepare_encoded_read(&keys)? else {
             return Ok(None);
         };
-        struct Catalog<'a>(BTreeMap<&'a str, &'a TensorMetadata>);
-        impl RecipeCatalog for Catalog<'_> {
-            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-                self.0
-                    .get(key)
-                    .map(|value| (*value).clone())
-                    .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
-            }
-        }
         let output = if use_source_cache && source.recipe_cache().is_some() {
             // Immutable sources bind read batches to the same admitted catalog.
             // Validate the whole recipe first, preserving ordinary left-to-right
@@ -1089,13 +1082,7 @@ impl DerivedWeightRecipe {
             }
             output
         } else {
-            let catalog = Catalog(
-                batch
-                    .tensors()
-                    .iter()
-                    .map(|value| (value.name.as_str(), value))
-                    .collect(),
-            );
+            let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.build();
             let output = self.infer(&catalog)?;
             if !preserves_bytes(self, &catalog)? {
                 return Ok(None);

@@ -860,6 +860,13 @@ share the same adjacency coalescing and slice traversal. Child mappings remain
 borrowed during output construction; exact range storage replaces geometric
 growth, with an additional geometry pass. These layouts alone do not reserve
 storage or cover source metadata, recipe inference and child-array construction.
+Contiguous and projected encoded reads share a sized metadata catalog index.
+The index borrows the batch's immutable tensor records, sorts occurrence indices
+in place and retains the last occurrence for duplicate keys. Its single index
+allocation is sized from the input occurrence count, including duplicates; names
+and metadata are cloned only when the ordinary owning lookup requests them.
+Borrowed lookup supports finite inference over the same retained entries. The
+catalog supplies no source authority, persistent inference cache or reservation.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

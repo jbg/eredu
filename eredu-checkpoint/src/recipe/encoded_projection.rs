@@ -199,15 +199,6 @@ pub(super) fn prepare(
     let Some(batch) = source.prepare_encoded_read(&keys)? else {
         return Ok(None);
     };
-    struct Catalog<'a>(BTreeMap<&'a str, &'a TensorMetadata>);
-    impl RecipeCatalog for Catalog<'_> {
-        fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
-            self.0
-                .get(key)
-                .map(|value| (*value).clone())
-                .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
-        }
-    }
     fn compile<C: RecipeCatalog + ?Sized>(
         recipe: &DerivedWeightRecipe,
         catalog: &C,
@@ -234,13 +225,7 @@ pub(super) fn prepare(
     let compiled = if use_source_cache && source.recipe_cache().is_some() {
         compile(recipe, source, batch.tensors(), batch.byte_len())?
     } else {
-        let catalog = Catalog(
-            batch
-                .tensors()
-                .iter()
-                .map(|value| (value.name.as_str(), value))
-                .collect(),
-        );
+        let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.build();
         compile(recipe, &catalog, batch.tensors(), batch.byte_len())?
     };
     let Some((output, mapping)) = compiled else {
