@@ -48,45 +48,16 @@ impl EncodedReadBatch {
             // Original batch spans have disjoint source coordinates even when
             // a physical tensor occurs repeatedly. Source order is restored below.
             spans.sort_unstable_by_key(|span| span.destination.start);
-            let mut projected = Vec::<ReadSpan>::new();
-            for row in ranges {
-                let first = spans.partition_point(|span| span.destination.end <= row.source.start);
-                for span in &spans[first..] {
-                    if span.destination.start >= row.source.end {
-                        break;
-                    }
-                    let start = span.destination.start.max(row.source.start);
-                    let end = span.destination.end.min(row.source.end);
-                    if start >= end {
-                        continue;
-                    }
-                    let length = end - start;
-                    let file_start = span
-                        .source
-                        .start
-                        .checked_add(
-                            u64::try_from(start - span.destination.start).map_err(|_| invalid())?,
-                        )
-                        .ok_or_else(invalid)?;
-                    let file_end = file_start
-                        .checked_add(u64::try_from(length).map_err(|_| invalid())?)
-                        .filter(|end| *end <= span.source.end)
-                        .ok_or_else(invalid)?;
-                    let destination_start = row
-                        .destination
-                        .start
-                        .checked_add(start - row.source.start)
-                        .ok_or_else(invalid)?;
-                    let destination_end =
-                        destination_start.checked_add(length).ok_or_else(invalid)?;
-                    covered = covered.checked_add(length).ok_or_else(invalid)?;
-                    projected.push(ReadSpan {
-                        source: file_start..file_end,
-                        destination: destination_start..destination_end,
-                    });
-                }
-            }
-            projected.sort_unstable_by_key(|span| span.source.start);
+            let plan = SpanProjectionPlan::new(spans, ranges).map_err(StoreError::from)?;
+            let mut projected = vec![
+                ReadSpan {
+                    source: 0..0,
+                    destination: 0..0
+                };
+                plan.count
+            ];
+            plan.fill_into(&mut projected).map_err(StoreError::from)?;
+            covered = covered.checked_add(plan.covered).ok_or_else(invalid)?;
             *spans = projected;
         }
         // This also rejects a gap in the original admitted source coordinates.
@@ -100,3 +71,135 @@ impl EncodedReadBatch {
         Ok(self)
     }
 }
+
+/// Original spans are ordered by their disjoint logical destination coordinates.
+/// Their source coordinates may repeat or belong to different physical tensors.
+struct SpanProjectionPlan<'a> {
+    spans: &'a [ReadSpan],
+    ranges: &'a [EncodedRange],
+    count: usize,
+    covered: usize,
+    layout: std::alloc::Layout,
+}
+#[derive(Clone, Copy, Debug)]
+enum ProjectionError {
+    Invalid,
+    Layout,
+    Destination { expected: usize, actual: usize },
+}
+impl From<ProjectionError> for StoreError {
+    fn from(error: ProjectionError) -> Self {
+        match error {
+            ProjectionError::Invalid => invalid(),
+            ProjectionError::Layout => {
+                StoreError::Internal("encoded projection span layout overflow".into())
+            }
+            ProjectionError::Destination { expected, actual } => StoreError::Internal(format!(
+                "encoded projection destination has {actual} spans; expected {expected}"
+            )),
+        }
+    }
+}
+impl<'a> SpanProjectionPlan<'a> {
+    fn new(spans: &'a [ReadSpan], ranges: &'a [EncodedRange]) -> Result<Self, ProjectionError> {
+        let mut previous = 0;
+        for span in spans {
+            if span.source.start > span.source.end
+                || span.destination.start > span.destination.end
+                || span.destination.start < previous
+                || u64::try_from(span.destination.len()).ok()
+                    != Some(span.source.end - span.source.start)
+            {
+                return Err(ProjectionError::Invalid);
+            }
+            previous = span.destination.end;
+        }
+        let mut count = 0usize;
+        let covered = project(spans, ranges, |_| {
+            count = count.checked_add(1).ok_or(ProjectionError::Layout)?;
+            Ok(())
+        })?;
+        let layout =
+            std::alloc::Layout::array::<ReadSpan>(count).map_err(|_| ProjectionError::Layout)?;
+        Ok(Self {
+            spans,
+            ranges,
+            count,
+            covered,
+            layout,
+        })
+    }
+    fn fill_into(&self, destination: &mut [ReadSpan]) -> Result<(), ProjectionError> {
+        if destination.len() != self.layout.size() / std::mem::size_of::<ReadSpan>() {
+            return Err(ProjectionError::Destination {
+                expected: self.count,
+                actual: destination.len(),
+            });
+        }
+        let mut next = 0;
+        project(self.spans, self.ranges, |span| {
+            let slot = destination.get_mut(next).ok_or(ProjectionError::Invalid)?;
+            *slot = span;
+            next += 1;
+            Ok(())
+        })?;
+        destination.sort_unstable_by_key(|span| span.source.start);
+        Ok(())
+    }
+}
+
+/// One projection traversal drives both counting and filling. It borrows the
+/// original source coordinates and emits no payload or source-owner changes.
+fn project(
+    spans: &[ReadSpan],
+    ranges: &[EncodedRange],
+    mut emit: impl FnMut(ReadSpan) -> Result<(), ProjectionError>,
+) -> Result<usize, ProjectionError> {
+    let mut covered = 0usize;
+    for row in ranges {
+        let first = spans.partition_point(|span| span.destination.end <= row.source.start);
+        for span in &spans[first..] {
+            if span.destination.start >= row.source.end {
+                break;
+            }
+            let start = span.destination.start.max(row.source.start);
+            let end = span.destination.end.min(row.source.end);
+            if start >= end {
+                continue;
+            }
+            let length = end - start;
+            let file_start = span
+                .source
+                .start
+                .checked_add(
+                    u64::try_from(start - span.destination.start)
+                        .map_err(|_| ProjectionError::Invalid)?,
+                )
+                .ok_or(ProjectionError::Invalid)?;
+            let file_end = file_start
+                .checked_add(u64::try_from(length).map_err(|_| ProjectionError::Invalid)?)
+                .filter(|end| *end <= span.source.end)
+                .ok_or(ProjectionError::Invalid)?;
+            let destination_start = row
+                .destination
+                .start
+                .checked_add(start - row.source.start)
+                .ok_or(ProjectionError::Invalid)?;
+            let destination_end = destination_start
+                .checked_add(length)
+                .ok_or(ProjectionError::Invalid)?;
+            covered = covered
+                .checked_add(length)
+                .ok_or(ProjectionError::Invalid)?;
+            emit(ReadSpan {
+                source: file_start..file_end,
+                destination: destination_start..destination_end,
+            })?;
+        }
+    }
+
+    Ok(covered)
+}
+
+#[cfg(test)]
+mod tests;

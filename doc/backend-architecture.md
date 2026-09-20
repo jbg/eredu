@@ -848,6 +848,12 @@ destination. Encoded projection allocates that destination after counting, so
 range storage follows the selected geometry rather than tensor payload size.
 The plan itself supplies no reservation: read-batch metadata, mapping arrays,
 source/header retention and their construction lifetimes still need admission.
+Per-source projected spans also use a borrowed count/fill plan over the actual
+read intersections. File and memory batches allocate exact span destinations,
+retain their original source owners and restore physical source ordering after
+fill. Counting validates disjoint logical source coordinates and checked span
+layouts; filling refuses wrong destination lengths before writes. This geometry
+plan does not reserve storage or cover source-batch and recipe-mapping creation.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its
