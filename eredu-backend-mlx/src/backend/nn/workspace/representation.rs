@@ -187,6 +187,9 @@ pub(super) fn output(
         // The existing supplied-table adapter's negative half uses try_from_f32.
         K::Rotary(_, None) => F::Float32,
         K::TensorRotary(..) => dtype(operation, 0)?,
+        // Explicit frequencies are cast to F32 internally, but both native
+        // RoPE and its fallback return the input scalar type.
+        K::RotaryFrequencies(..) => dtype(operation, 0)?,
         K::MultiAxisRotary(_) | K::PreparedMultiAxisRotary(_) => {
             return super::positional::rotary_representation(operation, index);
         }

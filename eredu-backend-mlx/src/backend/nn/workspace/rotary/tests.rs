@@ -185,6 +185,77 @@ mod native {
     use eredu_nn::Tensor;
     use safemlx::{Array, Device, DeviceType, Dtype, Stream};
 
+    #[test]
+    #[ignore = "requires Metal; verifies native explicit-frequency output precision"]
+    fn explicit_frequencies_preserve_input_precision_for_empty_and_nonempty_histories() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
+        let mechanism = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            for frequency_dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+                for tokens in [0, 3] {
+                    for strided in [false, true] {
+                        let shape = [1, tokens, 8];
+                        let (source, values) = input(&shape, dtype, strided, &stream);
+                        for dimensions in [4, 8] {
+                            let frequencies = MlxTensor::from_array(
+                                Array::from_slice(
+                                    &(0..dimensions / 2)
+                                        .map(|i| (1 + 2 * i) as f32)
+                                        .collect::<Vec<_>>(),
+                                    &[dimensions / 2],
+                                )
+                                .as_dtype(frequency_dtype, &stream)
+                                .unwrap(),
+                            );
+                            for traditional in [false, true] {
+                                let actual = source.rope_with_frequencies(
+                                    dimensions, traditional, 7, &frequencies, &stream,
+                                ).unwrap();
+                                actual.as_array().evaluated().unwrap();
+                                assert_eq!(actual.as_array().dtype(), dtype);
+                                let context = WorkspaceContext::new(mechanism);
+                                let mut projection = ExistingArrayProjection::with_source_count(&context, 3).unwrap();
+                                let symbolic_source = projection.project(source.as_array()).unwrap();
+                                let symbolic_frequencies = projection.project(frequencies.as_array()).unwrap();
+                                let native = projection.project(actual.as_array()).unwrap();
+                                let symbolic = symbolic_source.rope_with_frequencies(
+                                    dimensions, traditional, 7, &symbolic_frequencies, &context,
+                                ).unwrap();
+                                assert_eq!(symbolic.shape(), actual.shape());
+                                assert_eq!(
+                                    symbolic.layout().representation().unwrap().dtype(),
+                                    native.layout().representation().unwrap().dtype(),
+                                );
+                                let zero = symbolic.zeros_like(&context).unwrap();
+                                assert_eq!(zero.shape(), symbolic.shape());
+                                assert_eq!(zero.layout().representation().unwrap().dtype(),
+                                    native.layout().representation().unwrap().dtype());
+                                let reference = expected(&values, &shape, spec(
+                                    RotaryAlgorithm::Default, RotaryArithmetic::Native,
+                                    traditional, dimensions,
+                                ), 7, true);
+                                let output = actual.to_f32_vec(&stream).unwrap();
+                                assert_eq!(output.len(), reference.len());
+                                for (actual, expected) in output.iter().zip(reference) {
+                                    assert!((*actual as f64 - expected).abs() <= 0.006 + expected.abs() * 0.04);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Frequency precision cannot supply a missing input scalar fact.
+        let context = WorkspaceContext::new(mechanism);
+        let unknown = WorkspaceTensor::existing(
+            context.layout(&[1, 0, 8], WorkspaceDtype::Float32).unwrap(), &context,
+        ).unwrap();
+        let frequencies = WorkspaceTensor::full_f32(1., &[4], &context).unwrap();
+        let result = unknown.rope_with_frequencies(8, true, 0, &frequencies, &context).unwrap();
+        assert!(result.layout().representation().is_none());
+        assert!(result.zeros_like(&context).is_err());
+    }
+
     fn input(shape: &[i32], dtype: Dtype, strided: bool, stream: &Stream) -> (MlxTensor, Vec<f32>) {
         let count = shape.iter().product::<i32>() as usize;
         let values = (0..count)

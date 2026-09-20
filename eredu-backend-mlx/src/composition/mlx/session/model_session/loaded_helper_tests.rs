@@ -4,7 +4,7 @@ use crate::composition::mlx::replicated_text::tests::{
     routed_deepseek_v4_config, tiny_artifact, tiny_heterogeneous_artifact,
 };
 use crate::tests::support::path_instrumentation as paths;
-use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
+use eredu_runtime::working_memory::WorkingMemoryPool;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -282,7 +282,6 @@ mod generation {
         ControlledTextGeneration, InferenceGeometry, OutputDemand, TextGeneration,
         TextGenerationInput, TextPreparationInput, TokenFilterController,
     };
-    use eredu_runtime::working_memory::PrefillPlanningError;
 
     #[derive(Clone, Default)]
     struct Controller(Rc<Cell<(usize, usize)>>);
@@ -346,26 +345,8 @@ mod generation {
             capacity_bytes: (ids.capacity() * std::mem::size_of::<u32>()) as u64,
         }
     }
-    fn assert_incomplete(error: &(dyn std::error::Error + 'static)) {
-        assert!(
-            matches!(
-                cause::<WorkingMemoryError>(error),
-                Some(WorkingMemoryError::UnknownBound)
-            ) || matches!(
-                cause::<PrefillPlanningError>(error),
-                Some(
-                    PrefillPlanningError::IncompleteWorkspace(_)
-                        | PrefillPlanningError::Admission(
-                            eredu_core::AdmissionRejection::EstimationUnsupported { .. }
-                        )
-                )
-            ),
-            "unexpected full V4 quote rejection: {error}"
-        );
-    }
-
     #[test]
-    fn v4_full_quote_reports_actual_completeness_and_three_decodes_match_controlled() {
+    fn v4_full_quote_admits_three_cached_decodes_in_both_drivers() {
         let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
         let source_stream =
             Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
@@ -438,9 +419,10 @@ mod generation {
                             .peak_bytes()
                             .unwrap()
                             .is_some();
-                    eprintln!("V4 actual full quote complete={complete}: equations={:?}, retained={:?}, equation_gap={:?}, sampling={:?}, sampling_gap={:?}, prompt={:?}, state_coverage={:?}, selected_state={:?}, workspace={:?}",
-                        full_generation.equations.transient(), full_generation.equations.retained_peak_bytes(), full_generation.equations.first_gap(),
-                        full_generation.sampling.peak, full_generation.sampling.first_gap, prompt.peak(), full.persistent_state_completeness, full.selected_state_backing, full.execution_workspace);
+                    assert!(complete,
+                        "V4 requires a complete finite quote: equations={:?}, sampling={:?}, prompt={:?}",
+                        full_generation.equations.first_gap(),
+                        full_generation.sampling.first_gap, prompt.peak());
                     assert_eq!(
                         (
                             paths::snapshot(),
@@ -461,56 +443,17 @@ mod generation {
                         config(Some(u64::MAX)),
                         &controller,
                     );
-                    if complete {
-                        let preparation = admitted.unwrap();
-                        let request = preparation.request.as_ref().unwrap().request();
-                        let reservation = request.memory_reservation().unwrap();
-                        assert!(reservation.bytes() > 0);
-                        let ceiling = before.3 .0.checked_add(reservation.bytes()).unwrap();
-                        assert_eq!(pool.used_bytes().unwrap(), ceiling);
-                        // This probe includes our instrumented controller; its
-                        // bound also covers the ordinary driver's default one.
-                        capacity = Some(ceiling);
-                        drop(preparation);
-                        settle(&pool, before.3 .0);
-                    } else {
-                        let error = admitted
-                            .err()
-                            .expect("incomplete full workspace cannot admit");
-                        assert_incomplete(&error);
-                        eprintln!("V4 finite request rejected before work: {error}; remaining quote gap is not finite support");
-                        if controlled {
-                            let error = ControlledTextGeneration::from_input(
-                                &mut runtime,
-                                TextGenerationInput::TokenIds(tokens()),
-                                config(Some(u64::MAX)),
-                                controller.clone(),
-                            )
-                            .err()
-                            .expect("controlled must reject incomplete quote");
-                            assert_incomplete(&error);
-                        } else {
-                            let error =
-                                TextGeneration::new(&mut runtime, tokens(), config(Some(u64::MAX)))
-                                    .err()
-                                    .expect("ordinary must reject incomplete quote");
-                            assert_incomplete(&error);
-                        }
-                        assert_eq!(controller.0.get(), (0, 0));
-                        assert_eq!(
-                            (
-                                paths::snapshot(),
-                                paths::session_input_creation_attempts(),
-                                paths::session_reset_attempts(),
-                                usage(&pool)
-                            ),
-                            before
-                        );
-                        assert_eq!(
-                            runtime.session().payload.model.erased().state_snapshot(),
-                            frontier
-                        );
-                    }
+                    let preparation = admitted.unwrap();
+                    let request = preparation.request.as_ref().unwrap().request();
+                    let reservation = request.memory_reservation().unwrap();
+                    assert!(reservation.bytes() > 0);
+                    let ceiling = before.3 .0.checked_add(reservation.bytes()).unwrap();
+                    assert_eq!(pool.used_bytes().unwrap(), ceiling);
+                    // This probe includes our instrumented controller; its
+                    // bound also covers the ordinary driver's default one.
+                    capacity = Some(ceiling);
+                    drop(preparation);
+                    settle(&pool, before.3 .0);
                 }
                 let outputs = if controlled {
                     ControlledTextGeneration::from_input(

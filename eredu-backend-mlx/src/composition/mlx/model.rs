@@ -384,6 +384,8 @@ impl Executable {
             )
         })?;
         let context = eredu_nn::workspace::WorkspaceContext::new(facts);
+        self.erased().install_workspace_parameter_representations(&context)
+            .map_err(|cause| Error::Other(Box::new(cause)))?;
         let state = self.erased().project_resident_workspace(batch, &context)?;
         blueprint
             .quote_replicated_resident_text(geometry, &state, &context)
@@ -493,6 +495,8 @@ impl Executable {
             )
         })?;
         let context = eredu_nn::workspace::WorkspaceContext::new(facts);
+        self.erased().install_workspace_parameter_representations(&context)
+            .map_err(|cause| Error::Other(Box::new(cause)))?;
         let state = self.erased().project_resident_workspace(batch, &context)?;
         self.quote_sampling_program(geometry, &state, &context, config, filter, capture)
     }
@@ -814,6 +818,8 @@ impl Executable {
             )
         })?;
         let context = eredu_nn::workspace::WorkspaceContext::new(facts);
+        self.erased().install_workspace_parameter_representations(&context)
+            .map_err(|cause| Error::Other(Box::new(cause)))?;
         let projected = self
             .erased()
             .project_resident_workspace_with_storage(batch, &context)?;
