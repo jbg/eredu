@@ -15,24 +15,6 @@ fn product(shape: &[usize]) -> Result<usize, RecipeError> {
         .iter()
         .try_fold(1usize, |n, d| n.checked_mul(*d).ok_or_else(overflow))
 }
-fn collect(recipe: &DerivedWeightRecipe, keys: &mut Vec<String>) -> bool {
-    match recipe {
-        DerivedWeightRecipe::Source { key, .. } => {
-            keys.push(key.clone());
-            true
-        }
-        DerivedWeightRecipe::Concatenate { inputs, .. }
-        | DerivedWeightRecipe::Stack { inputs, .. } => {
-            inputs.iter().all(|input| collect(input, keys))
-        }
-        DerivedWeightRecipe::Select { input, .. }
-        | DerivedWeightRecipe::Reshape { input, .. }
-        | DerivedWeightRecipe::View { input, .. }
-        | DerivedWeightRecipe::Transpose { input, .. }
-        | DerivedWeightRecipe::Cast { input, .. } => collect(input, keys),
-        _ => false,
-    }
-}
 
 mod mapping;
 use mapping::{Mapping, MappingInput, MappingPlan};
@@ -190,13 +172,10 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
 pub(super) fn prepare(
     recipe: &DerivedWeightRecipe,
     source: &dyn CheckpointSource,
+    keys: &[String],
     use_source_cache: bool,
 ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
-    let mut keys = Vec::new();
-    if !collect(recipe, &mut keys) {
-        return Ok(None);
-    }
-    let Some(batch) = source.prepare_encoded_read(&keys)? else {
+    let Some(batch) = source.prepare_encoded_read(keys)? else {
         return Ok(None);
     };
     fn compile<C: RecipeCatalog + ?Sized>(

@@ -860,6 +860,14 @@ share the same adjacency coalescing and slice traversal. Child mappings remain
 borrowed during output construction; exact range storage replaces geometric
 growth, with an additional geometry pass. These layouts alone do not reserve
 storage or cover source metadata, recipe inference and child-array construction.
+Encoded recipe reads share one source-key traversal for structural qualification,
+counting and construction. The ordered occurrence list preserves duplicates and
+uses exact requested vector/string capacities. Runtime implements its existing
+shared initializer directly for the checkpoint-owned plan, comparing before
+construction and retaining custody with the move-only keys or failed prefix.
+Unsupported computational recipes invoke no source read constructor. Geometry
+inference, source-batch admission, projection storage and payloads remain separate;
+the key plan is not a whole-recipe or native-conversion admission grant.
 Contiguous and projected encoded reads share a sized metadata catalog index.
 The index borrows the batch's immutable tensor records, sorts occurrence indices
 in place and retains the last occurrence for duplicate keys. Its single index

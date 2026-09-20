@@ -5,6 +5,7 @@ use std::{
     mem::{size_of, size_of_val},
 };
 
+mod recipe_keys;
 mod memory_read;
 pub use memory_read::MemoryEncodedReadInitializer;
 mod file_read;

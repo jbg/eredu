@@ -11,6 +11,8 @@ use crate::StoredDtype;
 
 mod encoded_projection;
 mod read_catalog;
+mod read_keys;
+pub use read_keys::{EncodedRecipeKeysBuildError, EncodedRecipeKeysPlan, PreparedEncodedRecipeKeys};
 use read_catalog::ReadBatchCatalogPlan;
 mod finite_inference;
 mod uncached_catalog;
@@ -1004,26 +1006,6 @@ impl DerivedWeightRecipe {
         source: &dyn CheckpointSource,
         use_source_cache: bool,
     ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
-        fn collect(recipe: &DerivedWeightRecipe, keys: &mut Vec<String>) -> bool {
-            match recipe {
-                DerivedWeightRecipe::Source {
-                    key,
-                    selection: TensorSelection::Full,
-                } => {
-                    keys.push(key.clone());
-                    true
-                }
-                DerivedWeightRecipe::Concatenate { axis: 0, inputs }
-                | DerivedWeightRecipe::Stack { axis: 0, inputs } => {
-                    inputs.iter().all(|input| collect(input, keys))
-                }
-                DerivedWeightRecipe::Reshape { input, .. }
-                | DerivedWeightRecipe::View { input, .. }
-                | DerivedWeightRecipe::Transpose { input, .. }
-                | DerivedWeightRecipe::Cast { input, .. } => collect(input, keys),
-                _ => false,
-            }
-        }
         // The source batch is already admitted. Use that same catalog for the
         // geometry proof; no source read, payload transform or backend branch.
         fn preserves_bytes<C: RecipeCatalog + ?Sized>(
@@ -1065,11 +1047,17 @@ impl DerivedWeightRecipe {
                 _ => Ok(false),
             }
         }
-        let mut keys = Vec::new();
-        if !collect(self, &mut keys) {
-            return encoded_projection::prepare(self, source, use_source_cache);
+        let Some(plan) = EncodedRecipeKeysPlan::new(self)? else {
+            return Ok(None);
+        };
+        let contiguous = plan.contiguous();
+        let keys = plan.construct(()).map_err(|cause| {
+            StoreError::Internal(format!("encoded recipe source keys: {cause}"))
+        })?;
+        if !contiguous {
+            return encoded_projection::prepare(self, source, keys.keys(), use_source_cache);
         }
-        let Some(batch) = source.prepare_encoded_read(&keys)? else {
+        let Some(batch) = source.prepare_encoded_read(keys.keys())? else {
             return Ok(None);
         };
         let output = if use_source_cache && source.recipe_cache().is_some() {
