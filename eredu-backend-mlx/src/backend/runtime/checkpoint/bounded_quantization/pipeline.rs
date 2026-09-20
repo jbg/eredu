@@ -3,6 +3,8 @@ use super::{
     layout::{BoundedAllocatorCache, OutputLayout, OutputShard},
     preflight::{quantization_error, report_source_bytes},
 };
+mod producer;
+use producer::{OrdinaryTileProducer, TileCompletion, TileProducer};
 
 /// A source checkpoint overlaid with memory-backed, load-time-quantized weights.
 ///
@@ -88,18 +90,10 @@ impl super::preparation::PreparedQuantization {
         self,
         conversion_stream: &Stream,
     ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), Error> {
-        let Self {
-            workspace,
-            source,
-            plan,
-            mut output_shards,
-            transformed_keys,
-            materialized_source_keys,
-            materialized_source_shards,
-        } = self;
         let device = conversion_stream.get_device()?;
-        if workspace
-            != super::workspace::QuantizerWorkspace::selected(plan.quantization, device.get_type()?)
+        let device_type = device.get_type()?;
+        if self.workspace
+            != super::workspace::QuantizerWorkspace::selected(self.plan.quantization, device_type)
         {
             return Err(quantization_error(
                 "quantization destinations require preparation for the selected stream",
@@ -109,6 +103,34 @@ impl super::preparation::PreparedQuantization {
         let tile_contexts = tile_streams
             .each_ref()
             .map(|stream| MlxParameterMaterializationContext::new(stream, stream));
+        self.materialize_with_producer(device_type, &mut OrdinaryTileProducer(tile_contexts))
+    }
+
+    /// Shared tile selection, overlap, writeback and telemetry. The producer
+    /// supplies its selected device fact and independently owned completions;
+    /// it must fund its inputs, native work and retained resources. This driver
+    /// creates no additional device or stream wrapper.
+    pub(super) fn materialize_with_producer<P: TileProducer>(
+        self,
+        device_type: safemlx::DeviceType,
+        producer: &mut P,
+    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), Error> {
+        if self.workspace
+            != super::workspace::QuantizerWorkspace::selected(self.plan.quantization, device_type)
+        {
+            return Err(quantization_error(
+                "quantization destinations require preparation for the selected stream",
+            ));
+        }
+        let Self {
+            workspace: _,
+            source,
+            plan,
+            mut output_shards,
+            transformed_keys,
+            materialized_source_keys,
+            materialized_source_shards,
+        } = self;
 
         let mut report = WeightMaterializationReport {
             admitted_working_set_bytes: plan.max_working_set_bytes,
@@ -124,7 +146,7 @@ impl super::preparation::PreparedQuantization {
                 target,
                 &plan,
                 index,
-                &tile_contexts,
+                producer,
                 &mut output_shards,
                 &mut pending_tiles,
                 &mut allocator_cache,
@@ -345,14 +367,14 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
     }
 }
 
-fn transform_target(
+fn transform_target<P: TileProducer>(
     source: &dyn eredu_checkpoint::store::CheckpointSource,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
     output_shard: usize,
-    tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
+    producer: &mut P,
     output_shards: &mut Vec<OutputShard>,
-    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile<P::Completion>>,
     allocator_cache: &mut BoundedAllocatorCache,
     report: &mut WeightMaterializationReport,
 ) -> Result<(), Error> {
@@ -385,7 +407,7 @@ fn transform_target(
             &target.source,
             target,
             plan.quantization,
-            tile_contexts,
+            producer,
             tile_buffers,
             output_shard,
             0,
@@ -468,7 +490,7 @@ fn transform_target(
                 &recipe,
                 target,
                 plan.quantization,
-                tile_contexts,
+                producer,
                 tile_buffers,
                 output_shard,
                 matrix_start * rows,
@@ -549,7 +571,7 @@ fn transform_target(
                     &tile_recipe,
                     target,
                     plan.quantization,
-                    tile_contexts,
+                    producer,
                     tile_buffers,
                     output_shard,
                     output_start,
@@ -584,12 +606,12 @@ fn transform_target(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn submit_quantization_tile(
+fn submit_quantization_tile<P: TileProducer>(
     source: &dyn CheckpointSource,
     recipe: &DerivedWeightRecipe,
     target: &BoundedQuantizationTarget,
     quantization: WeightQuantization,
-    tile_contexts: &[MlxParameterMaterializationContext; BOUNDED_QUANTIZATION_TILE_BUFFERS],
+    producer: &mut P,
     tile_buffers: usize,
     output_shard: usize,
     output_start: usize,
@@ -597,7 +619,7 @@ fn submit_quantization_tile(
     planned_working_set_bytes: u64,
     output_bytes: u64,
     output_shards: &mut [OutputShard],
-    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile<P::Completion>>,
     allocator_cache: &mut BoundedAllocatorCache,
     report: &mut WeightMaterializationReport,
 ) -> Result<(), Error> {
@@ -609,13 +631,9 @@ fn submit_quantization_tile(
     // read them, after its peak fits alongside the still-pending submissions.
     recipe.preflight_bounded(source)?;
     let metadata = recipe.infer(source)?;
-    let tile_context = &tile_contexts[report.source_tiles % tile_buffers];
-    let tile_stream = tile_context.source_stream();
-    let pending = recipe.prepare_borrowed_materialization(source, tile_context)?;
-    let (dense, source_leases) = pending.into_parts();
-    let mut prepared = WeightMaterialization::prepare_retained(vec![dense], source_leases)?;
-    prepare_quantized_outputs(&mut prepared, quantization, target, tile_stream)?;
-    let completion = prepared.submit_prepared_outputs()?;
+    let completion = producer.submit(
+        source, recipe, target, quantization, report.source_tiles % tile_buffers,
+    )?;
     output_shards[output_shard].tile_submitted();
     pending_tiles.push_back(SubmittedQuantizationTile {
         completion,
@@ -718,21 +736,22 @@ pub(crate) use original_affine::submit_original_affine_tile;
 #[cfg(test)]
 mod output_tests;
 
-struct SubmittedQuantizationTile {
-    completion: WeightMaterialization,
+struct SubmittedQuantizationTile<C> {
+    completion: C,
     output_start: usize,
     rows: usize,
     planned_working_set_bytes: u64,
     output_shard: usize,
 }
 
-impl SubmittedQuantizationTile {
+impl<C: TileCompletion> SubmittedQuantizationTile<C> {
     fn write(self, shard: &mut OutputShard) -> Result<(), Error> {
-        self.completion.wait()?;
+        let materialization = self.completion.materialization();
+        materialization.wait()?;
         for ((layout, output), buffer) in shard
             .layouts
             .iter()
-            .zip(self.completion.completed_outputs())
+            .zip(materialization.completed_outputs())
             .zip(&mut shard.buffers)
         {
             write_tile(
@@ -743,12 +762,12 @@ impl SubmittedQuantizationTile {
                 &output?,
             )?;
         }
-        Ok(())
+        self.completion.retire()
     }
 }
 
-fn write_oldest_tile(
-    pending_tiles: &mut VecDeque<SubmittedQuantizationTile>,
+fn write_oldest_tile<C: TileCompletion>(
+    pending_tiles: &mut VecDeque<SubmittedQuantizationTile<C>>,
     output_shards: &mut [OutputShard],
     allocator_cache: &mut BoundedAllocatorCache,
 ) -> Result<(), Error> {
@@ -765,8 +784,8 @@ fn write_oldest_tile(
     Ok(())
 }
 
-fn queued_working_set_bytes(
-    pending_tiles: &VecDeque<SubmittedQuantizationTile>,
+fn queued_working_set_bytes<C>(
+    pending_tiles: &VecDeque<SubmittedQuantizationTile<C>>,
 ) -> Result<u64, Error> {
     pending_tiles.iter().try_fold(0u64, |total, tile| {
         total

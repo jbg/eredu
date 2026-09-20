@@ -801,6 +801,14 @@ transfers its owners to the same recovery queue. Queued conversion tiles need
 independent scopes because a materialization owner observes its entire scope.
 Synchronous native roles submit and finish through this same implementation,
 preserving their deadline across the callback and final completion observation.
+Bounded conversion shares tile selection, the cross-weight completion window,
+writeback and telemetry across producers. An ordinary producer supplies its
+existing materialization owner; a cold producer supplies an independently scoped
+submission. The queue keeps either owner through output readback and retires the
+cold submission after successful writeback. A later submission or writeback
+failure drops the same queued owners through their existing recovery paths.
+The common driver takes the selected device fact without constructing device or
+stream wrappers; producer resources and pipeline metadata need separate admission.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming
