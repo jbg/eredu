@@ -7,6 +7,8 @@ use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
 pub enum SafetensorsEncodedReadPlanError<'a> {
     /// This source does not contain the requested occurrence.
     UnknownTensor { index: usize },
+    /// An enclosing concrete view excludes this requested occurrence.
+    UnauthorizedTensor { index: usize, contract: &'a str },
     /// Header construction belongs to the source's separate retained admission.
     HeaderUnavailable { index: usize },
     /// The original source still owns this header failure.
@@ -23,6 +25,10 @@ impl fmt::Display for SafetensorsEncodedReadPlanError<'_> {
             Self::UnknownTensor { index } => {
                 write!(f, "encoded file source occurrence {index} is absent")
             }
+            Self::UnauthorizedTensor { index, contract } => write!(
+                f,
+                "encoded file source occurrence {index} is not authorized by {contract:?}"
+            ),
             Self::HeaderUnavailable { index } => write!(
                 f,
                 "encoded file source occurrence {index} has no prepared header"
@@ -48,6 +54,10 @@ impl SafetensorsEncodedReadPlanError<'_> {
         match self {
             Self::UnknownTensor { index } => StoreError::UnknownTensor {
                 key: keys[index].clone(),
+            },
+            Self::UnauthorizedTensor { index, contract } => StoreError::UnauthorizedTensor {
+                key: keys[index].clone(),
+                contract: contract.into(),
             },
             Self::Header { source, .. } => source.clone(),
             Self::HeaderUnavailable { .. } => {
@@ -78,6 +88,30 @@ pub struct SafetensorsEncodedReadPlan<'a> {
     backing_bytes: usize,
 }
 impl<'a> SafetensorsEncodedReadPlan<'a> {
+    /// Authenticate and borrow an actual file source through retained built-in
+    /// views, preserving their ordered batch authorization. The root and keys
+    /// stay borrowed through inspection/construction; completed batches own their
+    /// file identities. Unsupported or forwarded routes return no plan and never
+    /// invoke ordinary read preparation. Header failures remain source-owned loans.
+    ///
+    /// ```compile_fail
+    /// use eredu_checkpoint::store::{RetainedCheckpointSource, SafetensorsEncodedReadPlan};
+    /// fn retire_early(root: RetainedCheckpointSource, keys: &[String]) {
+    ///     let plan = SafetensorsEncodedReadPlan::from_source(&root, keys).unwrap().unwrap();
+    ///     drop(root);
+    ///     let _ = plan.construct(());
+    /// }
+    /// ```
+    pub fn from_source(
+        source: &'a RetainedCheckpointSource,
+        keys: &'a [String],
+    ) -> Result<Option<Self>, SafetensorsEncodedReadPlanError<'a>> {
+        let Some(store) = acquisition::retained_route::encoded_file_source(source, keys)? else {
+            return Ok(None);
+        };
+        Self::new(store, keys).map(Some)
+    }
+
     /// Inspect only headers already retained by this exact source. Missing headers
     /// refuse without an ordinary fallback or a new header-initialization charge.
     pub fn new(
@@ -373,5 +407,7 @@ impl<C> std::error::Error for SafetensorsEncodedReadBuildError<C> {
     }
 }
 
+#[cfg(test)]
+mod route_tests;
 #[cfg(test)]
 mod tests;

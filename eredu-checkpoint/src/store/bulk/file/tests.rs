@@ -1,7 +1,7 @@
 use super::*;
 use safetensors::tensor::{TensorView, serialize_to_file};
 
-fn fixture() -> (tempfile::TempDir, SafetensorsWeightStore) {
+pub(super) fn fixture() -> (tempfile::TempDir, SafetensorsWeightStore) {
     let directory = tempfile::tempdir().unwrap();
     for (name, rows) in [
         (
@@ -30,7 +30,7 @@ fn fixture() -> (tempfile::TempDir, SafetensorsWeightStore) {
     let store = SafetensorsWeightStore::open(directory.path()).unwrap();
     (directory, store)
 }
-fn warm(store: &SafetensorsWeightStore) {
+pub(super) fn warm(store: &SafetensorsWeightStore) {
     for key in ["a", "c"] {
         WeightStore::metadata(store, key).unwrap();
     }

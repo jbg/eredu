@@ -1,8 +1,8 @@
 //! Original file-read metadata admission, separate from source/header ownership.
 use super::*;
 use eredu_checkpoint::store::{
-    PreparedSafetensorsEncodedRead, SafetensorsEncodedReadBuildError, SafetensorsEncodedReadPlan,
-    SafetensorsEncodedReadPlanError, SafetensorsWeightStore,
+    PreparedSafetensorsEncodedRead, RetainedCheckpointSource, SafetensorsEncodedReadBuildError,
+    SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError, SafetensorsWeightStore,
 };
 
 /// Binds the actual source's prepared headers before comparing the original
@@ -10,6 +10,16 @@ use eredu_checkpoint::store::{
 /// separate admission. The plan never opens a source or initializes a header.
 pub struct SafetensorsEncodedReadInitializer<'a>(SafetensorsEncodedReadPlan<'a>);
 impl<'a> SafetensorsEncodedReadInitializer<'a> {
+    /// Borrow an authorized concrete file source through retained built-in views.
+    /// The root and keys stay borrowed until construction or rejected-plan drop.
+    /// This does not initialize headers or invoke ordinary read preparation.
+    pub fn from_source(
+        source: &'a RetainedCheckpointSource,
+        keys: &'a [String],
+    ) -> Result<Option<Self>, SafetensorsEncodedReadPlanError<'a>> {
+        SafetensorsEncodedReadPlan::from_source(source, keys).map(|plan| plan.map(Self))
+    }
+
     /// Inspect only metadata already retained by this exact immutable source.
     pub fn new(
         source: &'a SafetensorsWeightStore,

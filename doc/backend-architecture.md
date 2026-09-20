@@ -897,6 +897,14 @@ admitted-path table. Construction and reads mark existing rows without extending
 a path set. Header/source construction and later read scratch and output buffers
 remain separate admission requirements; file batches keep exact admitted file
 identities and use the existing validated borrowed read worker.
+File and memory read selection share the same retained-view authorization worker.
+File selection borrows an authenticated concrete source through the original root;
+the root and ordered keys remain borrowed through comparison and construction.
+This preserves exact source-owned header errors and contract identities without
+allocating route records or invoking ordinary read preparation. Completed file
+batches own their file identities and metadata, so the views may then retire.
+Memory selection retains its selected store independently of the enclosing views.
+Both paths preserve prepared-catalog qualification and composite batch ordering.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its
