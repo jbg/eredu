@@ -225,6 +225,42 @@ fn realized_cpu_identity_is_derived_from_the_native_device() {
 }
 
 #[test]
+#[cfg(target_vendor = "apple")]
+fn cpu_factory_retains_admitted_streams_without_requiring_metal() {
+    const CASE: &str = "cpu_factory_retains_admitted_streams_without_requiring_metal";
+    if std::env::var("EREDU_CPU_FACTORY_CASE").as_deref() != Ok(CASE) {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("composition::mlx::automatic::tests::{CASE}"),
+                "--nocapture",
+            ])
+            .env("EREDU_CPU_FACTORY_CASE", CASE)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("CPU_FACTORY_OK"));
+        return;
+    }
+
+    let backend = realize_backend(&DevicePlan::new("mlx", "cpu:0").unwrap()).unwrap();
+    backend.validate_original_stream_owners().unwrap();
+    backend.observe_original_streams_idle().unwrap();
+    assert_eq!(backend.stream().device_type().unwrap(), DeviceType::Cpu);
+    assert_eq!(
+        backend.weights_stream().device_type().unwrap(),
+        DeviceType::Cpu
+    );
+    assert_eq!(backend.memory_pool().unquoted_owner_count().unwrap(), 0);
+    println!("CPU_FACTORY_OK");
+}
+
+#[test]
 fn realization_rejects_generic_gpu_family() {
     let plan = DevicePlan::new("mlx", "gpu:0").unwrap();
     let error = mlx_device(&plan).unwrap_err();

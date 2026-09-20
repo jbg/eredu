@@ -366,22 +366,34 @@ fn realize_backend(device: &DevicePlan) -> Result<MlxBackend<'static>, Automatic
     let realized = mlx_device(device)?;
     // The factory owns these native constructors. Exact prepared wrappers
     // and source accounts remain in MlxBackend; no ordinary clone is needed.
-    if cfg!(all(feature = "metal", target_vendor = "apple")) {
-        let kind=realized.device.get_type().map_err(|error|planning_backend_error("execution_device_type",error))?;
-        let index=realized.device.get_index().map_err(|error|planning_backend_error("execution_device_index",error))?;
-        if index==0 {
-            let pool=crate::backend::managed_memory::domain();
-            let streams=crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(&pool,kind).map_err(|error|planning_backend_error("create_admitted_execution_stream",error.into_backend_failure()))?;
-            if let Some(streams)=streams {
-                return Ok(MlxBackend::for_prepared_execution_plan(streams,realized.identity));
-            }
+    let kind = realized
+        .device
+        .get_type()
+        .map_err(|error| planning_backend_error("execution_device_type", error))?;
+    let index = realized
+        .device
+        .get_index()
+        .map_err(|error| planning_backend_error("execution_device_index", error))?;
+    if index == 0 {
+        let pool = crate::backend::managed_memory::domain();
+        let streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(&pool, kind)
+            .map_err(|error| planning_backend_error("create_admitted_execution_stream", error.into_backend_failure()))?;
+        if let Some(streams) = streams {
+            return Ok(MlxBackend::for_prepared_execution_plan(
+                streams,
+                realized.identity,
+            ));
         }
     }
     let stream = Stream::try_new_with_device(&realized.device)
         .map_err(|error| planning_backend_error("create_execution_stream", error))?;
     let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
         .map_err(|error| planning_backend_error("create_weights_stream", error))?;
-    Ok(MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity))
+    Ok(MlxBackend::for_execution_plan(
+        &stream,
+        &weights_stream,
+        realized.identity,
+    ))
 }
 
 /// Converts an MLX routed-expert cache snapshot into neutral telemetry.

@@ -1271,6 +1271,13 @@ inspections are never promoted to funded origins. GGUF loading retains its
 ordinary route; explicit catalog-pool preparation is independently available.
 Payloads and subsequent recipe storage require separate admission.
 
+The MLX execution-plan factory selects admitted execution and source streams
+from the actual device before ordinary stream construction. CPU stream and
+worker ownership uses that same factory without requiring the Metal feature.
+An unavailable native stream layout permits ordinary construction; a failure
+after admission propagates. Stream ownership alone does not establish complete
+workspace coverage for the selected allocator and operators.
+
 Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
 selected checkpoint contract. Ordinary and admitted preparation share the same
 descriptor conversion, metadata comparison and provenance construction. Runtime
