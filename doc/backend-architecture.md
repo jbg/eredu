@@ -768,6 +768,11 @@ sources with the same recovery owner. Original materialization owners use their
 prepared vector capacity and reject growth. They can submit a caller-supplied
 finite traversal on an explicit stream through that same owner; source preparation,
 native fit and producer admission remain the caller's separate obligations.
+The CPU affine tile entry authenticates that owner and validates its completed
+input and selected storage quote before constructing quantization or companion
+casts. It uses the shared tile producer with separate affine and cast constructor
+banks, then submits the quote's finite traversal through the retained owner.
+Lazy inputs and mismatched quotes are rejected before producing native outputs.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

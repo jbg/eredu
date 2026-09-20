@@ -353,6 +353,18 @@ impl WeightMaterialization {
         &self.retained.retention().inputs
     }
 
+    /// Authenticate the retained owner before preparing original native work.
+    pub(crate) fn original_observer(
+        &self,
+    ) -> Result<&OriginalScopeObserver, CheckpointMaterializationError> {
+        let observer = self
+            .retained
+            .original_observer()
+            .ok_or(CheckpointMaterializationError::OriginalOperationDomain)?;
+        validate_operation(observer)?;
+        Ok(observer)
+    }
+
     pub(crate) fn outputs(&self) -> &[Array] {
         &self.retained.retention().outputs
     }

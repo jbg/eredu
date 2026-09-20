@@ -242,6 +242,37 @@ fn component_destinations_with_retained_account_and_controls<T>(
         OriginalHostDestinationBank,
     ) -> T,
 ) -> T {
+    component_destinations_with_native_budget(
+        source_bytes,
+        attempts,
+        partitions,
+        destinations,
+        existing,
+        additional_ceiling,
+        retained_account,
+        additional_controls,
+        None,
+        operation,
+    )
+}
+
+fn component_destinations_with_native_budget<T>(
+    source_bytes: u64,
+    attempts: usize,
+    partitions: usize,
+    destinations: Option<(u64, usize, usize)>,
+    existing: u64,
+    additional_ceiling: impl FnOnce(&WorkingMemoryPool) -> u64,
+    retained_account: u64,
+    additional_controls: u64,
+    native_budget: Option<&safemlx::OriginalBufferBudget>,
+    operation: impl FnOnce(
+        &OriginalTextControlGuard,
+        &OriginalScopeObserver,
+        &WorkingMemoryPool,
+        OriginalHostDestinationBank,
+    ) -> T,
+) -> T {
     let support = SupportFacts::new();
     let source = HostSourceConstructionFacts::new(
         source_bytes + support.bytes(),
@@ -422,6 +453,9 @@ fn component_destinations_with_retained_account_and_controls<T>(
     scope.require_original_native_controls().unwrap();
     failure.bind_original_scope(&scope).unwrap();
     scope.enable_original_native_controls().unwrap();
+    if let Some(budget) = native_budget {
+        scope.bind_original_buffer_budget(budget).unwrap();
+    }
     let observer = OriginalScopeObserver::require_current().unwrap();
     assert_eq!(
         (
@@ -848,3 +882,6 @@ fn original_fixed_collector_deduplicates_refuses_before_clone_and_retires_final_
     drop(last);
     settle_pool(&pool);
 }
+
+#[path = "funded_component/affine_tile.rs"]
+mod affine_tile;

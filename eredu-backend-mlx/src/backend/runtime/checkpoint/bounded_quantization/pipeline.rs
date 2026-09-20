@@ -652,6 +652,7 @@ fn prepare_quantized_outputs(
         quantization,
         target,
         stream,
+        None,
         |array, dtype, stream| array.as_dtype(dtype, stream),
     )
 }
@@ -661,6 +662,10 @@ fn prepare_quantized_outputs_with(
     quantization: WeightQuantization,
     target: &BoundedQuantizationTarget,
     stream: &Stream,
+    original: Option<(
+        safemlx::CpuAffineQuantizeSubmissionLayout,
+        &safemlx::OriginalScopeObserver,
+    )>,
     mut convert: impl FnMut(&Array, Dtype, &Stream) -> Result<Array, safemlx::error::Exception>,
 ) -> Result<(), Error> {
     prepared.prepare_output_capacity(if matches!(quantization, WeightQuantization::MxFp4) {
@@ -668,7 +673,15 @@ fn prepare_quantized_outputs_with(
     } else {
         3
     })?;
+    use crate::backend::runtime::checkpoint::store::CheckpointMaterializationError;
+    let construction = original
+        .map(|(layout, observer)| {
+            safemlx::OperationEvent::prepare_affine_quantize_graph(layout.construction(), observer)
+                .map_err(CheckpointMaterializationError::OriginalNative)
+        })
+        .transpose()?;
     let quantized = quantize_tensor(&prepared.inputs()[0], quantization, stream)?;
+    drop(construction);
     prepared.retain_output(quantized.weight)?;
     prepared.retain_output(quantized.scales)?;
     if let Some(biases) = quantized.biases {
@@ -681,13 +694,26 @@ fn prepare_quantized_outputs_with(
         _ => unreachable!("validated bounded companion dtype"),
     };
     if !matches!(quantization, WeightQuantization::MxFp4) {
+        let construction = original
+            .and_then(|(layout, observer)| {
+                layout.companion_construction().map(|layout| (layout, observer))
+            })
+            .map(|(layout, observer)| {
+                safemlx::OperationEvent::prepare_resident_graph(layout, observer)
+                    .map_err(CheckpointMaterializationError::OriginalNative)
+            })
+            .transpose()?;
         for index in 1..prepared.outputs().len() {
             let converted = convert(&prepared.outputs()[index], companion_dtype, stream)?;
             prepared.replace_output(index, converted);
         }
+        drop(construction);
     }
     Ok(())
 }
+
+mod original_affine;
+pub(crate) use original_affine::submit_original_affine_tile;
 
 #[cfg(test)]
 mod output_tests;

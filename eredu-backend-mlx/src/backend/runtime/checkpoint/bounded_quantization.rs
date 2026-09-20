@@ -56,6 +56,7 @@ mod workspace;
 pub(crate) use workspace::cpu_quantization_temporary_row_bytes;
 
 pub use pipeline::BoundedQuantizedWeightStore;
+pub(crate) use pipeline::submit_original_affine_tile;
 pub(crate) use handoff::ConvertedQuantization;
 pub(crate) use preparation::{ColdQuantization, PreparedQuantization};
 pub use plan::{BoundedQuantizationPlan, BoundedQuantizationTarget};

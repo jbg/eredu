@@ -25,6 +25,7 @@ fn companion_failure_keeps_native_siblings_and_each_accepted_conversion() {
             eredu_checkpoint::AffineQuantization::default().into(),
             &target(),
             &stream,
+            None,
             |input, dtype, stream| {
                 let ordinal = calls;
                 calls += 1;
@@ -82,6 +83,7 @@ fn mxfp4_retains_two_roots_without_converting_encoded_scales() {
         WeightQuantization::MxFp4,
         &target(),
         &stream,
+        None,
         |_, _, _| panic!("MXFP4 scales must retain their encoded dtype"),
     )
     .unwrap();
