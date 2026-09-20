@@ -827,6 +827,13 @@ contiguous/projection compiler. It infers against metadata retained by the read
 batch, so temporary inference does not consult or populate the source's
 persistent cache. Construction metadata, the retained read and read scratch
 still require their own admission; disabling inference caching grants none.
+Bounded conversion's geometry, selection search, peak sizing and source-byte
+telemetry use a borrowed uncached catalog view. Recursive inference follows the
+same recipe algorithms but leaves temporary candidate recipes and metadata with
+the caller, without retaining them in the source's persistent inference cache.
+Repeated inspections recompute metadata. Physical bounded-read checks and each
+producer's materialization ownership remain separate; the view itself supplies
+no reservation for temporary construction or retained read metadata.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

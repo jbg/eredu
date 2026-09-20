@@ -85,3 +85,6 @@ mod encoded_affine;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod planning_tests;

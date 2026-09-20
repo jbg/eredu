@@ -413,6 +413,7 @@ fn transform_target<P: TileProducer>(
     allocator_cache: &mut BoundedAllocatorCache,
     report: &mut WeightMaterializationReport,
 ) -> Result<(), P::Error> {
+    let catalog = eredu_checkpoint::recipe::UncachedRecipeCatalog::new(source);
     let super::preparation::ConversionGeometry {
         leading,
         rows,
@@ -462,7 +463,7 @@ fn transform_target<P: TileProducer>(
             while matrix_end + 1 < rejected_end {
                 let candidate_end = matrix_end + (rejected_end - matrix_end) / 2;
                 let candidate = target.source.select_bounded(
-                    source,
+                    &catalog,
                     TensorSelection::Range {
                         axis: 0,
                         start: matrix_start,
@@ -479,7 +480,7 @@ fn transform_target<P: TileProducer>(
                     .checked_mul(candidate_rows as u64)
                     .ok_or_else(|| quantization_error("leading batch output size overflow"))?;
                 let candidate_peak = candidate
-                    .peak_materialization_bytes(source)?
+                    .peak_materialization_bytes(&catalog)?
                     .checked_add(candidate_output_bytes)
                     .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                     .ok_or_else(|| quantization_error("leading batch working-set overflow"))?;
@@ -492,7 +493,7 @@ fn transform_target<P: TileProducer>(
                 }
             }
             let recipe = target.source.select_bounded(
-                source,
+                &catalog,
                 TensorSelection::Range {
                     axis: 0,
                     start: matrix_start,
@@ -506,7 +507,7 @@ fn transform_target<P: TileProducer>(
                 .checked_mul(batch_rows as u64)
                 .ok_or_else(|| quantization_error("leading batch output size overflow"))?;
             let batch_peak = recipe
-                .peak_materialization_bytes(source)?
+                .peak_materialization_bytes(&catalog)?
                 .checked_add(
                     live_output_row_bytes
                         .checked_mul(batch_rows as u64)
@@ -551,7 +552,7 @@ fn transform_target<P: TileProducer>(
                 while end + 1 < rejected_end {
                     let candidate_end = end + (rejected_end - end) / 2;
                     let candidate = target.source.select_bounded_matrix_rows(
-                        source,
+                        &catalog,
                         matrix,
                         start,
                         candidate_end,
@@ -561,7 +562,7 @@ fn transform_target<P: TileProducer>(
                         .checked_mul(candidate_rows as u64)
                         .ok_or_else(|| quantization_error("candidate tile output size overflow"))?;
                     let peak = candidate
-                        .peak_materialization_bytes(source)?
+                        .peak_materialization_bytes(&catalog)?
                         .checked_add(output_bytes)
                         .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                         .ok_or_else(|| quantization_error("candidate tile working-set overflow"))?;
@@ -578,12 +579,12 @@ fn transform_target<P: TileProducer>(
                 let tile_rows = end - start;
                 let tile_recipe = target
                     .source
-                    .select_bounded_matrix_rows(source, matrix, start, end)?;
+                    .select_bounded_matrix_rows(&catalog, matrix, start, end)?;
                 let tile_output_bytes = output_row_bytes
                     .checked_mul(tile_rows as u64)
                     .ok_or_else(|| quantization_error("quantized tile output size overflow"))?;
                 let tile_peak = tile_recipe
-                    .peak_materialization_bytes(source)?
+                    .peak_materialization_bytes(&catalog)?
                     .checked_add(
                         live_output_row_bytes
                             .checked_mul(tile_rows as u64)
@@ -665,7 +666,8 @@ fn submit_quantization_tile<P: TileProducer>(
     // Verification acquires real payload leases. Only the selected tile may
     // read them, after its peak fits alongside the still-pending submissions.
     recipe.preflight_bounded(source)?;
-    let metadata = recipe.infer(source)?;
+    let catalog = eredu_checkpoint::recipe::UncachedRecipeCatalog::new(source);
+    let metadata = recipe.infer(&catalog)?;
     let completion = producer.submit(
         source, recipe, target, quantization, report.source_tiles % tile_buffers,
     )?;

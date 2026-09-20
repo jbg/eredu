@@ -241,7 +241,8 @@ fn prepare_target(
     plan: &BoundedQuantizationPlan,
     workspace: QuantizerWorkspace,
 ) -> Result<TargetOutputs, Error> {
-    let metadata = target.source.infer(source)?;
+    let catalog = eredu_checkpoint::recipe::UncachedRecipeCatalog::new(source);
+    let metadata = target.source.infer(&catalog)?;
     if metadata.shape().len() < 2
         || !matches!(
             metadata.dtype(),
@@ -316,11 +317,11 @@ fn prepare_target(
     for matrix in 0..leading {
         let one_row = target
             .source
-            .select_bounded_matrix_rows(source, matrix, 0, 1)?;
-        one_row_source_bytes = one_row_source_bytes.max(one_row.infer(source)?.byte_len());
+            .select_bounded_matrix_rows(&catalog, matrix, 0, 1)?;
+        one_row_source_bytes = one_row_source_bytes.max(one_row.infer(&catalog)?.byte_len());
         one_row_peak = one_row_peak.max(
             one_row
-                .peak_materialization_bytes(source)?
+                .peak_materialization_bytes(&catalog)?
                 .checked_add(live_output_row_bytes)
                 .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
                 .ok_or_else(|| quantization_error("one-row conversion working-set overflow"))?,
@@ -354,7 +355,7 @@ fn prepare_target(
         .ok_or_else(|| quantization_error("complete target element count overflow"))?;
     let complete_peak = target
         .source
-        .peak_materialization_bytes(source)?
+        .peak_materialization_bytes(&catalog)?
         .checked_add(
             live_output_row_bytes
                 .checked_mul(complete_rows as u64)
@@ -364,7 +365,7 @@ fn prepare_target(
         .ok_or_else(|| quantization_error("complete target working-set overflow"))?;
     let leading_batch_admissible = if row_axis == 1 {
         let one_matrix = target.source.select_bounded(
-            source,
+            &catalog,
             TensorSelection::Range {
                 axis: 0,
                 start: 0,
@@ -375,7 +376,7 @@ fn prepare_target(
             .checked_mul(rows as u64)
             .ok_or_else(|| quantization_error("one-matrix output size overflow"))?;
         one_matrix
-            .peak_materialization_bytes(source)?
+            .peak_materialization_bytes(&catalog)?
             .checked_add(one_matrix_output)
             .and_then(|bytes| bytes.checked_add(fixed_working_set_bytes))
             .is_some_and(|peak| peak <= tile_budget)

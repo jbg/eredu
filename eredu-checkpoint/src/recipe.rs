@@ -11,6 +11,8 @@ use crate::StoredDtype;
 
 mod encoded_projection;
 mod finite_inference;
+mod uncached_catalog;
+pub use uncached_catalog::UncachedRecipeCatalog;
 pub use finite_inference::{
     infer_recipe_bytes, RecipeInferenceError, RecipeInferenceInput, RecipeInferenceLayout,
 };
