@@ -2726,7 +2726,6 @@ where
         &mut self,
         visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
     ) -> bool {
-        self.observation_binding.invalidate();
         crate::parameter_operations::visit_loaded_parameters_in_parts::<A, B, S, P>(
             &mut self.architecture, &mut self.policy, visitor,
         )
@@ -2737,7 +2736,6 @@ where
         operation: &mut crate::parameter_operations::ParameterSlotOperation<'_, B::Tensor, P::Error>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<bool, LayerwiseAcquireError<A::Error, P::Error>> {
-        self.observation_binding.invalidate();
         crate::parameter_operations::with_parameter_slots_in_parts::<A, B, S, P>(
             &mut self.architecture, &mut self.policy, location, operation, context,
         )

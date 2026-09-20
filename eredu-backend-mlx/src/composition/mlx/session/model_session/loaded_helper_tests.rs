@@ -57,7 +57,7 @@ fn cause<'a, T: std::error::Error + 'static>(
 #[derive(Default)]
 struct Parameters(BTreeMap<String, safemlx::AllocationIdentity>);
 impl eredu_nn::ParameterSlotVisitor<crate::MlxTensor> for Parameters {
-    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut crate::MlxTensor) {
+    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &crate::MlxTensor) {
         let identity = value
             .as_array()
             .try_metadata_snapshot()

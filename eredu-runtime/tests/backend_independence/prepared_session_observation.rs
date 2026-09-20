@@ -104,7 +104,7 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
 }
 pub(super) struct Slots;
 impl eredu_nn::ParameterSlotVisitor<FakeTensor> for Slots {
-    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut FakeTensor) {}
+    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &FakeTensor) {}
 }
 
 #[test]
@@ -185,8 +185,10 @@ fn stale_binding_rejects_before_state_and_cold_rebind_reuses_original_source() {
     ] {
         let (mut session, counters) = session(residency);
         let mut observer = Observer::new(&session);
-        // Mutable parameter-owner exposure invalidates even if no slot is changed.
         let _ = session.visit_loaded_parameters(&mut Slots);
+        session.validate_prepared_observation_paths(session.shared_observation_paths().unwrap()).unwrap();
+        // Replacement publication invalidates even if the replacement set is empty.
+        session.publish_parameter_replacements(&Default::default(), false).unwrap();
         let before = counters.snapshot();
         let error = session
             .forward_with_observer(&FakeTensor(vec![4, 9]), None, &(), &mut observer)
@@ -289,7 +291,7 @@ fn cold_path_validation_rejects_stale_token_and_accepts_valid_same_source_rebind
         session
             .validate_prepared_observation_paths(&source)
             .unwrap();
-        let _ = session.visit_loaded_parameters(&mut Slots);
+        session.publish_parameter_replacements(&Default::default(), false).unwrap();
         let before = counters.snapshot();
         assert!(matches!(
             session.validate_prepared_observation_paths(&source),

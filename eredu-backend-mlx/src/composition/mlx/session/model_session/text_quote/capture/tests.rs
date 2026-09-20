@@ -416,10 +416,6 @@ fn original_capture_bank_rejects_wrong_source_and_coordinates_then_moves_once() 
     disk::settle(&pool, 0);
 }
 
-struct Slots;
-impl eredu_nn::ParameterSlotVisitor<crate::MlxTensor> for Slots {
-    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut crate::MlxTensor) {}
-}
 #[test]
 fn original_capture_bank_checks_actual_current_path_token_before_consumption() {
     let stream = stream();
@@ -440,7 +436,8 @@ fn original_capture_bank_checks_actual_current_path_token_before_consumption() {
         payload
             .model
             .erased_mut()
-            .visit_loaded_parameters(&mut Slots)
+            .publish_parameter_replacements(&Default::default(), false)
+            .unwrap()
     );
     let before = path_instrumentation::snapshot();
     let used = pool.used_bytes().unwrap();

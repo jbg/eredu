@@ -264,8 +264,8 @@ fn publish_original<U: Parameterized<MlxTensor>>(
         values: &'a BTreeMap<String, MlxTensor>,
         failure: Option<safemlx::error::Exception>,
     }
-    impl ParameterSlotVisitor<MlxTensor> for PublishOriginal<'_> {
-        fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
+    impl<'a> ParameterVisitorMut<'a, MlxTensor> for PublishOriginal<'_> {
+        fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
             if self.failure.is_some() {
                 return;
             }
@@ -279,7 +279,6 @@ fn publish_original<U: Parameterized<MlxTensor>>(
     }
     let frames = [
         size_of::<PublishOriginal<'_>>(),
-        size_of::<Slots<'_>>(),
         size_of::<Result<(), Error>>(),
         size_of::<Result<safemlx::Array, safemlx::error::Exception>>(),
         size_of::<ParameterMetadata>(),
@@ -304,7 +303,7 @@ fn publish_original<U: Parameterized<MlxTensor>>(
         values,
         failure: None,
     };
-    module.visit_parameters_mut(&mut Slots(&mut publish));
+    module.visit_parameters_mut(&mut publish);
     match publish.failure {
         Some(cause) => Err(cause.into()),
         None => Ok(()),

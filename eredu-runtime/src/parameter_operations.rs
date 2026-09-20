@@ -175,9 +175,8 @@ where
     policy.visit_resident_parameter_sources(visitor, context)
 }
 
-// These closed workers expose only the existing tensor-slot operations. A
-// runtime can preserve validated topology while still invalidating observation
-// bindings, without exposing its raw mutable architecture to the caller.
+// Inspection lends immutable tensor values; publication separately replaces
+// slots. Neither operation exposes the raw architecture to its caller.
 pub(crate) fn visit_loaded_parameters_in_parts<A, B, S, P>(
     architecture: &mut A,
     policy: &mut P,
@@ -255,21 +254,31 @@ where
     if !policy.publish_parameter_replacements(values, active)? {
         return Ok(false);
     }
-    struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
-    impl<T: Clone> eredu_nn::ParameterSlotVisitor<T> for Publish<'_, T> {
-        fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut T) {
-            if let Some(replacement) = self.0.get(metadata.id().as_str()) {
-                *value = replacement.clone();
-            }
-        }
-    }
     match architecture
-        .visit_static_parameters_mut(&mut LoadedSlotAdapter::<B>(&mut Publish(values)))
+        .visit_static_parameters_mut(&mut Publish(values))
     {
         Ok(()) => {}
         Err(never) => match never {},
     }
     Ok(true)
+}
+
+struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
+impl<'a, T: Clone + 'a> eredu_nn::ParameterVisitorMut<'a, T> for Publish<'_, T> {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut T) {
+        if let Some(replacement) = self.0.get(metadata.id().as_str()) {
+            *value = replacement.clone();
+        }
+    }
+}
+impl<B: NeuralBackend> crate::StaticParameterVisitorMut<B> for Publish<'_, B::Tensor> {
+    type Error = std::convert::Infallible;
+    fn visit_mut<M: Parameterized<B::Tensor>>(
+        &mut self, _role: &str, module: &mut M,
+    ) -> Result<(), Self::Error> {
+        module.visit_parameters_mut(self);
+        Ok(())
+    }
 }
 
 struct LoadedSlotAdapter<'a, B: NeuralBackend>(

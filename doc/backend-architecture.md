@@ -103,6 +103,11 @@ roles and exact prepared artifacts rather than reopening artifacts, redispatchin
 source formats or reconstructing family branches. External-assistant compatibility
 and source selection also precede target/draft resource materialization.
 
+Parameter discovery and residency-scoped queries lend immutable tensor values.
+They preserve prepared observation bindings. Replacement publication remains a
+separate operation that invalidates bindings and requires fresh preparation;
+callers cannot replace parameter slots through inspection visitors.
+
 Prepared configuration loans project the typed configuration from the retained
 artifact and verify its identity. Execution eligibility belongs to cold selection;
 borrowing a selected routed configuration does not require dense-model eligibility.

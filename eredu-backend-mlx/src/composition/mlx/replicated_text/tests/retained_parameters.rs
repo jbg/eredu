@@ -80,7 +80,7 @@ fn retained_target_parameters_track_replacements_without_loading_or_double_count
                 fn visit_slot(
                     &mut self,
                     metadata: eredu_nn::ParameterMetadataView<'_>,
-                    value: &mut MlxTensor,
+                    value: &MlxTensor,
                 ) {
                     if metadata.id().as_str() == self.key {
                         self.value = Some(value.clone());

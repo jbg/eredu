@@ -192,14 +192,14 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
                 return (Err(error.into()), Vec::new());
             }
             self.inner
-                .visit_parameters_mut(&mut Slots(&mut Publish(&self.replacements)));
+                .visit_parameters_mut(&mut Publish(&self.replacements));
             operation(&mut self.inner)
         });
         // Clear every native module handle, including derived operator caches.
         // Unresolved native work retains its own roots and the real lease in
         // the completion recovery owner; unloading is not a completion signal.
         self.inner
-            .visit_parameters_mut(&mut Slots(&mut Publish(&self.placeholders)));
+            .visit_parameters_mut(&mut Publish(&self.placeholders));
         if !self.residency.is_fully_resident() {
             let eviction = manager.evict(&id, MemoryTier::Device);
             if outcome.is_ok() {
@@ -524,8 +524,8 @@ where
 pub(in crate::composition::mlx::replicated_text) struct Publish<'a>(
     pub &'a BTreeMap<String, MlxTensor>,
 );
-impl ParameterSlotVisitor<MlxTensor> for Publish<'_> {
-    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
+impl<'a> ParameterVisitorMut<'a, MlxTensor> for Publish<'_> {
+    fn visit_mut(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &'a mut MlxTensor) {
         if let Some(replacement) = self.0.get(metadata.id().as_str()) {
             *value = replacement.clone();
         }
@@ -617,7 +617,7 @@ pub(super) fn placeholders<M: Parameterized<MlxTensor>>(
     if let Some(error) = collect.failure {
         return Err(error);
     }
-    module.visit_parameters_mut(&mut Slots(&mut Publish(&collect.values)));
+    module.visit_parameters_mut(&mut Publish(&collect.values));
     Ok(collect.values)
 }
 

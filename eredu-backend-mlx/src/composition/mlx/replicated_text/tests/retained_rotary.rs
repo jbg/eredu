@@ -44,7 +44,7 @@ struct EditableValues {
 }
 
 impl eredu_nn::ParameterSlotVisitor<MlxTensor> for EditableValues {
-    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &mut MlxTensor) {
+    fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadataView<'_>, value: &MlxTensor) {
         self.metadata.push(metadata.to_owned());
         self.values.push(value.clone());
     }

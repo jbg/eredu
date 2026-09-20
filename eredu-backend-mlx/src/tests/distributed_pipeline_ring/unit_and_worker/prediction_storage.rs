@@ -93,7 +93,7 @@ fn retained_prediction_storage_covers_family_owners_and_unloaded_replacements() 
                 fn visit_slot(
                     &mut self,
                     metadata: eredu_nn::ParameterMetadataView<'_>,
-                    value: &mut MlxTensor,
+                    value: &MlxTensor,
                 ) {
                     if metadata.id().as_str() == self.key {
                         self.value = Some(value.clone());

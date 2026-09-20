@@ -2,10 +2,6 @@
 use super::*;
 use crate::tests::support::path_instrumentation;
 
-struct Slots;
-impl eredu_nn::ParameterSlotVisitor<crate::MlxTensor> for Slots {
-    fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut crate::MlxTensor) {}
-}
 fn binding_error(error: &Error) {
     let mut cause: &(dyn std::error::Error + 'static) = error;
     loop {
@@ -80,12 +76,13 @@ fn replicated_and_composite_erasure_validate_actual_path_owner_and_stale_token_c
         assert_eq!(path_instrumentation::snapshot(), before);
         assert_eq!(pool.used_bytes().unwrap(), used);
         assert_eq!(pool.unquoted_owner_count().unwrap(), owners);
-        // Mutable parameter-owner access invalidates the existing runtime token,
-        // even though this visitor changes no tensor or semantic declaration.
+        // Replacement publication invalidates the existing runtime token,
+        // including an empty replacement set.
         let _ = first
             .executable_mut()
             .erased_mut()
-            .visit_loaded_parameters(&mut Slots);
+            .publish_parameter_replacements(&Default::default(), false)
+            .unwrap();
         let stale_before = path_instrumentation::snapshot();
         binding_error(
             &first

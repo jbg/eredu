@@ -193,12 +193,9 @@ where
         Ok(())
     }
     fn rebind_after_parameter_access(&mut self) -> Result<(), Error> {
-        struct Slots;
-        impl<T: eredu_nn::Tensor> eredu_nn::ParameterSlotVisitor<T> for Slots {
-            fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut T) {}
-        }
         let source = self.session.shared_observation_paths().unwrap().clone();
-        let _ = self.session.visit_loaded_parameters(&mut Slots);
+        self.session.publish_parameter_replacements(&Default::default(), false)
+            .map_err(|error| Error::Other(Box::new(error)))?;
         assert!(matches!(
             self.session.validate_prepared_observation_paths(&source),
             Err(eredu_runtime::ReplicatedTextSessionError::PreparedObservation(

@@ -873,12 +873,12 @@ pub trait ParameterVisitorMut<'a, T: 'a> {
     fn visit_mut(&mut self, metadata: ParameterMetadataView<'_>, value: &'a mut T);
 }
 
-/// Object-safe traversal of loaded parameter slots at a quiescent boundary.
-/// Visitors must preserve slot topology and must not mutate shared tensor storage.
-/// A transaction prepares replacements separately, then publishes infallible moves.
+/// Object-safe read-only traversal of loaded parameters at a quiescent boundary.
+/// Visitors must not mutate shared tensor storage. Replacement transactions use
+/// the separate publication operation after preparing their values.
 pub trait ParameterSlotVisitor<T> {
     /// Visits one slot without allowing a borrowed tensor to escape traversal.
-    fn visit_slot(&mut self, metadata: ParameterMetadataView<'_>, value: &mut T);
+    fn visit_slot(&mut self, metadata: ParameterMetadataView<'_>, value: &T);
 }
 
 /// Backend-neutral parameter topology for a module or operator.

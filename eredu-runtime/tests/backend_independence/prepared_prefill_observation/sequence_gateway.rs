@@ -772,11 +772,9 @@ fn sequence_gateway_checks_current_token_and_state_only_before_source_work() {
         );
         let original = Original::new(&session, g, state_only, true);
         if !state_only {
-            // Mutable parameter exposure invalidates the token while preserving
+            // Parameter replacement publication invalidates the token while preserving
             // the immutable original path source and quote.
-            let _ = session.visit_loaded_parameters(
-                &mut super::super::prepared_session_observation::Slots,
-            );
+            session.publish_parameter_replacements(&Default::default(), false).unwrap();
         }
         let before = state(&session);
         let events = Rc::new(RefCell::new(Events::default()));
