@@ -2,6 +2,8 @@
 use super::*;
 use safemlx::{CpuBinaryOperation, CpuCopyEvalLayout, OperationEvent};
 use std::mem::{size_of, size_of_val};
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
+mod test_execution;
 mod dense;
 mod affine;
 mod program;

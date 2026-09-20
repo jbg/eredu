@@ -24,13 +24,13 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let native=match dtype {
         WorkspaceFloatingType::Float32=>Dtype::Float32,
         WorkspaceFloatingType::Bfloat16=>Dtype::Bfloat16,
-        _=>return Ok(None),
+        WorkspaceFloatingType::Float16=>Dtype::Float16,
     };
     let count=usize::try_from(input.elements()?)?;
     if count>i32::MAX as usize {return Ok(None);}
     let source=(|| {
         let mut population=CpuPopulation::default();let mut scalars=0usize;
-        if native==Dtype::Bfloat16 {population.copy(OperationEvent::cpu_cast_layout(native,Dtype::Float32,rank,count,false)?,1)?;}
+        if matches!(native,Dtype::Bfloat16|Dtype::Float16) {population.copy(OperationEvent::cpu_cast_layout(native,Dtype::Float32,rank,count,false)?,1)?;}
         if silu {
             population.unary(OperationEvent::cpu_unary_layout(CpuUnaryOperation::Negative,Dtype::Float32,rank,false)?)?;
             population.unary(OperationEvent::cpu_unary_layout(CpuUnaryOperation::Exponential,Dtype::Float32,rank,false)?)?;

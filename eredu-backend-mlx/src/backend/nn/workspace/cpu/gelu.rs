@@ -1,8 +1,12 @@
-//! Exact GELU from layers::gelu, preserving its eager F32 scalar promotion.
+//! Shared exact and approximate GELU sources with their actual scalar promotion.
 use super::*;
 use safemlx::{CpuUnaryOperation,Dtype};
+mod approximate;
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
+mod tests;
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
+    if let Some(plan)=approximate::inspect(operation,mechanism)? {return Ok(Some(plan));}
     if !matches!(operation.kind,WorkspaceOperationKindView::Elementwise("gelu")) {return Ok(None);}
     if operation.inputs.len()!=1||operation.outputs.len()!=1 {
         return Err(MlxWorkspaceFactError::descriptor("CPU GELU population differs"));

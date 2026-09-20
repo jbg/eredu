@@ -765,6 +765,12 @@ completion retains the exact chunk-table capacity and joins the final transpose
 and reshape, including any physical copy required by the head/token layout.
 Cache offsets and retained source strides determine each tile's key geometry.
 
+The CPU tanh-GELU recipe preserves the input-precision cube, the native scalar
+square root, and the eager F32 scalar operations that produce its F32 result.
+Unbounded gated products compose the selected activation recipe with the shared
+multiplication recipe using the activation's resulting precision. SiLU and sigmoid
+keep their F32 internal arithmetic and final F16/BF16 cast.
+
 The neutral `zeros_like` trace delegates to the existing typed zero constructor,
 using the prototype's authenticated scalar precision and shape without claiming
 its values as graph inputs. Generic host initialization remains a separate

@@ -314,6 +314,10 @@ pub(super) fn output(
         // L2 has an explicit F32 epsilon array followed by division/multiply.
         K::LayerNorm { .. } => layer_norm::scalar(operation)?,
         K::Normalization("l2", _) => F::Float32,
+        K::GatedProduct(policy) if policy.activation() == GatedProductActivation::GeluApproximate => {
+            dtype(operation,0)?; dtype(operation,1)?;
+            F::Float32
+        }
         K::GatedProduct(policy)
             if policy.activation() == GatedProductActivation::Silu
                 && policy.sigmoid_multiplier() == 1.0
