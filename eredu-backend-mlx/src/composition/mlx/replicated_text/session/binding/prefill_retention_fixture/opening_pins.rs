@@ -384,12 +384,10 @@ fn old_snapshot_survives_actual_later_state_and_new_kv_snapshot_rejects_missing_
         old_keys,
         "snapshot retains old owners, never refreshes itself"
     );
-    // Quiet used the ordinary custom traversal. Its runtime token is stale,
-    // independently of the old snapshot's still-valid retained owner identity.
-    // Refresh only the actual session binding at this explicit cold boundary,
-    // before preparing the later snapshot that must reject unpublished KV keys.
+    // Ordinary execution preserves the runtime binding independently of the
+    // snapshot's retained owner identity and the later KV publication check.
     f.session
-        .rebind_opening_paths_after_unprepared_forward()
+        .validate_opening_paths_after_forward()
         .unwrap();
     // The first original native scope continues to retain its unregistered
     // successful state. A separately admitted pin-only request must not infer

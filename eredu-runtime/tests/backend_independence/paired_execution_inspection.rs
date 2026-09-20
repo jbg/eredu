@@ -89,6 +89,8 @@ fn paired_inspection_borrows_actual_owners_across_both_residencies_and_cached_st
         let path_source = session.shared_observation_paths().unwrap().clone();
         session.decode(&FakeTensor(vec![3]), &()).unwrap();
         session.decode(&FakeTensor(vec![4]), &()).unwrap();
+        session.validate_prepared_observation_paths(&path_source).unwrap();
+        let _ = session.visit_loaded_parameters(&mut super::prepared_session_observation::Slots);
         let before = counters.snapshot();
         session
             .inspect_runtime_execution(|_, s, e| {
@@ -97,8 +99,8 @@ fn paired_inspection_borrows_actual_owners_across_both_residencies_and_cached_st
                     s.as_ref()[0].1.as_ref().unwrap(),
                     &FakeTensor(vec![15, -7, 29])
                 );
-                // Ordinary custom traversal invalidates its earlier prepared
-                // token. Paired inspection must preserve that stale rejection.
+                // Mutable parameter exposure invalidates the token. Read-only
+                // inspection must preserve that rejection.
                 assert!(matches!(
                     e.validate_observation_binding(session.prepared_observation_paths().unwrap()),
                     Err(ReplicatedTextSessionError::PreparedObservation(

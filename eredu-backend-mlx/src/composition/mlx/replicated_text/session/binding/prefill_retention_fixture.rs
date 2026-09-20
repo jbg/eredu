@@ -46,7 +46,8 @@ trait TypedSession {
         context: &WorkspaceContext,
     ) -> Result<InferenceWorkspaceReport, Error>;
 
-    fn rebind_opening_paths_after_unprepared_forward(&mut self) -> Result<(), Error>;
+    fn validate_opening_paths_after_forward(&self) -> Result<(), Error>;
+    fn rebind_after_parameter_access(&mut self) -> Result<(), Error>;
     fn prepare_pin_snapshot(
         &self,
         source: &SharedCapturePlan,
@@ -179,22 +180,8 @@ where
         };
         quote.map_err(|e| Error::Other(Box::new(e)))
     }
-    fn rebind_opening_paths_after_unprepared_forward(&mut self) -> Result<(), Error> {
-        // Explicit cold fixture boundary: ordinary custom traversal invalidates
-        // its runtime token. Rebinding preserves the physical source, and grants
-        // no publication, completion, pin success or snapshot freshness.
+    fn validate_opening_paths_after_forward(&self) -> Result<(), Error> {
         let paths = self.session.shared_observation_paths().unwrap().clone();
-        assert!(matches!(
-            self.session.validate_prepared_observation_paths(&paths),
-            Err(
-                eredu_runtime::ReplicatedTextSessionError::PreparedObservation(
-                    eredu_runtime::PreparedSessionObservationError::BindingMismatch
-                )
-            )
-        ));
-        self.session
-            .rebind_observation_paths()
-            .map_err(|error| Error::Other(Box::new(error)))?;
         self.session
             .validate_prepared_observation_paths(&paths)
             .map_err(|error| Error::Other(Box::new(error)))?;
@@ -204,6 +191,24 @@ where
             .unwrap()
             .same_storage(&paths));
         Ok(())
+    }
+    fn rebind_after_parameter_access(&mut self) -> Result<(), Error> {
+        struct Slots;
+        impl<T: eredu_nn::Tensor> eredu_nn::ParameterSlotVisitor<T> for Slots {
+            fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut T) {}
+        }
+        let source = self.session.shared_observation_paths().unwrap().clone();
+        let _ = self.session.visit_loaded_parameters(&mut Slots);
+        assert!(matches!(
+            self.session.validate_prepared_observation_paths(&source),
+            Err(eredu_runtime::ReplicatedTextSessionError::PreparedObservation(
+                eredu_runtime::PreparedSessionObservationError::BindingMismatch
+            ))
+        ));
+        self.session.rebind_observation_paths()
+            .map_err(|error| Error::Other(Box::new(error)))?;
+        self.session.validate_prepared_observation_paths(&source)
+            .map_err(|error| Error::Other(Box::new(error)))
     }
     fn opening_paths(&self) -> &eredu_runtime::SharedLayeredObservationPaths {
         self.session.shared_observation_paths().unwrap()
@@ -492,8 +497,9 @@ impl PrefillRetentionFixture {
     pub(crate) fn numeric_state(&self) -> Result<Vec<(Vec<i32>, Vec<f32>)>, Error> {
         self.session.numeric_state()
     }
-    pub(crate) fn rebind_after_unprepared(&mut self) -> Result<(), Error> {
-        self.session.rebind_opening_paths_after_unprepared_forward()
+    pub(crate) fn rebind_after_parameter_access(&mut self) -> Result<(), Error> {
+        self.session.validate_opening_paths_after_forward()?;
+        self.session.rebind_after_parameter_access()
     }
     pub(crate) fn opening_rows_quote(
         &self,

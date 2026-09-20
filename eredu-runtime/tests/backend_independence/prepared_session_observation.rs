@@ -102,9 +102,36 @@ impl ActivationObserver<FakeTensor, Error> for Observer {
         Ok(())
     }
 }
-struct Slots;
+pub(super) struct Slots;
 impl eredu_nn::ParameterSlotVisitor<FakeTensor> for Slots {
     fn visit_slot(&mut self, _: eredu_nn::ParameterMetadataView<'_>, _: &mut FakeTensor) {}
+}
+
+#[test]
+fn ordinary_generation_and_reset_preserve_prepared_observation_binding() {
+    for residency in [
+        LayerWeightResidency::FullyResident,
+        LayerWeightResidency::LayerwiseHost(Default::default()),
+    ] {
+        let (mut session, _) = session(residency);
+        let mut observer = Observer::new(&session);
+        let source = observer.paths.clone();
+        let tokens = FakeTensor(vec![3, 7, 2]);
+        let expected = session.forward(&tokens, None, &()).unwrap();
+        session.validate_prepared_observation_paths(&source).unwrap();
+        session.forward(&FakeTensor(vec![11]), None, &()).unwrap();
+        session.validate_prepared_observation_paths(&source).unwrap();
+        session.reset(&()).unwrap();
+        session.validate_prepared_observation_paths(&source).unwrap();
+        let actual = session
+            .forward_with_observer(&tokens, None, &(), &mut observer)
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(observer.boundaries, 2);
+        assert_eq!(observer.logits, 1);
+        assert_eq!(observer.events, ["prepare", "complete", "commit"]);
+        assert!(source.same_storage(session.shared_observation_paths().unwrap()));
+    }
 }
 
 #[test]

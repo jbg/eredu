@@ -2876,7 +2876,7 @@ where
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<B::Tensor, LayerwiseRuntimeError<A::Error, P::Error>> {
-        self.forward_with_context_hook(input, state, context, |_, _, _| Ok(()))
+        self.forward_with_traversal_hook(input, state, context, &mut NoopLayeredTraversalHook)
             .map(|(output, _)| output)
     }
 
@@ -2985,8 +2985,8 @@ where
     where
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_internal_observer_and_context_with_readout(
-            input,
+        self.forward_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
             state,
             context,
             |architecture, group, index, unit, hidden, state, forward, context, observer| {
@@ -2996,6 +2996,7 @@ where
             },
             observer,
             demand,
+            true,
         )
     }
 
@@ -3343,8 +3344,8 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_internal_observer_and_context_with_readout(
-            input,
+        self.forward_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
             state,
             context,
             |architecture, group, index, unit, hidden, state, forward, context, observer| {
@@ -3354,6 +3355,7 @@ where
             },
             observer,
             demand,
+            true,
         )
     }
 
@@ -3401,76 +3403,20 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        if self.geometry_stale {
-            return Err(crate::ExecutionUnitLayoutError::StalePreparedGeometry.into());
-        }
-        let ordinary_graph;
-        let graph = match self.prepared_geometry.as_ref() {
-            Some(geometry) => geometry.graph(),
-            None => {
-                ordinary_graph = self.architecture.execution_graph()
-                    .map_err(LayerwiseRuntimeError::Architecture)?.into_owned();
-                &ordinary_graph
-            }
-        };
-        let mut units = Vec::with_capacity(graph.groups().len());
-        let mut group_inputs = Vec::with_capacity(graph.groups().len());
-        let mut group_outputs = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = self
-                .architecture
-                .group_unit_count(group, None)
-                .map_err(LayerwiseRuntimeError::Architecture)?;
-            units.push(
-                (0..count)
-                    .map(|index| {
-                        if self.architecture.observes_unit_boundaries(group, index) {
-                            Ok(None)
-                        } else {
-                            self.architecture.unit_path(group, index, None).map(Some)
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_inputs.push(
-                self.architecture
-                    .group_input_observation_path(group, None)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-            group_outputs.push(
-                self.architecture
-                    .group_output_observation_path(group, None)
-                    .map_err(LayerwiseRuntimeError::Architecture)?,
-            );
-        }
-        let observer = std::rc::Rc::new(std::cell::RefCell::new(observer));
-        let routed_observer = observer.clone();
-        let mut hook = ActivationObserverTraversalHook {
-            observer,
-            units,
-            group_inputs,
-            group_outputs,
-        };
-        self.forward_with_unit_executor_and_traversal_hook(
-            input,
+        self.forward_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
             state,
             context,
-            |architecture, group, index, unit, hidden, state, forward, context| {
+            |architecture, group, index, unit, hidden, state, forward, context, observer| {
                 architecture.forward_unit_observed_with_inferred_provider(
-                    group,
-                    index,
-                    unit,
-                    hidden,
-                    state,
-                    forward,
-                    provider,
-                    context,
-                    &mut **routed_observer.borrow_mut(),
+                    group, index, unit, hidden, state, forward, provider, context, observer,
                 )
             },
-            &mut hook,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+            true,
         )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
     }
 
     /// Runs one pass with both a custom unit executor and post-unit context hook.
@@ -3719,8 +3665,8 @@ where
         ) -> Result<B::Tensor, A::Error>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        // Only the validated crate-private prepared traversal may retain its
-        // binding while using the selected canonical/provider unit callback.
+        // Fixed architecture/provider equations preserve declarations. Caller-selected
+        // unit callbacks invalidate the binding before gaining mutable access.
         if !observe_unit_internals && !preserve_observation_binding {
             self.observation_binding.invalidate();
         }
@@ -4133,8 +4079,10 @@ where
     where
         A: ParallelLayeredArchitecture<B, S>,
     {
-        self.forward_parallel_with_context_hook(input, state, parallel, context, |_, _, _| Ok(()))
-            .map(|(output, _)| output)
+        self.forward_parallel_fixed_with_readout(
+            input, state, parallel, context, eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, _)| output.expect("sequence readout returns scores"))
     }
 
     /// Runs one rank-local pass and exposes mutable context after each unit.
@@ -4248,9 +4196,8 @@ where
         context:&<B::Tensor as Tensor>::Context, demand:eredu_core::OutputDemand,
     )->Result<(Option<B::Tensor>,A::ForwardContext),LayerwiseRuntimeError<A::Error,P::Error>>
     where A:ParallelLayeredArchitecture<B,S> {
-        self.observation_binding.invalidate();
-        // `true` preserves the checked geometry. The no-op hook observes no
-        // activations, so the common worker calls only the ordinary numerical
+        // `true` preserves the checked geometry and observation binding. The no-op
+        // hook observes no activations, so the worker calls only the ordinary numerical
         // input/unit/readout methods and creates no observation path owner.
         self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
             input,state,parallel,context,
@@ -4274,8 +4221,8 @@ where
         A: ParallelLayeredArchitecture<B, S>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_internal_observer_and_context_with_readout(
-            input,
+        self.forward_parallel_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
             state,
             parallel,
             context,
@@ -4295,6 +4242,7 @@ where
             },
             observer,
             demand,
+            true,
         )
     }
 
@@ -4559,8 +4507,8 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_internal_observer_and_context(
-            input,
+        self.forward_parallel_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
             state,
             parallel,
             context,
@@ -4580,8 +4528,10 @@ where
                 )
             },
             observer,
+            eredu_core::OutputDemand::Sequence,
+            true,
         )
-        .map(|(output, _)| output)
+        .map(|(output, _)| output.expect("sequence readout returns scores"))
     }
 
     /// Runs one parallel pass with custom unit execution and a post-unit hook.

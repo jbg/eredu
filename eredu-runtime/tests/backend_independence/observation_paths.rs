@@ -802,6 +802,42 @@ impl ParallelLayeredArchitecture<FakeBackend, State> for PathsFixture {
 }
 
 #[test]
+fn fixed_serial_and_parallel_passes_preserve_observation_binding() {
+    for parallel in [false, true] {
+        for observed in [false, true] {
+            let mut runtime = layerwise();
+            let paths = runtime.prepare_observation_paths().unwrap();
+            let mut state = fixture_state();
+            let mut observer = Observer::default();
+            for _ in 0..2 {
+                match (parallel, observed) {
+                    (false, false) => runtime.forward(None, &mut state, &()).unwrap(),
+                    (true, false) => runtime
+                        .forward_parallel(None, &mut state, &(), &())
+                        .unwrap(),
+                    (false, true) => runtime
+                        .forward_with_observer(None, &mut state, &(), &mut observer)
+                        .unwrap(),
+                    (true, true) => runtime
+                        .forward_parallel_with_observer(None, &mut state, &(), &(), &mut observer)
+                        .unwrap(),
+                };
+                runtime.validate_observation_binding(&paths).unwrap();
+            }
+            let mut prepared = Observer::default();
+            runtime
+                .forward_with_prepared_observer_and_context_with_readout(
+                    None, &mut state, &(), &mut prepared, &paths,
+                    eredu_core::OutputDemand::Sequence,
+                )
+                .unwrap();
+            assert!(!prepared.values.is_empty());
+            runtime.validate_observation_binding(&paths).unwrap();
+        }
+    }
+}
+
+#[test]
 fn custom_unit_executor_adapters_emit_each_original_and_effective_boundary_once() {
     let mut results = Vec::new();
     for parallel in [false, true] {
@@ -834,6 +870,10 @@ fn custom_unit_executor_adapters_emit_each_original_and_effective_boundary_once(
                     .unwrap()
                     .0
             };
+            assert!(matches!(
+                runtime.validate_observation_binding(&paths),
+                Err(PreparedError::BindingMismatch)
+            ));
             for group in 0..paths.source().group_count() {
                 for index in 0..paths.source().unit_count(group).unwrap() {
                     let original = paths.source().unit_paths(group, index).unwrap();

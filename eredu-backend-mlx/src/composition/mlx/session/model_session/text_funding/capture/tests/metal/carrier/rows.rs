@@ -682,7 +682,7 @@ impl ActivationObserver<Array, Error> for Quiet {
     }
 }
 #[test]
-fn actual_unprepared_forward_and_same_source_rebind_cannot_freshen_original_rows() {
+fn mutable_parameter_access_and_same_source_rebind_cannot_freshen_original_rows() {
     let mut f = build(0, 5, false);
     let result = f
         .session
@@ -694,11 +694,9 @@ fn actual_unprepared_forward_and_same_source_rebind_cannot_freshen_original_rows
         )
         .unwrap();
     assert_eq!(result.outcome, PrefillOutcome::Complete);
-    assert!(
-        f.session.install_opening_rows(&f.rows).is_err(),
-        "current runtime token was invalidated"
-    );
-    f.session.rebind_after_unprepared().unwrap();
+    // Ordinary execution keeps the binding; mutable parameter exposure creates
+    // a new binding generation that cannot authenticate these original rows.
+    f.session.rebind_after_parameter_access().unwrap();
     let allowance = f
         .error_allowance
         .take()
