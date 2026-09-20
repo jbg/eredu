@@ -6,6 +6,7 @@ use std::{
 };
 
 mod recipe_keys;
+mod read_catalog;
 mod memory_read;
 pub use memory_read::MemoryEncodedReadInitializer;
 mod file_read;

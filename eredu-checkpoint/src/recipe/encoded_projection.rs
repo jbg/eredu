@@ -204,7 +204,7 @@ pub(super) fn prepare(
     let compiled = if use_source_cache && source.recipe_cache().is_some() {
         compile(recipe, source, batch.tensors(), batch.byte_len())?
     } else {
-        let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.build();
+        let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.construct(())?;
         compile(recipe, &catalog, batch.tensors(), batch.byte_len())?
     };
     let Some((output, mapping)) = compiled else {

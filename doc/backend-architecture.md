@@ -868,13 +868,17 @@ construction and retaining custody with the move-only keys or failed prefix.
 Unsupported computational recipes invoke no source read constructor. Geometry
 inference, source-batch admission, projection storage and payloads remain separate;
 the key plan is not a whole-recipe or native-conversion admission grant.
-Contiguous and projected encoded reads share a sized metadata catalog index.
-The index borrows the batch's immutable tensor records, sorts occurrence indices
-in place and retains the last occurrence for duplicate keys. Its single index
-allocation is sized from the input occurrence count, including duplicates; names
-and metadata are cloned only when the ordinary owning lookup requests them.
-Borrowed lookup supports finite inference over the same retained entries. The
-catalog supplies no source authority, persistent inference cache or reservation.
+Contiguous and projected encoded reads share a metadata catalog constructor.
+Its borrowed plan sizes one exact requested index allocation from all source
+occurrences, sorts indices in place and retains the last duplicate name. Ordinary
+construction supplies unit custody; runtime implements its existing shared
+initializer directly for the same plan and compares before allocation. The
+move-only catalog retains caller custody until its index retires, and reserve
+failure retains custody without a completed allocation prefix. Tensor metadata
+and source custody remain borrowed prerequisites. Owning lookups clone their
+selected records under separate policy; borrowed lookup allocates nothing and
+supports finite inference over the same retained entries. This index admission
+covers neither metadata inference nor complete encoded recipe compilation.
 Memory-backed encoded reads inspect their actual immutable store and ordered
 keys before constructing metadata records and source spans. Ordinary reads and
 the runtime-admitted constructor share that worker. Runtime compares the original

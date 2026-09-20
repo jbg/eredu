@@ -13,7 +13,7 @@ mod encoded_projection;
 mod read_catalog;
 mod read_keys;
 pub use read_keys::{EncodedRecipeKeysBuildError, EncodedRecipeKeysPlan, PreparedEncodedRecipeKeys};
-use read_catalog::ReadBatchCatalogPlan;
+pub use read_catalog::{ReadBatchCatalog, ReadBatchCatalogBuildError, ReadBatchCatalogPlan};
 mod finite_inference;
 mod uncached_catalog;
 pub use uncached_catalog::UncachedRecipeCatalog;
@@ -1070,7 +1070,7 @@ impl DerivedWeightRecipe {
             }
             output
         } else {
-            let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.build();
+            let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.construct(())?;
             let output = self.infer(&catalog)?;
             if !preserves_bytes(self, &catalog)? {
                 return Ok(None);
@@ -2507,6 +2507,8 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 #[derive(Debug, Clone, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum RecipeError {
+    #[error("encoded read catalog: {0}")]
+    ReadCatalog(#[from] ReadBatchCatalogBuildError<()>),
     #[error("derived-weight source key must not be empty")]
     EmptySourceKey,
     #[error("derived-weight output name must not be empty")]
