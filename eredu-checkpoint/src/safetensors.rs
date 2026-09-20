@@ -61,6 +61,7 @@ struct ShardCatalog {
     tensor_locations: Option<BTreeMap<String, PathBuf>>,
     admissions: BTreeMap<PathBuf, Arc<AdmittedShard>>,
     recipes: Arc<crate::recipe::RecipeInferenceCache>,
+    source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
 }
 
 impl SafetensorsShards {
@@ -130,8 +131,21 @@ impl SafetensorsShards {
         header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
     ) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
+        Self::discover_catalog_with_source_admission(path, limits, header_admission, None)
+            .map_err(|error| match error {
+                StoreError::SafetensorsShards(error) => error,
+                error => malformed_shard(path, error.to_string()),
+            })
+    }
+
+    pub(crate) fn discover_catalog_with_source_admission(
+        path: &Path,
+        limits: SafetensorsDiscoveryLimits,
+        header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
+        source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
+    ) -> Result<Self, StoreError> {
         if path.is_dir() {
-            return Self::discover_directory(path, limits, header_admission);
+            return Self::discover_directory(path, limits, header_admission, source_admission);
         }
         let payload = canonicalize(path)?;
         ShardCatalog {
@@ -140,6 +154,7 @@ impl SafetensorsShards {
             tensor_locations: None,
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
+            source_admission,
         }
         .admit(limits, header_admission)
     }
@@ -148,7 +163,8 @@ impl SafetensorsShards {
         root: &Path,
         limits: SafetensorsDiscoveryLimits,
         header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
-    ) -> Result<Self, SafetensorsShardError> {
+        source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
+    ) -> Result<Self, StoreError> {
         let access_root = canonical_checkpoint_access_root(root)?;
         let index_path = root.join("model.safetensors.index.json");
         if !index_path.exists() {
@@ -159,21 +175,29 @@ impl SafetensorsShards {
                 tensor_locations: None,
                 admissions: BTreeMap::new(),
                 recipes: Arc::default(),
+                source_admission,
             }
             .admit(limits, header_admission);
         }
 
         let mut file =
             std::fs::File::open(&index_path).map_err(|error| io_error(&index_path, error))?;
-        let length = file
-            .metadata()
-            .map_err(|error| io_error(&index_path, error))?
-            .len();
-        if length > limits.max_index_bytes {
-            return Err(index_too_large(&index_path, limits.max_index_bytes));
+        let version = crate::artifact::file::FileVersion::from_metadata(
+            &file.metadata().map_err(|error| io_error(&index_path, error))?,
+        ).map_err(|error| io_error(&index_path, error))?;
+        if version.length > limits.max_index_bytes {
+            return Err(index_too_large(&index_path, limits.max_index_bytes).into());
         }
-        // The read limit also applies if the file grows after metadata inspection.
-        let raw = read_index(&index_path, &mut file, limits.max_index_bytes)?;
+        let encoded_bytes = index_buffer_length(&index_path, version.length)?;
+        if let Some(policy) = &source_admission {
+            let path_bytes = access_root.as_os_str().len().checked_add(index_path.as_os_str().len())
+                .ok_or_else(|| index_too_large(&index_path, limits.max_index_bytes))?;
+            policy.reserve_index(SafetensorsIndexRequest { encoded_bytes, path_bytes })
+                .map_err(StoreError::SafetensorsSourceAdmission)?;
+        }
+        // The same retained handle and version determine the admitted buffer.
+        // Growth never expands the allocation; one stack byte probes the extent.
+        let raw = read_index(&index_path, &mut file, version)?;
         let index: SafetensorsIndex =
             serde_json::from_str(&raw).map_err(|error| SafetensorsShardError::MalformedIndex {
                 path: index_path.clone(),
@@ -183,7 +207,7 @@ impl SafetensorsShards {
             return Err(SafetensorsShardError::MalformedIndex {
                 path: index_path,
                 message: "weight_map must not be empty".into(),
-            });
+            }.into());
         }
 
         let mut payload_paths = BTreeSet::new();
@@ -194,7 +218,7 @@ impl SafetensorsShards {
                 return Err(SafetensorsShardError::MalformedIndex {
                     path: index_path.clone(),
                     message: "tensor names must not be empty".into(),
-                });
+                }.into());
             }
             let payload = if let Some(payload) = logical_payload_paths.get(&relative) {
                 PathBuf::clone(payload)
@@ -213,6 +237,7 @@ impl SafetensorsShards {
             tensor_locations: Some(tensor_locations),
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
+            source_admission,
         }
         .admit(limits, header_admission)
     }
@@ -220,6 +245,10 @@ impl SafetensorsShards {
     /// Input limits retained by this admitted shard set.
     pub const fn limits(&self) -> SafetensorsDiscoveryLimits {
         self.limits
+    }
+
+    pub(crate) fn source_admission(&self) -> Option<&Arc<dyn SafetensorsSourceAdmission>> {
+        self.catalog.source_admission.as_ref()
     }
 
     pub(crate) fn recipe_cache(&self) -> &crate::recipe::RecipeInferenceCache {
@@ -266,7 +295,12 @@ impl ShardCatalog {
         mut self,
         limits: SafetensorsDiscoveryLimits,
         header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
-    ) -> Result<SafetensorsShards, SafetensorsShardError> {
+    ) -> Result<SafetensorsShards, StoreError> {
+        let header_admission = match &self.source_admission {
+            Some(policy) => Some(policy.headers(self.payload_paths.len())
+                .map_err(StoreError::SafetensorsSourceAdmission)?),
+            None => header_admission,
+        };
         let mut expected = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         if let Some(locations) = &self.tensor_locations {
             for (key, path) in locations {
@@ -282,6 +316,7 @@ impl ShardCatalog {
                 expected.remove(path),
                 limits.max_header_bytes,
                 header_admission.clone(),
+                self.source_admission.clone(),
             )
             .map_err(|error| malformed_shard(path, error.to_string()))?;
             self.admissions.insert(path.clone(), Arc::new(shard));
@@ -429,6 +464,12 @@ impl RecipeCatalog for SafetensorsMetadataCatalog {
 /// Failure to discover and admit a SafeTensors checkpoint shard set.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum SafetensorsShardError {
+    /// The retained index handle changed after its encoded extent was inspected.
+    #[error("SafeTensors index changed during discovery: {path}", path = .path.display())]
+    IndexChanged {
+        /// Affected index path.
+        path: PathBuf,
+    },
     /// The encoded index exceeds the configured discovery input limit.
     #[error("SafeTensors index {path} exceeds {limit_bytes} bytes", path = .path.display())]
     IndexTooLarge {
@@ -576,22 +617,37 @@ fn index_too_large(path: &Path, limit_bytes: u64) -> SafetensorsShardError {
 
 fn read_index(
     path: &Path,
-    reader: &mut impl Read,
-    limit_bytes: u64,
+    reader: &mut std::fs::File,
+    version: crate::artifact::file::FileVersion,
 ) -> Result<String, SafetensorsShardError> {
-    let mut bytes = Vec::new();
-    reader
-        .take(limit_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error(path, error))?;
-    if bytes.len() as u64 > limit_bytes {
-        return Err(index_too_large(path, limit_bytes));
+    let validate = |file: &std::fs::File| {
+        let current = crate::artifact::file::FileVersion::from_metadata(
+            &file.metadata().map_err(|error| io_error(path, error))?,
+        ).map_err(|error| io_error(path, error))?;
+        if current != version { Err(SafetensorsShardError::IndexChanged { path: path.into() }) } else { Ok(()) }
+    };
+    validate(reader)?;
+    let raw = read_index_bytes(path, reader, index_buffer_length(path, version.length)?)?;
+    validate(reader)?;
+    Ok(raw)
+}
+
+fn index_buffer_length(path: &Path, length: u64) -> Result<usize, SafetensorsShardError> {
+    usize::try_from(length).ok()
+        .filter(|length| std::alloc::Layout::array::<u8>(*length).is_ok())
+        .ok_or_else(|| index_too_large(path, isize::MAX as u64))
+}
+
+fn read_index_bytes(path: &Path, reader: &mut impl Read, length: usize) -> Result<String, SafetensorsShardError> {
+    index_buffer_length(path, length as u64)?;
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes).map_err(|error| io_error(path, error))?;
+    let mut extra = [0];
+    if reader.read(&mut extra).map_err(|error| io_error(path, error))? != 0 {
+        return Err(SafetensorsShardError::IndexChanged { path: path.into() });
     }
     String::from_utf8(bytes).map_err(|error| {
-        io_error(
-            path,
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-        )
+        io_error(path, std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     })
 }
 
@@ -1027,3 +1083,6 @@ pub use header_admission::{
     SafetensorsHeaderAdmission, SafetensorsHeaderFailure, SafetensorsHeaderRequest,
     SafetensorsHeaderReservation,
 };
+
+mod source_admission;
+pub use source_admission::{SafetensorsIndexRequest, SafetensorsSourceAdmission};

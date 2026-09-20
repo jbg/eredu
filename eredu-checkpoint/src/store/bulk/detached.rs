@@ -222,6 +222,7 @@ where
                                 canonical_path: shard.admitted.identity.canonical_path.clone(),
                                 version: shard.admitted.identity.version,
                             },
+                            source_admission: shard.admitted.source_admission.clone(),
                         },
                         spans: shard.spans.clone(),
                     });

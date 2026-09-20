@@ -18,6 +18,7 @@ use crate::{
     safetensors::{
         MAX_HEADER_BYTES, SafetensorsDiscoveryLimits, SafetensorsHeaderAdmission,
         SafetensorsHeaderFailure, SafetensorsHeaderRequest, SafetensorsHeaderReservation,
+        SafetensorsSourceAdmission,
         SafetensorsShards,
     },
 };
@@ -1760,6 +1761,9 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
+    /// Typed refusal from source discovery or store metadata admission.
+    #[error("SafeTensors source admission failed: {0}")]
+    SafetensorsSourceAdmission(#[source] Arc<dyn std::error::Error + Send + Sync>),
     /// Lazy SafeTensors header admission or construction failure, with custody.
     #[error("{0}")]
     SafetensorsHeader(#[source] Arc<SafetensorsHeaderFailure>),
@@ -1932,12 +1936,14 @@ struct CacheState {
     hits: u64,
     misses: u64,
     evictions: u64,
+    _source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
 }
 
 #[derive(Debug, Default)]
 struct SafetensorsReadTelemetry {
     physical_reads: AtomicU64,
     physical_read_bytes: AtomicU64,
+    _source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
 }
 
 #[derive(Debug, Clone)]
@@ -1965,6 +1971,7 @@ impl AdmittedFileIdentity {
 #[derive(Debug)]
 pub(crate) struct AdmittedFile {
     identity: AdmittedFileIdentity,
+    source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
 }
 
 impl AdmittedFile {
@@ -1974,7 +1981,7 @@ impl AdmittedFile {
             path,
             &file.metadata().map_err(|error| fs_error(path, error))?,
         )?;
-        Ok(Self { identity })
+        Ok(Self { identity, source_admission: None })
     }
 
     fn open_validated(&self, path: &Path) -> Result<File, StoreError> {
@@ -2019,9 +2026,12 @@ impl AdmittedShard {
         expected: Option<BTreeSet<String>>,
         max_header_bytes: u64,
         header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
+        source_admission: Option<Arc<dyn SafetensorsSourceAdmission>>,
     ) -> Result<Self, StoreError> {
+        let mut file = AdmittedFile::open(path)?;
+        file.source_admission = source_admission;
         Ok(Self {
-            file: Arc::new(AdmittedFile::open(path)?),
+            file: Arc::new(file),
             expected,
             max_header_bytes: max_header_bytes.min(MAX_HEADER_BYTES),
             header_admission,
@@ -2205,6 +2215,21 @@ impl SafetensorsWeightStore {
         Self::open_admitted(shards, max_cached_shards)
     }
 
+    /// Opens under a policy funded before discovery. The caller retains it on
+    /// failure and completes construction after this method returns. Independent
+    /// metadata exports and read/payload construction need separate admission.
+    pub fn open_with_source_admission(
+        path: impl AsRef<Path>,
+        max_cached_shards: usize,
+        limits: SafetensorsDiscoveryLimits,
+        admission: Arc<dyn SafetensorsSourceAdmission>,
+    ) -> Result<Self, StoreError> {
+        let shards = SafetensorsShards::discover_catalog_with_source_admission(
+            path.as_ref(), limits, None, Some(admission),
+        )?;
+        Self::open_admitted(shards, max_cached_shards)
+    }
+
     /// Opens the exact shard set admitted by portable artifact inspection.
     ///
     /// This constructor performs no directory or index discovery. Indexed
@@ -2215,6 +2240,22 @@ impl SafetensorsWeightStore {
     ) -> Result<Self, StoreError> {
         if max_cached_shards == 0 {
             return Err(StoreError::InvalidShardCacheLimit);
+        }
+        if let Some(policy) = shards.source_admission() {
+            let mut input_bytes = Some(0usize);
+            let mut add = |name: &str, path: &Path| {
+                input_bytes = input_bytes.and_then(|n| n.checked_add(name.len()))
+                    .and_then(|n| n.checked_add(path.as_os_str().len()));
+            };
+            if let Some(locations) = shards.tensor_locations() {
+                for (name, path) in locations { add(name, path); }
+            } else {
+                let path = &shards.payload_paths()[0];
+                for name in shards.admission(path).header(path)?.tensors.keys() { add(name, path); }
+            }
+            for path in shards.payload_paths() { add("", path); }
+            let input_bytes = input_bytes.ok_or_else(|| StoreError::Overflow { context: "SafeTensors store metadata input".into() })?;
+            policy.reserve_store(input_bytes).map_err(StoreError::SafetensorsSourceAdmission)?;
         }
         let catalog = if let Some(locations) = shards.tensor_locations() {
             locations
@@ -2246,14 +2287,19 @@ impl SafetensorsWeightStore {
                 .collect()
         };
         let paths = bulk::DiagnosticPaths::new(shards.payload_paths());
+        let source_admission = shards.source_admission().cloned();
         Ok(Self {
             catalog,
             shards,
             cache: Arc::new(Mutex::new(CacheState {
                 paths,
+                _source_admission: source_admission.clone(),
                 ..CacheState::default()
             })),
-            read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
+            read_telemetry: Arc::new(SafetensorsReadTelemetry {
+                _source_admission: source_admission,
+                ..SafetensorsReadTelemetry::default()
+            }),
             max_cached_shards,
         })
     }

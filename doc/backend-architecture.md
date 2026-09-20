@@ -923,6 +923,26 @@ Policy and failure custody use weak pool references to avoid registry cycles.
 This header policy does not reserve discovery/index/catalog storage, later
 metadata clones, caches or read payloads; those owners need separate admission.
 
+Runtime also provides original SafeTensors source opening under the existing
+pool. It reserves initial policy controls and path/discovery headroom before
+filesystem discovery, then extends the same contribution for the measured index
+buffer and decoded-index estimate before reading. The retained index handle is
+checked against its observed version before and after the exact-extent read;
+a stack-owned byte probes growth without expanding the buffer. The index is
+decoded once, and its distinct shard count sizes header admission before any
+header is prepared. A separate estimate over borrowed tensor names and paths
+precedes store-map and fixed diagnostic construction. Indexed headers stay lazy.
+Source construction ends its active exclusion when opening returns, including
+failures. Shared catalogs, independent file identities, cache controls and read
+telemetry retain the source contribution; detached file identities preserve
+that custody too. Incremental admission failures retain the account in their
+shared typed cause, so cloning a refusal cannot refund its diagnostic storage.
+Path, decoded-index and catalog estimates remain configurable planning policy;
+they are not enforceable metadata or process ceilings. Payload/read buffers,
+subsequent cache contents and independently exported metadata have separate
+admission requirements. Ordinary opening and runtime-funded opening share the
+same discovery, index and header workers.
+
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that
 same constructor. The admitted entry refuses missing headers and lends retained

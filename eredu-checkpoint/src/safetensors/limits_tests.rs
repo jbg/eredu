@@ -33,6 +33,16 @@ fn index_limit_accepts_exact_bytes_and_refuses_one_less() {
     let catalog = SafetensorsMetadataCatalog::discover_with_limits(root.path(), limits).unwrap();
     assert_eq!(catalog.tensor("weight").unwrap().logical_shape, [1]);
     assert_eq!(catalog.shards().limits(), limits);
+    assert!(
+        SafetensorsShards::discover_with_limits(
+            root.path(),
+            SafetensorsDiscoveryLimits {
+                max_index_bytes: u64::MAX,
+                ..limits
+            }
+        )
+        .is_ok()
+    );
     limits.max_index_bytes -= 1;
     assert!(matches!(
         SafetensorsShards::discover_with_limits(root.path(), limits),
@@ -59,30 +69,34 @@ fn default_index_limit_refuses_sparse_oversized_input_before_decoding() {
 }
 
 #[test]
-fn index_stream_stops_after_limit_probe_even_without_a_length_hint() {
+fn index_read_keeps_its_exact_extent_and_probes_growth() {
     let path = Path::new("index.json");
     let mut input = std::io::Cursor::new(b"abcdef");
     assert!(matches!(
-        read_index(path, &mut input, 3),
-        Err(SafetensorsShardError::IndexTooLarge { limit_bytes: 3, .. })
+        read_index_bytes(path, &mut input, 3),
+        Err(SafetensorsShardError::IndexChanged { .. })
     ));
     assert_eq!(input.position(), 4);
     let mut exact = std::io::Cursor::new(b"abc");
-    assert_eq!(read_index(path, &mut exact, 3).unwrap(), "abc");
+    assert_eq!(read_index_bytes(path, &mut exact, 3).unwrap(), "abc");
     let mut empty = std::io::Cursor::new(b"");
-    assert_eq!(read_index(path, &mut empty, 0).unwrap(), "");
+    assert_eq!(read_index_bytes(path, &mut empty, 0).unwrap(), "");
     assert!(matches!(
-        read_index(path, &mut std::io::Cursor::new(b"x"), 0),
-        Err(SafetensorsShardError::IndexTooLarge { .. })
+        read_index_bytes(path, &mut std::io::Cursor::new(b"x"), 0),
+        Err(SafetensorsShardError::IndexChanged { .. })
     ));
     assert!(matches!(
-        read_index(path, &mut std::io::Cursor::new([0xff]), 1),
+        read_index_bytes(path, &mut std::io::Cursor::new([0xff]), 1),
         Err(SafetensorsShardError::Io { .. })
     ));
-    assert_eq!(
-        read_index(path, &mut std::io::Cursor::new(b"abc"), u64::MAX).unwrap(),
-        "abc"
-    );
+    assert!(matches!(
+        read_index_bytes(path, &mut std::io::Cursor::new(b"ab"), 3),
+        Err(SafetensorsShardError::Io { .. })
+    ));
+    assert!(matches!(
+        index_buffer_length(path, u64::MAX),
+        Err(SafetensorsShardError::IndexTooLarge { .. })
+    ));
 }
 
 #[test]

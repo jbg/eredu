@@ -7,7 +7,7 @@ use std::{
     fmt,
     mem::{size_of, size_of_val},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
     },
 };
@@ -19,7 +19,7 @@ use std::{
 #[derive(Debug)]
 struct SourceAccountInner {
     pool: Weak<super::Pool>,
-    bytes: u64,
+    bytes: AtomicU64,
     active: AtomicBool,
     compiling: AtomicBool,
 }
@@ -35,7 +35,7 @@ impl Drop for SourceAccountInner {
             if *self.compiling.get_mut() {
                 usage.reservations -= 1;
             }
-            usage.reserved -= self.bytes;
+            usage.reserved -= *self.bytes.get_mut();
         };
     }
 }
@@ -55,7 +55,7 @@ impl SourceAccount {
     pub(super) fn new_unarmed(pool: &WorkingMemoryPool, bytes: u64) -> Self {
         Self(Some(Arc::new(SourceAccountInner {
             pool: Arc::downgrade(&pool.0),
-            bytes,
+            bytes: AtomicU64::new(bytes),
             active: AtomicBool::new(false),
             compiling: AtomicBool::new(true),
         })))
@@ -71,6 +71,28 @@ impl SourceAccount {
     }
     pub(super) fn matches_pool(&self, pool: &WorkingMemoryPool) -> bool {
         Weak::ptr_eq(&self.inner().pool, &Arc::downgrade(&pool.0))
+    }
+    /// Extend only active source construction, atomically with the pool ledger.
+    /// All aliases retain the complete accepted contribution through retirement.
+    pub(super) fn reserve_more(&self, bytes: u64) -> Result<(), WorkingMemoryError> {
+        let inner = self.inner();
+        let pool = inner.pool.upgrade().ok_or(WorkingMemoryError::IdentityMismatch)?;
+        let mut usage = pool.usage.lock().map_err(|_| WorkingMemoryError::Poisoned)?;
+        if !inner.active.load(Ordering::Relaxed) || !inner.compiling.load(Ordering::Relaxed) {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let available = pool.available(&usage, None)?;
+        if bytes > available {
+            return Err(WorkingMemoryError::BudgetExceeded { required_bytes: bytes, available_bytes: available });
+        }
+        let total = inner.bytes.load(Ordering::Relaxed).checked_add(bytes).ok_or(WorkingMemoryError::Overflow)?;
+        let reserved = usage.reserved.checked_add(bytes).ok_or(WorkingMemoryError::Overflow)?;
+        let used = pool.existing.checked_add(usage.registered).and_then(|n| n.checked_add(reserved))
+            .ok_or(WorkingMemoryError::Overflow)?;
+        inner.bytes.store(total, Ordering::Relaxed);
+        usage.reserved = reserved;
+        usage.peak = usage.peak.max(used);
+        Ok(())
     }
     pub(super) fn finish(&self) -> Result<(), WorkingMemoryError> {
         let pool = self
@@ -178,7 +200,7 @@ impl SourceInventoryOrigin {
         if !account.active.load(Ordering::Relaxed)
             || account.compiling.load(Ordering::Relaxed)
             || self.prepaid > self.total
-            || self.prepaid > account.bytes
+            || self.prepaid > account.bytes.load(Ordering::Relaxed)
         {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
