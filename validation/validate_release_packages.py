@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from typing import Any
@@ -23,6 +24,7 @@ from typing import Any
 # This is also the documented publication order. Dependency order includes
 # development dependencies because crates.io validates their version metadata.
 RELEASE_ORDER = (
+    "eredu-collections",
     "eredu-gguf",
     "safemlx-internal-macros",
     "eredu-backend-mlx-macros",
@@ -292,14 +294,48 @@ def write_cargo_config(config: Path, staged: list[dict[str, Any]]) -> None:
     for package in staged:
         lines.extend([f'[registries.{package["name"]}]',
                       f'index = {json.dumps(package["index"].as_uri())}', ""])
-    if staged:
-        lines.extend(["", "[patch.crates-io]"])
-        for package in staged:
-            lines.append(
-                f'{json.dumps(package["name"])} = '
-                f'{{ version = "={package["version"]}", registry = "{package["name"]}" }}'
-            )
     config.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def staged_test_manifest(package_root: Path, staged: list[dict[str, Any]]) -> None:
+    """Select first-party registries only in the isolated archive-test copy.
+
+    Cargo's normal package verification already built the original archive.
+    A registry dependency cannot itself be tested when it has dev-dependencies,
+    so tests need a root manifest with explicit staging registry selections.
+    Preserve the published manifest separately; do not edit archive bytes.
+    """
+    manifest = package_root / "Cargo.toml"
+    original = manifest.read_text(encoding="utf-8")
+    document = tomllib.loads(original)
+    indices = {entry["name"]: entry["index"].as_uri() for entry in staged}
+    lines = []
+    selected = None
+    for line in original.splitlines(keepends=True):
+        if line.startswith("["):
+            selected = None
+            if not line.startswith("[["):
+                table = tomllib.loads(line + "\n__staging_marker = true\n")
+                path = []
+                while "__staging_marker" not in table:
+                    key, table = next(iter(table.items()))
+                    path.append(key)
+                if len(path) >= 2 and path[-2] in (
+                    "dependencies", "dev-dependencies", "build-dependencies",
+                ):
+                    dependency = document
+                    for key in path:
+                        dependency = dependency[key]
+                    selected = indices.get(dependency.get("package", path[-1]))
+            lines.append(line)
+            if selected is not None:
+                lines.append(f"registry-index = {json.dumps(selected)}\n")
+        elif selected is not None and line.split("=", 1)[0].strip() in ("registry-index", "registry"):
+            continue
+        else:
+            lines.append(line)
+    manifest.with_name("Cargo.toml.published").write_text(original, encoding="utf-8")
+    manifest.write_text("".join(lines), encoding="utf-8")
 
 
 def git_commit_index(index: Path, relative_path: Path, message: str) -> None:
@@ -369,6 +405,7 @@ def validate_packaged_tests(
     destination: Path,
     config: Path,
     environment: dict[str, str],
+    staged: list[dict[str, Any]],
 ) -> None:
     library_kinds = {"lib", "proc-macro"}
     if not any(library_kinds.intersection(target["kind"]) for target in package["targets"]):
@@ -377,6 +414,7 @@ def validate_packaged_tests(
     destination = destination / hashlib.sha256(archive.read_bytes()).hexdigest()
     shutil.unpack_archive(archive, destination, "gztar")
     package_root = destination / f'{package["name"]}-{package["version"]}'
+    staged_test_manifest(package_root, staged)
     normalize_source_times(package_root)
     run(
         [
@@ -460,7 +498,27 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="validate tracked and untracked working-tree source instead of requiring a clean tree",
     )
+    parser.add_argument(
+        "--package-toolchain",
+        help="Cargo toolchain for multi-package verification; compilation and consumer checks retain the invoking Rust toolchain",
+    )
     return parser.parse_args()
+
+
+def package_command(environment: dict[str, str], toolchain: str | None) -> list[str]:
+    if toolchain is None:
+        return ["cargo", "package"]
+    # A newer Cargo can package an unpublished chain while the real compilers
+    # still validate the selected MSRV. Consumer Cargo remains on that MSRV too.
+    selected = environment.get("RUSTUP_TOOLCHAIN")
+    if selected is None:
+        raise RuntimeError("--package-toolchain requires an identified Rust toolchain")
+    for variable, tool in (("RUSTC", "rustc"), ("RUSTDOC", "rustdoc")):
+        if variable not in environment:
+            environment[variable] = subprocess.check_output(
+                ["rustup", "which", "--toolchain", selected, tool], text=True,
+            ).strip()
+    return ["cargo", f"+{toolchain}", "package"]
 
 
 def published(name: str, version: str) -> bool:
@@ -496,6 +554,11 @@ def release_closure(packages: dict[str, dict[str, Any]], roots: list[str], avail
                     selected.add(name)
                     pending.append(name)
     return [name for name in RELEASE_ORDER if name in selected]
+
+
+def package_target_directory(target_dir: Path, identity: str) -> Path:
+    """Give Cargo's temporary unpublished registry an immutable source identity."""
+    return target_dir / "package-verification" / identity
 
 
 def main() -> int:
@@ -540,23 +603,24 @@ def main() -> int:
         environment = toolchain_environment(workspace)
         environment["CARGO_TARGET_DIR"] = str(target_dir)
 
+        # Package the complete selected chain together. Cargo verifies the actual
+        # archives through its temporary registry for unpublished workspace peers.
+        # No patch, replacement, or source override is passed to Cargo.
+        command = package_command(environment, arguments.package_toolchain)
+        command += ["--quiet"]
+        for crate_name in order:
+            command += ["-p", crate_name]
+        # Cargo's temporary registry lives below the package target directory.
+        # Keep its source identity immutable when unpublished versions are
+        # rebuilt, including registry archives already cached in CARGO_HOME.
+        package_target = package_target_directory(target_dir, identity)
+        package_environment = dict(environment, CARGO_TARGET_DIR=str(package_target))
+        run(command, cwd=release_workspace, env=package_environment)
+
         for crate_name in order:
             package = packages[crate_name]
-            print(f"\n==> Packaging {crate_name} {package['version']}", flush=True)
-            run(
-                [
-                    "cargo",
-                    "package",
-                    "--quiet",
-                    "-p",
-                    crate_name,
-                    "--config",
-                    str(config),
-                ],
-                cwd=release_workspace,
-                env=environment,
-            )
-            archive = target_dir / "package" / f"{crate_name}-{package['version']}.crate"
+            print(f"\n==> Checking archive {crate_name} {package['version']}", flush=True)
+            archive = package_target / "package" / f"{crate_name}-{package['version']}.crate"
             size = archive.stat().st_size
             sizes.append((crate_name, size))
             if size > MAX_ARCHIVE_BYTES:
@@ -565,16 +629,12 @@ def main() -> int:
                     f"{MAX_ARCHIVE_BYTES:,} bytes"
                 )
             print(f"    archive size: {size / 1024:.1f} KiB", flush=True)
-            validate_packaged_tests(
-                package,
-                archive,
-                root / "unit-tests",
-                config,
-                environment,
-            )
             entry = stage_package(package, archive, root / "registries", staged)
             staged.append(entry)
             write_cargo_config(config, staged)
+            validate_packaged_tests(
+                package, archive, root / "unit-tests", config, environment, staged,
+            )
             validate_downstream_consumer(
                 package,
                 root / "downstream-consumers" / entry["index"].parent.name,

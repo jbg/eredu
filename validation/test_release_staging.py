@@ -13,9 +13,9 @@ import unittest
 from unittest.mock import patch
 
 from validate_release_packages import (
-    copy_release_source, index_path, normalize_source_times,
+    copy_release_source, index_path, normalize_source_times, package_target_directory,
     stage_package, staging_directory, staging_root, validate_packaged_tests,
-    validate_downstream_consumer, write_cargo_config,
+    staged_test_manifest, validate_downstream_consumer, write_cargo_config,
 )
 
 
@@ -29,8 +29,10 @@ class ReleaseStagingTests(unittest.TestCase):
 
     def archive(self, root, package, source):
         manifest = (f'[package]\nname="{package["name"]}"\nversion="1.0.0"\n'
-                    'edition="2021"\n[dependencies]\n')
-        manifest += "\n".join(f'{d["name"]}="=1.0.0"' for d in package["dependencies"])
+                    'edition="2021"\n')
+        manifest += "\n".join(
+            f'[{"dev-dependencies" if d.get("kind") == "dev" else "dependencies"}.{d["name"]}]\nversion="=1.0.0"'
+            for d in package["dependencies"])
         archive = root / (package["name"] + ".crate")
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode="w") as tar:
@@ -129,14 +131,14 @@ class ReleaseStagingTests(unittest.TestCase):
             self.assertEqual(identities[0], identities[1])
             self.assertNotEqual(identities[1], identities[2])
 
-    def test_normal_cargo_package_retains_verification_and_reproducible_archives(self):
+    def test_normal_package_verifies_rebuilt_versions_and_reproduces_unchanged_archives(self):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
             root = Path(temporary)
             environment = dict(os.environ, CARGO_HOME=str(root / "cargo-home"),
                                CARGO_TARGET_DIR=str(root / "target"), CARGO_INCREMENTAL="0")
             packages = [self.package("fixture-leaf"), self.package("fixture-parent", ["fixture-leaf"])]
-            # Cargo package consults the original registry even with patches.
-            # Supply an empty local index so this fixture never needs network.
+            # The fixture publishes only to its own empty registry. Normal
+            # multi-package verification needs no crates.io or source override.
             empty = root / "empty-index"
             empty.mkdir()
             (empty / "config.json").write_text(json.dumps({"dl": root.as_uri()}))
@@ -144,7 +146,7 @@ class ReleaseStagingTests(unittest.TestCase):
                          ("-c", "user.name=Test", "-c", "user.email=test@invalid", "commit", "-qm", "empty")]:
                 subprocess.run(["git", *args], cwd=empty, check=True)
             checksums = []
-            for iteration in range(2):
+            for value in [1, 1, 2]:
                 with staging_directory(root / "stage") as stage:
                     workspace = stage / "workspace"
                     workspace.mkdir()
@@ -155,29 +157,31 @@ class ReleaseStagingTests(unittest.TestCase):
                         (crate / "src").mkdir(parents=True)
                         manifest = f'[package]\nname="{package["name"]}"\nversion="1.0.0"\nedition="2021"\n'
                         if package["dependencies"]:
-                            manifest += '[dependencies]\nfixture-leaf={path="../fixture-leaf",version="=1.0.0"}\n'
+                            manifest += '[dependencies]\nfixture-leaf={path="../fixture-leaf",version="=1.0.0",registry="fixture"}\n'
                         (crate / "Cargo.toml").write_text(manifest)
                         (crate / "src/lib.rs").write_text(
-                            "pub use fixture_leaf::value;" if package["dependencies"] else "pub fn value() -> u8 { 1 }")
+                            f"pub use fixture_leaf::value{value} as value;" if package["dependencies"]
+                            else f"pub fn value{value}() -> u8 {{ {value} }}")
                     normalize_source_times(workspace)
                     config = stage / "config.toml"
+                    config.write_text(f'[registries.fixture]\nindex="{empty.as_uri()}"\n')
                     staged = []
                     current = []
+                    target = package_target_directory(root / "target", f"source-{value}")
+                    package_environment = dict(environment, CARGO_TARGET_DIR=str(target))
+                    result = subprocess.run(
+                        ["cargo", "package", "--workspace", "--registry", "fixture", "--config", str(config)],
+                        cwd=workspace, env=package_environment, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stderr.count("Verifying"), len(packages), result.stderr)
                     for package in packages:
-                        write_cargo_config(config, staged)
-                        with config.open("a") as handle:
-                            handle.write('\n[source.crates-io]\nreplace-with="empty-fixture"\n'
-                                         f'[source.empty-fixture]\nregistry="{empty.as_uri()}"\n')
-                        result = subprocess.run(["cargo", "package", "-p", package["name"], "--config", str(config)],
-                                                cwd=workspace, env=environment, capture_output=True, text=True)
-                        self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertIn("Verifying", result.stderr)
-                        archive = root / "target/package" / (package["name"] + "-1.0.0.crate")
+                        archive = target / "package" / (package["name"] + "-1.0.0.crate")
                         entry = stage_package(package, archive, stage / "registries", staged)
                         staged.append(entry)
                         current.append(entry["index"])
                     checksums.append(current)
             self.assertEqual(checksums[0], checksums[1])
+            self.assertNotEqual(checksums[1], checksums[2])
 
     def test_packaged_checks_are_isolated_from_enclosing_workspace(self):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
@@ -196,10 +200,49 @@ class ReleaseStagingTests(unittest.TestCase):
             with staging_directory(base) as stage:
                 config = stage / "config.toml"
                 write_cargo_config(config, [])
-                validate_packaged_tests(package, archive, stage / "tests", config, environment)
                 entry = stage_package(package, archive, stage / "registries", [])
                 write_cargo_config(config, [entry])
+                validate_packaged_tests(package, archive, stage / "tests", config, environment, [entry])
                 validate_downstream_consumer(package, stage / "consumers", config, environment)
+
+    def test_archived_dev_dependencies_support_unit_tests_and_doctests(self):
+        with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
+            root = Path(temporary)
+            environment = dict(os.environ, CARGO_HOME=str(root / "cargo-home"),
+                               CARGO_TARGET_DIR=str(root / "target"), CARGO_INCREMENTAL="0")
+            leaf = self.package("fixture-leaf")
+            parent = self.package("fixture-parent", ["fixture-leaf"])
+            parent["dependencies"][0]["kind"] = "dev"
+            parent["targets"] = [{"kind": ["lib"]}]
+            leaf_archive = self.archive(root, leaf, "pub fn expected() -> u8 { 17 }")
+            parent_archive = self.archive(root, parent,
+                "/// ```\n/// assert_eq!(fixture_parent::value(), fixture_leaf::expected());\n/// ```\n"
+                "pub fn value() -> u8 { 17 }\n"
+                "#[test] fn value_matches() { assert_eq!(value(), fixture_leaf::expected()); }")
+            first = stage_package(leaf, leaf_archive, root / "registries", [])
+            second = stage_package(parent, parent_archive, root / "registries", [first])
+            config = root / "config.toml"
+            write_cargo_config(config, [first, second])
+            validate_packaged_tests(parent, parent_archive, root / "tests", config, environment, [first, second])
+
+    def test_test_manifest_selects_only_staged_dependency_tables(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = ('[package]\nname="fixture"\nversion="1.0.0"\n'
+                        '[dependencies.external]\nversion="2"\n'
+                        '[build-dependencies.renamed]\npackage="fixture-leaf"\nversion="1"\n'
+                        '[target.\'cfg(unix)\'.dev-dependencies.fixture-leaf]\nversion="1"\n'
+                        'registry-index="file:///original-index"\n'
+                        '[[test]]\nname="integration"\npath="tests/integration.rs"\n')
+            (root / "Cargo.toml").write_text(original)
+            staged_test_manifest(root, [{"name": "fixture-leaf", "index": root / "index"}])
+            import tomllib
+            actual = tomllib.loads((root / "Cargo.toml").read_text())
+            self.assertEqual(actual["dependencies"]["external"], {"version": "2"})
+            for selected in [actual["build-dependencies"]["renamed"],
+                             actual["target"]["cfg(unix)"]["dev-dependencies"]["fixture-leaf"]]:
+                self.assertEqual(selected["registry-index"], (root / "index").as_uri())
+            self.assertEqual((root / "Cargo.toml.published").read_text(), original)
 
 
 if __name__ == "__main__":

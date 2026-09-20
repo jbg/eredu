@@ -33,8 +33,7 @@ jobs:
       - uses: actions/checkout@v4
       - if: matrix.rust == '1.89.0'
         uses: dtolnay/rust-toolchain@1.89.0
-      - if: matrix.rust == 'stable'
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -60,7 +59,7 @@ jobs:
       - name: Build release archives in publication order
         env:
           RELEASE_PACKAGES: ${{ inputs.packages }}
-        run: python3 validation/validate_release_packages.py --packages-json "$RELEASE_PACKAGES" --target-dir target/release-validation
+        run: python3 validation/validate_release_packages.py --package-toolchain stable --packages-json "$RELEASE_PACKAGES" --target-dir target/release-validation
       - uses: ./.github/actions/save-native-cache
         with:
           key: ${{ steps.cache.outputs.native-key }}

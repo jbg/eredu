@@ -165,28 +165,42 @@ Every publishable crate must pass the same archive validation before a release:
 python3 validation/validate_release_packages.py
 ```
 
-The validator keeps the invoking workspace's active Rust toolchain for package,
+The validator keeps the invoking workspace's active Rust compilers for package,
 archive, and downstream-consumer checks, including checks in temporary
 directories outside the workspace. An explicit `RUSTUP_TOOLCHAIN` takes
 precedence; otherwise it preserves rustup's active environment, directory
-override, or repository toolchain selection.
+override, or repository toolchain selection. Multi-package archive verification
+requires a Cargo version supporting unpublished workspace dependencies. Use
+`--package-toolchain stable` to select that Cargo independently of the Rust
+compilers; archive tests and downstream Cargo remain on the invoking toolchain.
+The validator requires Python 3.11 or newer.
 
 Validate the minimum supported Rust version explicitly with an installed
 toolchain:
 
 ```bash
 rustup toolchain install 1.89.0 --profile minimal
-RUSTUP_TOOLCHAIN=1.89.0 python3 validation/validate_release_packages.py
+rustup toolchain install stable --profile minimal
+RUSTUP_TOOLCHAIN=1.89.0 python3 validation/validate_release_packages.py --package-toolchain stable
 ```
 
-The validator copies the Git package candidates to a content-identified workspace, then
-runs `cargo package` for each crate. It unpacks each archive, compiles its
-library unit tests, and runs its doctests with default features disabled before
-adding that archive to its own content-identified local registry. After staging a library, it
-also checks a new lock-free downstream crate that depends on the staged package
-with default features disabled. This lets consumers and the next workspace crate
-resolve the exact unpublished version while retaining Cargo's normal package
-verification. Package builds use a temporary target directory by default, or retain compiler
+The validator copies the Git package candidates to a content-identified workspace,
+then packages the selected dependency chain in one ordinary `cargo package`
+invocation. Cargo verifies the original archives using its temporary registry
+for unpublished workspace peers. Its target directory includes the source
+identity so cached unpublished versions cannot substitute an earlier archive.
+No dependency patch, replacement or source
+override is configured.
+
+Each archive is then added to a content-identified local registry. A fresh
+downstream crate consumes that exact version with default features disabled.
+The archive's test copy selects staged first-party registries explicitly in its
+root manifest and preserves the published manifest alongside it. This lets Cargo
+compile unit/integration targets and run doctests with their development
+dependencies; a registry dependency itself cannot be tested with development
+dependencies. Archive bytes and product manifests remain unchanged, and external
+dependencies resolve from crates.io. Package builds use a temporary target
+directory by default, or retain compiler
 outputs in an explicit `--target-dir` for subsequent runs. Nothing contacts a registry publishing API and no credentials
 are required.
 
@@ -309,24 +323,25 @@ documented `EREDU_MOSHI_NATIVE_FIXTURE` or
 Publish one crate at a time in this order, waiting for each version to become
 available in the registry index before continuing:
 
-1. `eredu-gguf`
-2. `safemlx-internal-macros`
-3. `eredu-backend-mlx-macros`
-4. `safemlx-sys`
-5. `eredu-nn-macros`
-6. `eredu-checkpoint`
-7. `eredu-core`
-8. `eredu-text`
-9. `safemlx`
-10. `eredu-nn`
-11. `eredu-runtime`
-12. `eredu-media`
-13. `eredu-architectures`
-14. `eredu-codec`
-15. `eredu-evaluation`
-16. `eredu-backend-mlx`
-17. `eredu`
-18. `eredu-cli`
+1. `eredu-collections`
+2. `eredu-gguf`
+3. `safemlx-internal-macros`
+4. `eredu-backend-mlx-macros`
+5. `safemlx-sys`
+6. `eredu-nn-macros`
+7. `eredu-checkpoint`
+8. `eredu-core`
+9. `eredu-text`
+10. `safemlx`
+11. `eredu-nn`
+12. `eredu-runtime`
+13. `eredu-media`
+14. `eredu-architectures`
+15. `eredu-codec`
+16. `eredu-evaluation`
+17. `eredu-backend-mlx`
+18. `eredu`
+19. `eredu-cli`
 
 This is a valid topological order for normal, build, and development
 dependencies. In particular, `eredu-evaluation` precedes
