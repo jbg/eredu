@@ -879,6 +879,12 @@ and source custody remain borrowed prerequisites. Owning lookups clone their
 selected records under separate policy; borrowed lookup allocates nothing and
 supports finite inference over the same retained entries. This index admission
 covers neither metadata inference nor complete encoded recipe compilation.
+Runtime implements shared initialization directly for the checkpoint-owned
+memory and SafeTensors read plans. Callers inspect the plan through its existing
+source constructors, then compare and construct through the pool; there is no
+second initializer object. Source visibility and prepared-header requirements
+are enforced by the checkpoint plans before admission.
+
 Memory-backed encoded reads inspect their actual immutable store and ordered
 keys before constructing metadata records and source spans. Ordinary reads and
 the runtime-admitted constructor share that worker. Runtime compares the original

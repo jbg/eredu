@@ -1,7 +1,6 @@
 use super::super::*;
-use crate::working_memory::{
-    DependencyMemoryPolicy, shared_native_initialization::SafetensorsEncodedReadInitializer,
-};
+use crate::working_memory::DependencyMemoryPolicy;
+use eredu_checkpoint::store::SafetensorsEncodedReadPlan;
 use eredu_checkpoint::{
     safetensors::{
         SafetensorsDiscoveryLimits, SafetensorsHeaderAdmission, SafetensorsIndexRequest,
@@ -185,7 +184,7 @@ fn funded_borrowed_headers_and_closed_source_feed_the_existing_prepared_read() {
     let source = funded(&pool, dir.path());
     let keys = ["weight".into()];
     assert!(matches!(
-        SafetensorsEncodedReadInitializer::new(&source, &keys),
+        SafetensorsEncodedReadPlan::new(&source, &keys),
         Err(SafetensorsEncodedReadPlanError::HeaderUnavailable { .. })
     ));
     let before = pool.used_bytes().unwrap();
@@ -213,17 +212,19 @@ fn funded_borrowed_headers_and_closed_source_feed_the_existing_prepared_read() {
     .unwrap();
     let restricted = RetainedCheckpointSource::from(Arc::new(restricted));
     assert!(matches!(
-        SafetensorsEncodedReadInitializer::from_source(&restricted, &keys),
+        SafetensorsEncodedReadPlan::from_source(&restricted, &keys),
         Err(SafetensorsEncodedReadPlanError::UnauthorizedTensor {
             index: 0,
             contract: "deny-weight"
         })
     ));
     drop(restricted);
-    let read = SafetensorsEncodedReadInitializer::from_source(&root, &keys)
-        .unwrap()
-        .unwrap()
-        .prepare(&pool)
+    let read = pool
+        .initialize_shared_native(
+            SafetensorsEncodedReadPlan::from_source(&root, &keys)
+                .unwrap()
+                .unwrap(),
+        )
         .unwrap();
     let read_bytes = read.original_bytes();
     assert_eq!(root.source_diagnostics().unwrap().physical_reads, 0);

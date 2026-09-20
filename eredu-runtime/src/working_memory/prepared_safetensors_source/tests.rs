@@ -1,5 +1,5 @@
 use super::*;
-use crate::working_memory::shared_native_initialization::SafetensorsEncodedReadInitializer;
+use eredu_checkpoint::store::SafetensorsEncodedReadPlan;
 use eredu_checkpoint::{
     StoredDtype,
     safetensors::SafetensorsDiscoveryLimits,
@@ -178,17 +178,17 @@ fn prepared_views_keep_typed_file_route_and_resolution_after_inspection_retires(
     ));
     let forbidden = vec!["beta".into()];
     assert!(matches!(
-        SafetensorsEncodedReadInitializer::from_source(&source, &forbidden),
+        SafetensorsEncodedReadPlan::from_source(&source, &forbidden),
         Err(eredu_checkpoint::store::SafetensorsEncodedReadPlanError::UnauthorizedTensor { .. })
     ));
     let view_bytes =
         WorkingMemoryPool::prepared_safetensors_view_bytes(inspection.tensors(), &contract, POLICY)
             .unwrap();
     let keys = vec!["alpha".into()];
-    let initializer = SafetensorsEncodedReadInitializer::from_source(&source, &keys)
+    let initializer = SafetensorsEncodedReadPlan::from_source(&source, &keys)
         .unwrap()
         .unwrap();
-    let read = initializer.prepare(&pool).unwrap();
+    let read = pool.initialize_shared_native(initializer).unwrap();
     let identity = source.identity();
     let alias = source.clone();
     assert!(source.same_source(&alias));

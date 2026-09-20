@@ -1,5 +1,8 @@
 use super::*;
 use eredu_checkpoint::store::{CheckpointSource, WeightStore};
+use eredu_checkpoint::store::{
+    RetainedCheckpointSource, SafetensorsEncodedReadPlanError, SafetensorsWeightStore,
+};
 use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 
 fn fixture() -> (tempfile::TempDir, SafetensorsWeightStore) {
@@ -23,8 +26,8 @@ fn fixture() -> (tempfile::TempDir, SafetensorsWeightStore) {
     let store = SafetensorsWeightStore::open(path).unwrap();
     (directory, store)
 }
-fn requirement(plan: &SafetensorsEncodedReadInitializer<'_>) -> Option<u64> {
-    let result = plan.required_bytes();
+fn requirement(plan: &SafetensorsEncodedReadPlan<'_>) -> Option<u64> {
+    let result = WorkingMemoryPool::shared_native_initialization_required_bytes(plan);
     if std::env::var_os("EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION").is_some() {
         assert!(result.is_ok(), "{result:?}");
     }
@@ -39,12 +42,12 @@ fn requirement(plan: &SafetensorsEncodedReadInitializer<'_>) -> Option<u64> {
 fn file_metadata_admission_compares_before_construction_and_keeps_actual_source() {
     let (_directory, source) = fixture();
     let keys = ["second".into(), "first".into(), "second".into()];
-    let plan = SafetensorsEncodedReadInitializer::new(&source, &keys).unwrap();
+    let plan = SafetensorsEncodedReadPlan::new(&source, &keys).unwrap();
     let Some(bytes) = requirement(&plan) else {
         return;
     };
     let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
-    let error = plan.prepare(&short).unwrap_err();
+    let error = short.initialize_shared_native(plan).unwrap_err();
     assert!(error.rejected_plan().is_some());
     assert!(matches!(
         error.accounting_failure(),
@@ -60,9 +63,8 @@ fn file_metadata_admission_compares_before_construction_and_keeps_actual_source(
     );
     drop(error);
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let read = SafetensorsEncodedReadInitializer::new(&source, &keys)
-        .unwrap()
-        .prepare(&pool)
+    let read = pool
+        .initialize_shared_native(SafetensorsEncodedReadPlan::new(&source, &keys).unwrap())
         .unwrap();
     assert_eq!(read.original_bytes(), bytes);
     assert_eq!(source.diagnostics().unwrap().physical_reads, 0);
@@ -84,28 +86,28 @@ fn file_metadata_admission_compares_before_construction_and_keeps_actual_source(
 fn file_metadata_admission_preserves_competing_charges_and_unquoted_exclusion() {
     let (_directory, source) = fixture();
     let keys = ["first".into()];
-    let plan = || SafetensorsEncodedReadInitializer::new(&source, &keys).unwrap();
+    let plan = || SafetensorsEncodedReadPlan::new(&source, &keys).unwrap();
     let Some(bytes) = requirement(&plan()) else {
         return;
     };
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
     let unquoted = pool.acquire_unquoted().unwrap();
-    let error = plan().prepare(&pool).unwrap_err();
+    let error = pool.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
         error.accounting_failure(),
         Some(WorkingMemoryError::UnknownBound)
     ));
     assert_eq!(pool.used_bytes().unwrap(), 0);
     drop((error, unquoted));
-    let first = plan().prepare(&pool).unwrap();
-    let second = plan().prepare(&pool).unwrap_err();
+    let first = pool.initialize_shared_native(plan()).unwrap();
+    let second = pool.initialize_shared_native(plan()).unwrap_err();
     assert!(matches!(
         second.accounting_failure(),
         Some(WorkingMemoryError::BudgetExceeded { .. })
     ));
     drop((second, first));
     assert_eq!(pool.used_bytes().unwrap(), 0);
-    let second = plan().prepare(&pool).unwrap();
+    let second = pool.initialize_shared_native(plan()).unwrap();
     drop(second);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
@@ -128,21 +130,21 @@ fn file_route_checks_visibility_and_releases_views_after_admitted_construction()
     .into();
     let denied = ["second".into()];
     assert!(matches!(
-        SafetensorsEncodedReadInitializer::from_source(&root, &denied),
+        SafetensorsEncodedReadPlan::from_source(&root, &denied),
         Err(SafetensorsEncodedReadPlanError::UnauthorizedTensor {
             index: 0,
             contract: "first only"
         })
     ));
     let keys = ["first".into(), "first".into()];
-    let plan = SafetensorsEncodedReadInitializer::from_source(&root, &keys)
+    let plan = SafetensorsEncodedReadPlan::from_source(&root, &keys)
         .unwrap()
         .unwrap();
     let Some(bytes) = requirement(&plan) else {
         return;
     };
     let short = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
-    let error = plan.prepare(&short).unwrap_err();
+    let error = short.initialize_shared_native(plan).unwrap_err();
     assert!(error.rejected_plan().is_some());
     assert!(matches!(
         error.accounting_failure(),
@@ -152,10 +154,12 @@ fn file_route_checks_visibility_and_releases_views_after_admitted_construction()
     assert!(leaf.diagnostics().unwrap().touched_shard_paths.is_empty());
     drop(error);
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let read = SafetensorsEncodedReadInitializer::from_source(&root, &keys)
-        .unwrap()
-        .unwrap()
-        .prepare(&pool)
+    let read = pool
+        .initialize_shared_native(
+            SafetensorsEncodedReadPlan::from_source(&root, &keys)
+                .unwrap()
+                .unwrap(),
+        )
         .unwrap();
     drop((root, leaf, keys));
     assert!(alive.upgrade().is_none());

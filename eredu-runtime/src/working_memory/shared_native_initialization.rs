@@ -8,9 +8,7 @@ use std::{
 mod recipe_keys;
 mod read_catalog;
 mod memory_read;
-pub use memory_read::MemoryEncodedReadInitializer;
 mod file_read;
-pub use file_read::SafetensorsEncodedReadInitializer;
 
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public
@@ -306,3 +304,6 @@ impl WorkingMemoryPool {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod read_sequence_tests;
