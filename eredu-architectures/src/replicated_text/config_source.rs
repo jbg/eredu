@@ -135,10 +135,20 @@ pub(crate) fn unchanged<C>(_: &C) -> Result<(), String> {
 }
 
 macro_rules! projection {
-    ($name:ident, $variant:ident, $ty:ty) => {
+    ($name:ident, $variant:ident, $ty:ty $(, $field:ident)?) => {
         pub(crate) fn $name(plan: &ArtifactArchitecturePlan) -> Option<&$ty> {
-            match eligible_config(plan).ok()? {
-                EligibleConfig::$variant(config) => Some(config),
+            // Selection owns execution eligibility; this loan only projects the
+            // immutable configuration whose identity source_config verifies.
+            match (
+                plan.safetensors_architecture().map(|plan| plan.model()),
+                plan.gguf_plan().map(|plan| plan.model()),
+            ) {
+                (Some(SafetensorsModelConfig::$variant(config)), None) => {
+                    Some(&config$(.$field)?)
+                }
+                (None, Some(GgufModelConfig::$variant(config))) => {
+                    Some(&config$(.$field)?)
+                }
                 _ => None,
             }
         }
@@ -151,7 +161,7 @@ projection!(k2_horizon, K2Horizon, crate::k2_horizon::ModelArgs);
 projection!(qwen, Qwen, crate::qwen::ModelArgs);
 projection!(lfm2, Lfm2, crate::lfm2::ModelArgs);
 projection!(nemotron_h, NemotronH, crate::nemotron_h::ModelArgs);
-projection!(qwen_hybrid, QwenHybrid, crate::qwen::hybrid::HybridConfig);
+projection!(qwen_hybrid, QwenHybrid, crate::qwen::hybrid::HybridConfig, text);
 projection!(kimi_linear, KimiLinear, crate::kimi_linear::ModelArgs);
 projection!(deepseek_v3, DeepSeekV3, crate::deepseek::V3Args);
 
@@ -607,4 +617,3 @@ mod projection_tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
-

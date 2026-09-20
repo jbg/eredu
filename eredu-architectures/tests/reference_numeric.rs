@@ -14623,7 +14623,9 @@ fn execute_numeric_routed_visitor_with_policy(
         &prepared_adapter::NumericPreparationProvider { addressable },
     )
     .unwrap();
-    prepared_adapter::routed(sources, context, tokens).unwrap()
+    prepared_adapter::routed(sources, context, tokens).unwrap_or_else(|error| {
+        panic!("{} addressable={addressable}: {error}", config["model_type"])
+    })
 }
 
 fn execute_numeric_composite_visitor(

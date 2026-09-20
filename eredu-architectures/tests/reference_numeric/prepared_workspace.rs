@@ -17,6 +17,16 @@ struct Facts {
     omit_copies: bool,
 }
 impl WorkspaceMechanisms for Facts {
+    fn output_representation(
+        &self,
+        operation: WorkspaceOperationView<'_>,
+        output: usize,
+    ) -> Option<WorkspaceRepresentation> {
+        // This mock allocates every floating output as contiguous F32.
+        (operation.outputs.get(output)?.dtype() == WorkspaceDtype::Float32)
+            .then_some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true))
+    }
+
     fn operation_bound(
         &self,
         operation: &WorkspaceOperation,
@@ -128,8 +138,14 @@ fn prepared_routed_workspace_shares_spans_across_gated_relu2_and_pooling_profile
                             )
                         });
                     assert_eq!(report.geometry(), geometry);
-                    assert_eq!(report.transient().bytes().is_none(), addressable);
-                    assert_eq!(report.first_gap().is_some(), addressable);
+                    assert!(report.transient().bytes().is_some());
+                    assert!(report.first_gap().is_none());
+                    assert_eq!(
+                        facts.operations.lock().unwrap().iter().any(|operation| {
+                            matches!(operation.kind, WorkspaceOperationKind::AddressableRegion(_))
+                        }),
+                        addressable,
+                    );
                     for lane in state.as_ref() {
                         assert_eq!(lane.position(), 0);
                     }
