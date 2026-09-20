@@ -780,6 +780,11 @@ and dtype checks precede admission; only a complete successful read publishes an
 immutable source. Escaped array aliases retain the source account independently
 of the constructor wrapper, and failed reads retain their account with the typed
 error. Retained read metadata and runtime initialization are separate prerequisites.
+Shared constructor failures can separate their uncalled plan from an owned
+failure. The failure retains typed causes, any completed output or failed prefix,
+and its original account. This allows borrowed planning inputs to retire without
+refunding surviving resources. Output access remains borrowed, and retained
+native owners continue to determine the failure's thread-safety requirements.
 Cold conversion can admit its fixed materialization slot through the source
 account before a text request exists. Checkout transfers the one prepared node;
 its source account stays with the same completion/recovery owner after the slot

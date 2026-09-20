@@ -6,7 +6,7 @@ use eredu_checkpoint::{
         TensorSelection,
     },
 };
-use safetensors::tensor::{Dtype as SafeDtype, TensorView, serialize_to_file};
+use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
 
 fn bytes() -> Vec<u8> {
     (0..256)
@@ -124,21 +124,32 @@ fn encoded_input_checks_exact_dtype_and_shape_before_admission() {
 
 #[test]
 fn encoded_input_source_failure_publishes_nothing_and_retains_error_account() {
-    let runtime = PreparedInputRuntime::prepare().unwrap();
     let (directory, source) = file();
-    let read = selected(&source);
-    let plan = PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32).unwrap();
-    let required = plan.required_bytes().unwrap();
-    let pool = WorkingMemoryPool::new(required, 0).unwrap();
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(directory.path().join("model.safetensors"))
+    let (error, pool, required) = {
+        let runtime = PreparedInputRuntime::prepare().unwrap();
+        let read = selected(&source);
+        let shape = [2, 64];
+        let plan = PreparedEncodedInputPlan::new(&read, &runtime, &shape, Dtype::Float32).unwrap();
+        let required = plan.required_bytes().unwrap();
+        let pool = WorkingMemoryPool::new(required, 0).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(directory.path().join("model.safetensors"))
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let (plan, error) = plan.prepare(&pool).unwrap_err().into_parts();
+        assert!(plan.is_none());
+        assert!(error.completed_output().is_none());
+        (error, pool, required)
+    };
+    // The retained typed failure no longer borrows the read, shape or runtime.
+    fn require_static<T: 'static>(_: &T) {}
+    require_static(&error);
+    assert!(std::error::Error::source(&error)
         .unwrap()
-        .set_len(0)
-        .unwrap();
-    let error = plan.prepare(&pool).unwrap_err();
-    assert!(error.rejected_plan().is_none());
-    assert!(error.completed_output().is_none());
+        .downcast_ref::<EncodedInputConstructionError>()
+        .is_some());
     assert!(matches!(
         error.constructor_failure(),
         Some(EncodedInputConstructionError::Read(EncodedReadFailure {

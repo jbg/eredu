@@ -79,52 +79,38 @@ impl<T> InitializedSharedNative<T> {
     }
 }
 
-/// Rejected plan or actual completed/failed constructor. All value fields retire
-/// before the raw account. Source errors remain typed and no native callback is
-/// invoked with Usage borrowed.
-pub struct SharedNativeInitializationError<P: SharedNativeInitializer> {
+/// Constructor failure and its actual output/prefix custody, independent of
+/// the input plan's type or lifetime. All value fields retire before the raw
+/// account. A completed output remains borrowed; it cannot escape its account.
+pub struct SharedNativeInitializationFailure<T, E> {
     accounting: Option<WorkingMemoryError>,
-    construction: Option<P::Error>,
-    plan: Option<P>,
-    output: Option<P::Output>,
+    construction: Option<E>,
+    output: Option<T>,
     account: Option<Account>,
 }
-impl<P: SharedNativeInitializer> SharedNativeInitializationError<P> {
-    fn rejected(plan: P, error: WorkingMemoryError) -> Self {
-        Self {
-            accounting: Some(error),
-            construction: None,
-            plan: Some(plan),
-            output: None,
-            account: None,
-        }
-    }
+impl<T, E> SharedNativeInitializationFailure<T, E> {
     /// Exact comparison/settlement refusal.
     pub fn accounting_failure(&self) -> Option<&WorkingMemoryError> {
         self.accounting.as_ref()
     }
-    /// Actual fixed constructor cause with its preserved failed owner/prefix.
-    pub fn constructor_failure(&self) -> Option<&P::Error> {
+    /// Actual constructor cause with its preserved failed owner/prefix.
+    pub fn constructor_failure(&self) -> Option<&E> {
         self.construction.as_ref()
     }
-    /// An admission rejection still owns the actual uncalled plan.
-    pub fn rejected_plan(&self) -> Option<&P> {
-        self.plan.as_ref()
-    }
     /// A settlement refusal may retain a genuinely completed native output.
-    pub fn completed_output(&self) -> Option<&P::Output> {
+    pub fn completed_output(&self) -> Option<&T> {
         self.output.as_ref()
     }
 }
-impl<P: SharedNativeInitializer> fmt::Debug for SharedNativeInitializationError<P> {
+impl<T, E: fmt::Debug> fmt::Debug for SharedNativeInitializationFailure<T, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SharedNativeInitializationError")
+        f.debug_struct("SharedNativeInitializationFailure")
             .field("accounting", &self.accounting)
             .field("construction", &self.construction)
             .finish_non_exhaustive()
     }
 }
-impl<P: SharedNativeInitializer> fmt::Display for SharedNativeInitializationError<P> {
+impl<T, E: fmt::Display> fmt::Display for SharedNativeInitializationFailure<T, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(cause) = &self.construction {
             cause.fmt(f)
@@ -136,9 +122,8 @@ impl<P: SharedNativeInitializer> fmt::Display for SharedNativeInitializationErro
         }
     }
 }
-impl<P: SharedNativeInitializer> std::error::Error for SharedNativeInitializationError<P>
-where
-    P::Error: 'static,
+impl<T, E: std::error::Error + 'static> std::error::Error
+    for SharedNativeInitializationFailure<T, E>
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.construction
@@ -149,6 +134,76 @@ where
                     .as_ref()
                     .map(|e| e as &(dyn std::error::Error + 'static))
             })
+    }
+}
+
+/// Rejected plan or actual completed/failed constructor. Source errors remain
+/// typed and no native callback is invoked with Usage borrowed.
+pub struct SharedNativeInitializationError<P: SharedNativeInitializer> {
+    plan: Option<P>,
+    failure: SharedNativeInitializationFailure<P::Output, P::Error>,
+}
+impl<P: SharedNativeInitializer> SharedNativeInitializationError<P> {
+    fn rejected(plan: P, error: WorkingMemoryError) -> Self {
+        Self {
+            plan: Some(plan),
+            failure: SharedNativeInitializationFailure {
+                accounting: Some(error),
+                construction: None,
+                output: None,
+                account: None,
+            },
+        }
+    }
+    /// Exact comparison/settlement refusal.
+    pub fn accounting_failure(&self) -> Option<&WorkingMemoryError> {
+        self.failure.accounting_failure()
+    }
+    /// Actual fixed constructor cause with its preserved failed owner/prefix.
+    pub fn constructor_failure(&self) -> Option<&P::Error> {
+        self.failure.constructor_failure()
+    }
+    /// An admission rejection still owns the actual uncalled plan.
+    pub fn rejected_plan(&self) -> Option<&P> {
+        self.plan.as_ref()
+    }
+    /// A settlement refusal may retain a genuinely completed native output.
+    pub fn completed_output(&self) -> Option<&P::Output> {
+        self.failure.completed_output()
+    }
+    /// Separate an uncalled plan from the failure without copying or releasing
+    /// any constructor prefix, completed output or original account. This lets
+    /// callers handle a borrowed plan locally while retaining an owned failure
+    /// when its output and cause types do not borrow those prerequisites.
+    /// Thread-safety remains determined by the actual retained output and cause.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<P>,
+        SharedNativeInitializationFailure<P::Output, P::Error>,
+    ) {
+        (self.plan, self.failure)
+    }
+}
+impl<P: SharedNativeInitializer> fmt::Debug for SharedNativeInitializationError<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedNativeInitializationError")
+            .field("accounting", &self.failure.accounting)
+            .field("construction", &self.failure.construction)
+            .finish_non_exhaustive()
+    }
+}
+impl<P: SharedNativeInitializer> fmt::Display for SharedNativeInitializationError<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.failure.fmt(f)
+    }
+}
+impl<P: SharedNativeInitializer> std::error::Error for SharedNativeInitializationError<P>
+where
+    P::Error: 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failure.source()
     }
 }
 
@@ -201,18 +256,22 @@ impl WorkingMemoryPool {
         match result {
             Ok(output) if accounting.is_none() => Ok(InitializedSharedNative { output, account }),
             Ok(output) => Err(SharedNativeInitializationError {
-                accounting,
-                construction: None,
                 plan: None,
-                output: Some(output),
-                account: Some(account),
+                failure: SharedNativeInitializationFailure {
+                    accounting,
+                    construction: None,
+                    output: Some(output),
+                    account: Some(account),
+                },
             }),
             Err(error) => Err(SharedNativeInitializationError {
-                accounting,
-                construction: Some(error),
                 plan: None,
-                output: None,
-                account: Some(account),
+                failure: SharedNativeInitializationFailure {
+                    accounting,
+                    construction: Some(error),
+                    output: None,
+                    account: Some(account),
+                },
             }),
         }
     }
