@@ -91,7 +91,7 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism: MlxCpuWo
             size_of::<CpuCopyEvalLayout>(), size_of::<Option<CpuCopyEvalLayout>>(),
             size_of::<Option<WorkspaceRepresentation>>(), size_of::<std::slice::Iter<'_, i32>>(),
             size_of::<(&WorkspaceSamplingOperation, MlxCpuWorkspaceMechanisms)>(),
-            crate::backend::random::standard_sampling_control_bytes()?,
+            crate::backend::random::standard_sampling_control_bytes(safemlx::DeviceType::Cpu)?,
         ];
         population.controls = parts.into_iter().try_fold(population.controls.checked_add(size_of_val(&parts))?, usize::checked_add)?;
         Some(OperationPlan { dtype: WorkspaceFloatingType::Float32, population, alias_input,

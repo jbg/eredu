@@ -14,16 +14,20 @@ fn resolve<'a>(key: impl Into<Option<&'a Array>>) -> Result<Cow<'a, Array>> {
         .ok_or_else(|| Exception::custom("random operations require an explicit PRNG key"))
 }
 
-/// Named native/C/safe controls for the explicit-key Standard sampling path.
-/// Array descriptors and requested buffers remain in the existing Graph/P owners.
-pub fn standard_sampling_control_bytes() -> Option<usize> {
+/// Named native/C/safe controls for explicit-key Standard sampling on a device.
+/// CPU evaluation workers provide their own operation layouts. GPU selection
+/// additionally requires Metal random-worker controls. Array descriptors and
+/// requested buffers remain in the existing Graph/P owners.
+pub fn standard_sampling_control_bytes(device: crate::DeviceType) -> Option<usize> {
     use std::mem::size_of;
     // SAFETY: pure scalar layout query with no runtime object or allocation.
-    let native = unsafe { safemlx_sys::mlx_random_standard_sampling_control_bytes() };
+    let native = unsafe { safemlx_sys::mlx_random_standard_sampling_control_bytes(device.into()) };
     if native == 0 {
         return None;
     }
     [
+        size_of::<crate::DeviceType>(),
+        size_of::<safemlx_sys::mlx_device_type>(),
         size_of::<Cow<'static, Array>>(),
         size_of::<[Array; 3]>(),
         size_of::<Result<Array>>(),
@@ -503,6 +507,20 @@ mod tests {
     use super::*;
     use crate::{array, assert_array_eq};
     use float_eq::{assert_float_eq, float_eq};
+
+    #[test]
+    #[cfg(target_vendor = "apple")]
+    fn sampling_controls_follow_the_selected_device() {
+        let cpu = standard_sampling_control_bytes(crate::DeviceType::Cpu).unwrap();
+        assert!(cpu > 0);
+        let gpu = standard_sampling_control_bytes(crate::DeviceType::Gpu);
+        let allocator = crate::PreparedInputAllocator::<()>::layout().unwrap();
+        if allocator.requires_device {
+            assert!(gpu.unwrap() > cpu);
+        } else {
+            assert_eq!(gpu, None);
+        }
+    }
 
     #[test]
     fn test_explicit_random_state_is_deterministic() {

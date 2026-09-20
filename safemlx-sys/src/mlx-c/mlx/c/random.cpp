@@ -8,12 +8,13 @@
 #include "mlx/c/private/mlx.h"
 #include "mlx/random.h"
 
-extern "C" size_t mlx_random_standard_sampling_control_bytes(void) {
+extern "C" size_t mlx_random_standard_sampling_control_bytes(mlx_device_type device) {
+  if (device != MLX_CPU && device != MLX_GPU) return 0;
   // key/split/categorical share these C transports; no output payload or
   // heap fallback is introduced by the read-only layout query.
-  const size_t native = mlx::core::random::standard_sampling_control_bytes();
+  const size_t native = mlx::core::random::standard_sampling_control_bytes(mlx_device_type_to_cpp(device));
   if (!native) return 0;
-  return native + sizeof(native) +
+  return native + sizeof(native) + sizeof(device) + sizeof(mlx::core::Device::DeviceType) +
       4 * sizeof(mlx_array) + sizeof(mlx_array*) + sizeof(mlx_stream) +
       sizeof(std::optional<mlx::core::array>) + sizeof(uint64_t) +
       2 * sizeof(int) + sizeof(const std::exception*);

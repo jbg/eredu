@@ -14,9 +14,9 @@ diff --git a/mlx/random.cpp b/mlx/random.cpp
  
  namespace mlx::core::random {
 +
-+size_t standard_sampling_control_bytes() noexcept {
-+  const size_t gpu = metal::random_bits_control_bytes();
-+  if (!gpu) return 0;
++size_t standard_sampling_control_bytes(Device::DeviceType device) noexcept {
++  const size_t gpu = device == Device::gpu ? metal::random_bits_control_bytes() : 0;
++  if (device != Device::cpu && (device != Device::gpu || !gpu)) return 0;
 +  // Key: the real initializer-list seed and final source descriptor.
 +  const size_t seed = sizeof(uint64_t) + 2 * sizeof(uint32_t) +
 +      sizeof(std::initializer_list<uint32_t>) + sizeof(Shape) + sizeof(array);
@@ -36,7 +36,7 @@ diff --git a/mlx/random.cpp b/mlx/random.cpp
 +  const size_t categorical = 8 * sizeof(array) + 2 * sizeof(Shape) +
 +      3 * sizeof(int) + sizeof(size_t) + 2 * sizeof(StreamOrDevice) +
 +      2 * sizeof(std::optional<array>) + 6 * sizeof(void*);
-+  return gpu + seed + bits + uniform + categorical + 5 * sizeof(size_t);
++  return gpu + seed + bits + uniform + categorical + 5 * sizeof(size_t) + sizeof(device);
 +}
  
  KeySequence::KeySequence(uint64_t seed) : key_(key(seed)) {}
@@ -50,7 +50,7 @@ diff --git a/mlx/random.h b/mlx/random.h
  namespace mlx::core::random {
 +
 +// Fixed controls for explicit-key Standard sampling; no source or payload grant.
-+MLX_API size_t standard_sampling_control_bytes() noexcept;
++MLX_API size_t standard_sampling_control_bytes(Device::DeviceType) noexcept;
  
  class MLX_API KeySequence {
   public:

@@ -101,9 +101,10 @@ impl RandomState {
 }
 
 /// Actual backend key/state/result controls of the shared Standard worker.
-pub(crate) fn standard_sampling_control_bytes() -> Option<usize> {
+pub(crate) fn standard_sampling_control_bytes(device: safemlx::DeviceType) -> Option<usize> {
     use std::mem::size_of;
     [
+        size_of::<safemlx::DeviceType>(),
         size_of::<RandomState>(),
         size_of::<Option<RandomState>>(),
         size_of::<[Array; 3]>(),
@@ -115,7 +116,7 @@ pub(crate) fn standard_sampling_control_bytes() -> Option<usize> {
     ]
     .into_iter()
     .try_fold(
-        safemlx::random::standard_sampling_control_bytes()?,
+        safemlx::random::standard_sampling_control_bytes(device)?,
         usize::checked_add,
     )
 }

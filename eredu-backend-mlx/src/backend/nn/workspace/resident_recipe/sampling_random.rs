@@ -122,7 +122,7 @@ pub(super) fn eager_preparation(
     };
     let Some(controls) = graph
         .control_bytes()
-        .and_then(|n| n.checked_add(crate::backend::random::standard_sampling_control_bytes()?))
+        .and_then(|n| n.checked_add(crate::backend::random::standard_sampling_control_bytes(safemlx::DeviceType::Cpu)?))
     else {
         return Ok(None);
     };

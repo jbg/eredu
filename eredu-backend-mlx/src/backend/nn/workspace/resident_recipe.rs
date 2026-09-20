@@ -2613,7 +2613,7 @@ impl ResidentRecipeRecorder {
                         | eredu_nn::workspace::WorkspaceSamplingOperation::Categorical
                 )
             ) {
-                let Some(controls) = crate::backend::random::standard_sampling_control_bytes()
+                let Some(controls) = crate::backend::random::standard_sampling_control_bytes(safemlx::DeviceType::Gpu)
                 else {
                     missing.get_or_insert(index);
                     continue;

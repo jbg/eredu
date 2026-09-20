@@ -1286,6 +1286,10 @@ bounds retain their own rounding rules; original Metal backing uses separately
 queried physical capacities. These buffer bounds do not cover allocator caches
 or establish a process-wide memory ceiling. CPU and Metal equations retain their
 respective mechanism dispatch, and missing operator facts still reject admission.
+Shared sampling-constructor controls take the selected device explicitly. CPU
+workers retain their operation-specific layout accounting; GPU sampling also
+requires Metal random-worker controls. Eager random-key preparation uses the
+host constructor and issues no device evaluation.
 
 Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
 selected checkpoint contract. Ordinary and admitted preparation share the same

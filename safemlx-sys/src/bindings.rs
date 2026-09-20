@@ -6764,7 +6764,7 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    pub fn mlx_random_standard_sampling_control_bytes() -> usize;
+    pub fn mlx_random_standard_sampling_control_bytes(device: mlx_device_type) -> usize;
 }
 
 unsafe extern "C" {
