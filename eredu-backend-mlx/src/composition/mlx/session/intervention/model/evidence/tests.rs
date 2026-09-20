@@ -7,7 +7,7 @@ use eredu_core::{
 use eredu_runtime::working_memory::{
     InferenceExecutionIdentity, OriginalInterventionSource, WorkingMemoryPool,
 };
-fn sources(pool: &WorkingMemoryPool) -> (OriginalInterventionSource, AdmittedCapturePlan) {
+fn sources(pool: &WorkingMemoryPool, invocation: bool) -> (OriginalInterventionSource, AdmittedCapturePlan) {
     let bounds = CaptureInvocationBounds {
         batch: 1,
         max_sequence: 5,
@@ -54,7 +54,9 @@ fn sources(pool: &WorkingMemoryPool) -> (OriginalInterventionSource, AdmittedCap
         .map(|(i, evidence)| InterventionOperation {
             id: i.to_string(),
             target: "block.output".into(),
-            schedule: Default::default(),
+            // Ordinary decode has one sequence row; this fixture's preview
+            // rectangle selects prompt rows three and four.
+            schedule: CaptureSchedule { decode: invocation, ..Default::default() },
             slices: if i == 1 {
                 vec![CaptureSlice {
                     axis: "sequence".into(),
@@ -72,9 +74,14 @@ fn sources(pool: &WorkingMemoryPool) -> (OriginalInterventionSource, AdmittedCap
             evidence,
         })
         .collect(),
-    }
-    .admit_invocations(&declaration, bounds, "session")
-    .unwrap();
+    };
+    let plan = if invocation {
+        plan.admit_invocations(&declaration, bounds, "session")
+    } else {
+        plan.admit(&declaration, CaptureRequestShape {
+            batch: 1, prompt_tokens: 5, max_predictions: 4,
+        }, "session")
+    }.unwrap();
     let source = pool
         .compile_intervention_source(
             eredu_core::intervention::PreparedInterventionPlanCopy::inspect(&plan).unwrap(),
@@ -123,7 +130,7 @@ fn sources(pool: &WorkingMemoryPool) -> (OriginalInterventionSource, AdmittedCap
 fn model_companion_trace_counts_lazy_summary_frontiers_and_metadata_only_window_sides() {
     let capacity = 1 << 27;
     let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
-    let (source, capture) = sources(&pool);
+    let (source, capture) = sources(&pool, true);
     let funding = pool
         .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity)
         .unwrap();
@@ -199,4 +206,51 @@ fn model_companion_trace_counts_lazy_summary_frontiers_and_metadata_only_window_
     assert!(pool.used_bytes().unwrap() > 0);
     drop(model);
     assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
+#[test]
+fn scheduled_evidence_accounts_for_each_source_publication_and_completion() {
+    let capacity = 1 << 27;
+    let mut populations = Vec::new();
+    for invocation in [true, false] {
+        let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+        let (source, capture) = sources(&pool, invocation);
+        let funding = pool.prepare_workspace_metadata(&InferenceExecutionIdentity::default(), capacity).unwrap();
+        let facts = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let context = WorkspaceContext::new_with_metadata_funding(facts, funding).unwrap();
+        let mut model = if invocation {
+            PreparedModelInterventions::prepare_with_evidence(&source, &[true, true],
+                CapturePhase::Prefill, 0, CaptureInvocationShape { batch: 1, sequence: 5, context: None },
+                None, Some(&[[None, None], [None, None]]), &context)
+        } else {
+            PreparedModelInterventions::prepare_scheduled_with_evidence(&source, &[true, true],
+                CapturePhase::Prefill, 0, Some(&[[None, None], [None, None]]), &context)
+        }.unwrap();
+        let input = WorkspaceTensor::existing(context.layout(&[5, 2],
+            eredu_nn::workspace::WorkspaceDtype::Float32).unwrap(), &context).unwrap();
+        context.begin_state_span([&input]).unwrap();
+        let mut ledger = CaptureLedger::new(&capture);
+        model.begin(CapturePhase::Prefill, 0, &mut ledger, &context).unwrap();
+        let mut roots = Vec::new();
+        let (output, population) = model.trace("block.output", &input, &context, &mut ledger, &mut roots).unwrap();
+        assert_eq!(output.as_ref().unwrap().shape(), &[5, 2]);
+        assert_eq!(ledger.total().captures, 4);
+        for row in &model.rows {
+            let Row::Ready(edit) = row else { panic!("missing edit"); };
+            assert_eq!(edit.evidence, [State::Traced; 2]);
+        }
+        model.finish(&context).unwrap();
+        let report = context.finish_report(&roots).unwrap();
+        assert!(population.retained_roots >= roots.len());
+        populations.push(population);
+        drop((report, roots, output, input, model, context, source, capture));
+        assert_eq!(pool.used_bytes().unwrap(), 0);
+    }
+    // Two sides for each of the preview and summary edits. Scheduled transfer
+    // publishes and completes each exact source once before its ordinary readout.
+    assert_eq!(populations[0].publications, 0);
+    assert_eq!(populations[1].publications, 4);
+    assert_eq!(populations[1].completions - populations[0].completions, 4);
+    assert!(populations[1].controls > populations[0].controls);
 }

@@ -48,14 +48,19 @@ impl Program<'_> {
         value: &WorkspaceTensor,
         ctx: &WorkspaceContext,
         roots: &mut Vec<WorkspaceTensor>,
+        scheduled: bool,
     ) -> Result<CaptureNativePopulation, Failure> {
         let population = match self {
+            Self::Preview(_) if scheduled => CaptureNativePopulation::raw(1),
             Self::Preview(_) => CaptureNativePopulation::within_raw(),
             Self::Summary(g) => {
-                CaptureNativePopulation::within_summary(&PreparedCaptureSummary::from_geometry(g)?)
+                let program = PreparedCaptureSummary::from_geometry(g)?;
+                if scheduled { program.population() } else { CaptureNativePopulation::within_summary(&program) }
             }
         }
         .ok_or(Failure::GeometryOverflow)?;
+        // Scheduled evidence first completes and publishes its source through
+        // FundedWork; an invocation already owns that source in its model role.
         // Native shared readout retains its actual input alias too. All aliases
         // remain in the enclosing model role's final root union and Recovery.
         ctx.reserve_metadata_vec(roots, 1)?;
@@ -147,7 +152,7 @@ pub(super) fn trace(
         return Ok((State::ValueSkipped, empty));
     }
     let population = program
-        .trace(input, context, roots)
+        .trace(input, context, roots, model.invocation.is_none())
         .map_err(|cause| context.metadata_source(cause))?
         .checked_add(empty)
         .ok_or(WorkspaceMetadataError::Overflow)?;
@@ -232,6 +237,7 @@ pub(super) fn planning_controls() -> Option<usize> {
             &WorkspaceTensor,
             &WorkspaceContext,
             &mut Vec<WorkspaceTensor>,
+            bool,
         )>(),
         size_of::<Result<Program<'static>, eredu_nn::Error>>(),
         size_of::<CaptureTensorGeometry<'static>>(),
