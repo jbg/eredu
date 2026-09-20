@@ -884,6 +884,19 @@ owner identities return no plan without invoking ordinary read construction.
 The selected plan needs no routing callbacks during construction; rejected plans
 retain their source until retirement, and completed batches retain the original
 payload handles after the surrounding views and catalog store retire.
+File-backed encoded reads have a sized constructor over already retained shard
+headers. Ordinary reads perform their lazy header preparation before using that
+same constructor. The admitted entry refuses missing headers and lends retained
+header errors without cloning or retrying them. Tensor metadata and source-order
+scratch are sized by occurrence count; shard slots are bounded by both occurrence
+and admitted-shard counts, with a conservative maximum selected-path allowance.
+Sorted source spans coalesce in place. Runtime compares before construction and
+retains the completed batch or failed prefix through its original account.
+Touched-metadata and payload diagnostics share fixed flags over one source-owned
+admitted-path table. Construction and reads mark existing rows without extending
+a path set. Header/source construction and later read scratch and output buffers
+remain separate admission requirements; file batches keep exact admitted file
+identities and use the existing validated borrowed read worker.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

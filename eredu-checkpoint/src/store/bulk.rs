@@ -8,6 +8,11 @@ mod projection;
 pub(crate) use projection::EncodedRange;
 mod detached;
 mod memory;
+mod file;
+pub use file::{
+    PreparedSafetensorsEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
+    SafetensorsEncodedReadBuildCause, SafetensorsEncodedReadBuildError,
+};
 pub use memory::{
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
     PreparedMemoryEncodedRead,
@@ -19,37 +24,29 @@ pub use detached::{
 };
 pub(super) use memory::prepare as prepare_memory;
 
-/// Every payload path comes from the retained admitted shard set. A successful
-/// read changes one flag; it never allocates a path or grows a diagnostic map.
+/// Diagnostic paths are fixed by the admitted shard set. Touching metadata or
+/// publishing payload bytes changes one flag without allocating another path.
 #[derive(Debug, Default)]
-pub(super) struct PayloadPaths(Vec<(PathBuf, bool)>);
-impl PayloadPaths {
+pub(super) struct DiagnosticPaths(Vec<(PathBuf, u8)>);
+impl DiagnosticPaths {
     pub(super) fn new(paths: &[PathBuf]) -> Self {
-        let mut rows = paths
-            .iter()
-            .map(|path| (path.clone(), false))
-            .collect::<Vec<_>>();
+        let mut rows = paths.iter().map(|path| (path.clone(), 0)).collect::<Vec<_>>();
         rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         rows.dedup_by(|left, right| left.0 == right.0);
         Self(rows)
     }
-    pub(super) fn mark(&mut self, path: &Path) -> bool {
-        let Ok(index) = self.0.binary_search_by(|row| row.0.as_path().cmp(path)) else {
-            return false;
-        };
-        self.0[index].1 = true;
+    fn mark(&mut self, path: &Path, flag: u8) -> bool {
+        let Ok(index) = self.0.binary_search_by(|row| row.0.as_path().cmp(path)) else { return false };
+        self.0[index].1 |= flag;
         true
     }
-    // Ordinary cache workers retain their consuming interface. Their supplied
-    // path is still validated against exactly the admitted source universe.
-    pub(super) fn insert(&mut self, path: PathBuf) -> bool {
-        let Ok(index) = self.0.binary_search_by(|row| row.0.cmp(&path)) else {
-            return false;
-        };
-        !std::mem::replace(&mut self.0[index].1, true)
+    pub(super) fn mark_touched(&mut self, path: &Path) -> bool { self.mark(path, 1) }
+    pub(super) fn mark_payload(&mut self, path: &Path) -> bool { self.mark(path, 2) }
+    pub(super) fn touched(&self) -> impl Iterator<Item = &PathBuf> {
+        self.0.iter().filter(|row| row.1 & 1 != 0).map(|row| &row.0)
     }
-    pub(super) fn iter(&self) -> impl Iterator<Item = &PathBuf> {
-        self.0.iter().filter(|row| row.1).map(|row| &row.0)
+    pub(super) fn payloads(&self) -> impl Iterator<Item = &PathBuf> {
+        self.0.iter().filter(|row| row.1 & 2 != 0).map(|row| &row.0)
     }
 }
 
@@ -240,93 +237,23 @@ pub(super) fn prepare(
             .or_default()
             .push((index, key));
     }
-    let mut entries = Vec::with_capacity(keys.len());
+    // Ordinary preparation owns lazy header admission. The shared constructor
+    // below accepts only those already retained, immutable headers.
     for (path, group) in groups {
         let admission = store.shards.admission(&path);
         let header = admission.header(&path)?;
-        store.lock_cache()?.touched.insert(path.clone());
-        for (index, key) in group {
-            let info = header
-                .metadata
-                .info(key)
+        store.lock_cache()?.paths.mark_touched(&path);
+        for (_, key) in group {
+            let info = header.metadata.info(key)
                 .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-            let metadata = header.tensors[key].clone();
-            let start = header
-                .payload_offset
-                .checked_add(info.data_offsets.0)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: "bulk tensor offset".into(),
-                })?;
-            entries.push((index, metadata, start, Arc::clone(&admission.file)));
+            header.payload_offset.checked_add(info.data_offsets.0)
+                .ok_or_else(|| StoreError::Overflow { context: "bulk tensor offset".into() })?;
         }
-        // Header admission is independent of the payload-cache window.
     }
-    entries.sort_unstable_by_key(|entry| entry.0);
-    let mut shards = BTreeMap::<PathBuf, ReadShard>::new();
-    let mut batch = EncodedReadBatch {
-        tensors: Vec::with_capacity(keys.len()),
-        shards: Vec::new(),
-        byte_len: 0,
-        memory: Vec::new(),
-        telemetry: Some(Arc::clone(&store.read_telemetry)),
-        cache: Some(Arc::clone(&store.cache)),
-    };
-    for (_, metadata, start, admitted) in entries {
-        let length =
-            usize::try_from(metadata.encoded_byte_len).map_err(|_| StoreError::Overflow {
-                context: "bulk tensor length".into(),
-            })?;
-        let end = batch
-            .byte_len
-            .checked_add(length)
-            .ok_or_else(|| StoreError::Overflow {
-                context: "bulk output length".into(),
-            })?;
-        let file_start = u64::try_from(start).map_err(|_| StoreError::Overflow {
-            context: "bulk file offset".into(),
-        })?;
-        let file_end = file_start
-            .checked_add(metadata.encoded_byte_len)
-            .ok_or_else(|| StoreError::Overflow {
-                context: "bulk file end".into(),
-            })?;
-        let path = metadata
-            .backing_shard
-            .clone()
-            .expect("SafeTensors source has a shard");
-        shards
-            .entry(path)
-            .or_insert_with(|| ReadShard {
-                admitted,
-                spans: Vec::new(),
-            })
-            .spans
-            .push(ReadSpan {
-                source: file_start..file_end,
-                destination: batch.byte_len..end,
-            });
-        batch.byte_len = end;
-        batch.tensors.push(metadata);
-    }
-    for shard in shards.values_mut() {
-        shard.spans.sort_unstable_by_key(|span| span.source.start);
-        let mut merged = Vec::<ReadSpan>::with_capacity(shard.spans.len());
-        for span in std::mem::take(&mut shard.spans) {
-            if let Some(previous) = merged.last_mut() {
-                if previous.source.end == span.source.start
-                    && previous.destination.end == span.destination.start
-                {
-                    previous.source.end = span.source.end;
-                    previous.destination.end = span.destination.end;
-                    continue;
-                }
-            }
-            merged.push(span);
-        }
-        shard.spans = merged;
-    }
-    batch.shards = shards.into_iter().collect();
-    Ok(batch)
+    let plan = SafetensorsEncodedReadPlan::new(store, keys)
+        .map_err(|error| error.into_ordinary(keys))?;
+    let prepared = plan.construct(()).map_err(|error| StoreError::Internal(error.to_string()))?;
+    Ok(prepared.batch)
 }
 
 #[cfg(test)]

@@ -53,7 +53,7 @@ impl SafetensorsWeightStore {
             admission,
             full_tensors: Mutex::new(BTreeMap::new()),
         });
-        cache.touched.insert(entry.shard.clone());
+        cache.paths.mark_touched(&entry.shard);
         cache.entries.insert(
             canonical_path,
             CacheEntry {
@@ -76,7 +76,7 @@ impl SafetensorsWeightStore {
             .get(key)
             .cloned()
             .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-        self.old_lock_cache()?.touched.insert(entry.shard.clone());
+        self.old_lock_cache()?.paths.mark_touched(&entry.shard);
         Ok(metadata)
     }
     fn old_acquire(&self, request: TensorReadRequest) -> Result<SafetensorsLease, StoreError> {
@@ -159,7 +159,7 @@ impl SafetensorsWeightStore {
         let length = u64::try_from(bytes.len()).map_err(|_| StoreError::Overflow {
             context: format!("physical read length for {:?}", request.key),
         })?;
-        self.old_lock_cache()?.payloads.insert(shard.path.clone());
+        self.old_lock_cache()?.paths.mark_payload(&shard.path);
         Ok(SafetensorsLease {
             metadata,
             selection: request.selection,

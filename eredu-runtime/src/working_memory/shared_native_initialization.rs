@@ -7,6 +7,8 @@ use std::{
 
 mod memory_read;
 pub use memory_read::MemoryEncodedReadInitializer;
+mod file_read;
+pub use file_read::SafetensorsEncodedReadInitializer;
 
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public

@@ -669,6 +669,8 @@ pub use bulk::{
     EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout,
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
     PreparedMemoryEncodedRead,
+    PreparedSafetensorsEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
+    SafetensorsEncodedReadBuildCause, SafetensorsEncodedReadBuildError,
 };
 
 /// Opens one exact admitted SafeTensors source and applies its retained resolution.
@@ -1918,8 +1920,7 @@ struct CacheEntry {
 #[derive(Debug, Default)]
 struct CacheState {
     entries: BTreeMap<PathBuf, CacheEntry>,
-    touched: BTreeSet<PathBuf>,
-    payloads: bulk::PayloadPaths,
+    paths: bulk::DiagnosticPaths,
     tick: u64,
     hits: u64,
     misses: u64,
@@ -2170,12 +2171,12 @@ impl SafetensorsWeightStore {
                 })
                 .collect()
         };
-        let payloads = bulk::PayloadPaths::new(shards.payload_paths());
+        let paths = bulk::DiagnosticPaths::new(shards.payload_paths());
         Ok(Self {
             catalog,
             shards,
             cache: Arc::new(Mutex::new(CacheState {
-                payloads,
+                paths,
                 ..CacheState::default()
             })),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
@@ -2328,8 +2329,8 @@ impl WeightStore for SafetensorsWeightStore {
             cache_misses: cache.misses,
             evictions: cache.evictions,
             currently_cached_shards: cache.entries.len(),
-            touched_shard_paths: cache.touched.iter().cloned().collect(),
-            payload_shard_paths: cache.payloads.iter().cloned().collect(),
+            touched_shard_paths: cache.paths.touched().cloned().collect(),
+            payload_shard_paths: cache.paths.payloads().cloned().collect(),
             physical_reads: self.read_telemetry.physical_reads.load(Ordering::Relaxed),
             physical_read_bytes: self
                 .read_telemetry

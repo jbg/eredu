@@ -58,7 +58,7 @@ pub(super) fn acquire_shard(
         admission,
         full_tensors: Mutex::new(BTreeMap::new()),
     });
-    cache.touched.insert(path.clone());
+    cache.paths.mark_touched(path);
     cache.entries.insert(
         canonical_path,
         CacheEntry {
@@ -124,13 +124,13 @@ pub(super) fn publish_full(
     Ok(())
 }
 pub(super) fn touch_metadata(cache: &Mutex<CacheState>, path: &PathBuf) -> Result<(), StoreError> {
-    lock(cache)?.touched.insert(path.clone());
+    lock(cache)?.paths.mark_touched(path);
     Ok(())
 }
 pub(super) fn publish_payload(
     cache: &Mutex<CacheState>,
     shard: &CachedShard,
 ) -> Result<(), StoreError> {
-    lock(cache)?.payloads.insert(shard.path.clone());
+    lock(cache)?.paths.mark_payload(&shard.path);
     Ok(())
 }

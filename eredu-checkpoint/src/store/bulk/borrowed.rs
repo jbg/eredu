@@ -321,8 +321,8 @@ impl Diagnostics<'_> {
             Self::Ordinary(cache) => cache
                 .lock()
                 .map_err(|_| EncodedReadFailureCause::CachePoisoned)?
-                .payloads
-                .mark(path),
+                .paths
+                .mark_payload(path),
             Self::Detached(source) => source.mark(path),
         };
         if marked {
