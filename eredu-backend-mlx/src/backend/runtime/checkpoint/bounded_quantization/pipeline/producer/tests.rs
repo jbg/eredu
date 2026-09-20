@@ -227,7 +227,7 @@ fn exercise(
         truncate_at: None,
     };
     let (result, _) = prepared
-        .materialize_with_producer(DeviceType::Cpu, &mut producer)
+        .materialize_with_admitted_producer(&producer.pool.clone(), DeviceType::Cpu, &mut producer)
         .unwrap();
     assert_eq!(result.report(), ordinary.report());
     assert_eq!(result.report().source_tiles, expected_tiles);
@@ -239,7 +239,13 @@ fn exercise(
             .collect::<Vec<_>>()
     );
     assert_eq!(producer.peak_live, expected_slots);
-    assert!(producer.peak_used.get() <= expected_slots as u64 * producer.largest_tile);
+    let controls = BoundedAllocatorCache::required_original_bytes(
+        super::super::controls::required_bytes::<<FundedProducer<'_> as TileProducer>::Completion>(
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(producer.peak_used.get() <= controls + expected_slots as u64 * producer.largest_tile);
     drain(&producer);
     for target in 0..targets {
         let expected_words = (0..elements / 8)
@@ -325,11 +331,13 @@ fn producer_failure_retires_the_already_queued_cold_submission() {
         truncate_at: None,
     };
     let error = prepared
-        .materialize_with_producer(DeviceType::Cpu, &mut producer)
+        .materialize_with_admitted_producer(&producer.pool.clone(), DeviceType::Cpu, &mut producer)
         .unwrap_err();
     assert!(matches!(
         error,
-        ProducerFailure::Backend(Error::PrefillControl(WorkingMemoryError::UnknownBound))
+        PipelineAdmissionError::Producer(ProducerFailure::Backend(Error::PrefillControl(
+            WorkingMemoryError::UnknownBound
+        )))
     ));
     assert_eq!(producer.slots, [0, 1]);
     assert_eq!(producer.peak_live, 1);
@@ -392,9 +400,12 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
         truncate_at: Some((1, path)),
     };
     let error = prepared
-        .materialize_with_producer(DeviceType::Cpu, &mut producer)
+        .materialize_with_admitted_producer(&producer.pool.clone(), DeviceType::Cpu, &mut producer)
         .unwrap_err();
-    assert!(matches!(&error, ProducerFailure::Invocation(_)));
+    assert!(matches!(
+        &error,
+        PipelineAdmissionError::Producer(ProducerFailure::Invocation(_))
+    ));
     assert_eq!(producer.slots, [0, 1]);
     assert_eq!(producer.peak_live, 2);
     let mut cause: &(dyn std::error::Error + 'static) = &error;
@@ -476,6 +487,14 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         fail_at: None,
         truncate_at: None,
     };
+    let error = prepare()
+        .materialize_with_admitted_producer(&producer.pool.clone(), DeviceType::Cpu, &mut producer)
+        .unwrap_err();
+    assert!(matches!(&error, PipelineAdmissionError::Admission(_)));
+    assert!(producer.slots.is_empty());
+    assert_eq!(producer.live.get(), 0);
+    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+    drop(error);
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
@@ -597,9 +616,9 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
             .unwrap();
         let with_outputs = pool.used_bytes().unwrap();
         assert!(with_outputs > persistent);
-        // Source/read, recipe, overlay and queue metadata remain separate
-        // fixture prerequisites. Runtime, workers, native tiles and actual
-        // final memory-tensor buffers use their admitted constructors here.
+        // Source/read, recipe and overlay metadata remain fixture prerequisites.
+        // Runtime, workers, native tiles, queue/cleanup controls and final
+        // memory-tensor buffers use their admitted constructors here.
         let mut producer = FundedProducer {
             pool: pool.clone(),
             runtime: resources.runtime(),
@@ -613,7 +632,7 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
             truncate_at: None,
         };
         let (result, _) = prepared
-            .materialize_with_producer(DeviceType::Cpu, &mut producer)
+            .materialize_with_admitted_producer(&pool, DeviceType::Cpu, &mut producer)
             .unwrap();
         assert_eq!(result.report().source_tiles, 8);
         assert_eq!(result.report().peak_in_flight_tiles, expected_slots);

@@ -25,7 +25,7 @@ use eredu_checkpoint::{
 use eredu_runtime::WeightMaterializationReport;
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::BTreeSet,
     path::PathBuf,
     sync::Arc,
 };

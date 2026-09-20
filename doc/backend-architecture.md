@@ -830,6 +830,14 @@ access, validates the original pool and retains successful prefixes on later
 construction failure. Foreign domains and active unquoted work refuse before
 runtime construction. Native registrations and worker threads retain their
 accounts for their actual process lifetime after wrapper retirement.
+The completion window stores its two slots inline and retires abandoned entries
+in submission order, including after wraparound. The admitted pipeline entry
+reserves these fixed queue controls and the allocator-cache cleanup node before
+running the shared tile driver. Cleanup retains its original account through
+ordinary deferred retirement; returning from conversion or dropping an error
+cannot refund a still-queued cleanup node. Cache clearing remains restricted to
+explicit host boundaries, with the same active-working-set and retained-cache
+limits. Source/read, recipe and overlay metadata remain separately owned.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming
