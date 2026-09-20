@@ -250,14 +250,21 @@ descriptors match; an independent CPU General-copy allocation and its Host sourc
 remain two roots. The actual borrowed-root enum, observations and attachments are
 included in the existing finite publication control census.
 
-A prepared immutable Host constructor proves physical provenance, not its payer:
-load-time managers and independently admitted saved copies use the same constructor
-as prepaid source banks. Their checked Host witness therefore emits the neutral
+A prepared immutable Array/Host constructor or foreign native-budget witness proves
+physical provenance, not its payer: load-time managers, conversions and independently
+admitted saved copies share constructors with prepaid request banks. Their checked
+witnesses therefore emit the neutral
 `ExistingPhysical` observation. This remains strictly existing-only: the canonical
 publisher validates generation, capacity, live ownership and original account health,
 then preserves the full ordinary, copy-funded or prepaid origin. Missing or foreign
 rows cannot become fresh births, and duplicate classifications must agree. Array
-native-birth and immutable-source observations retain their stricter origin checks.
+births authenticated against the current budget retain their stricter origin checks.
+
+Checkpoint sources likewise retain their first canonical charge. Same-pool source
+constructor custody is validated even when ordinary loading registered the full
+payload without prepaid credit. Later controlled publication preserves that full
+ordinary charge; it cannot promote the row, create a missing row or substitute
+an unrelated execution account for source funding.
 
 Lazy Host sources and canonical device parameter cells share one private scalar
 proof of successful attachment. The Host source transaction returns its sealed

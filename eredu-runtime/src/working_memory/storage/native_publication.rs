@@ -429,6 +429,17 @@ impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
                         canonical.validate_capacity(row.bytes)?;
                         row.origin = Some(canonical.clone());
                     }
+                } else if row.source && entry.prepaid.is_none() && row.origin.is_some() {
+                    self.failure_site = "registry fully charged source alias";
+                    // The constructor's same-pool source custody was validated
+                    // above. Ordinary loading may have registered the complete
+                    // payload without taking its prepaid credit. Keep that full
+                    // canonical charge; constructor custody cannot promote it.
+                    if entry.owners == 0 || entry.funding.is_some()
+                        || row.origin.as_ref().is_none_or(|origin|
+                            origin.residual_source_charge().is_none()) {
+                        return Err(WorkingMemoryError::IdentityMismatch);
+                    }
                 } else if row.existing_only {
                     self.failure_site = "registry canonical alias kind";
                     let canonical = entry

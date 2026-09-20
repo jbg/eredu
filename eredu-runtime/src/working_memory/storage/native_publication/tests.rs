@@ -865,3 +865,54 @@ fn physical_owner_alias_refuses_missing_capacity_and_conflicting_classifications
     drop((metadata, run, partition, source));
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+#[test]
+fn physical_owner_alias_retains_closed_prepaid_origin_and_refuses_unhealthy_accounts() {
+    for unhealthy in [None, Some(true), Some(false)] {
+        let pool = WorkingMemoryPool::new(1_000, 0).unwrap();
+        let (a, ar, ap) = account(&pool);
+        let a_scope = ar.scope().unwrap();
+        let donor = publish(&ap, &a_scope, vec![test_native(1u32, 64, &ap)]);
+        let (b, br, bp) = account(&pool);
+        let b_scope = br.scope().unwrap();
+        if let Some(donor_unhealthy) = unhealthy {
+            drop(if donor_unhealthy {
+                ar.scope().unwrap()
+            } else {
+                br.scope().unwrap()
+            });
+        }
+        a_scope.certify().unwrap();
+        drop((a, ar, ap));
+        let before = balances(&pool);
+        let mut alias = PreparedNativePublication::prepare_slots(bp.clone(), 1);
+        alias
+            .push_observation(
+                crate::working_memory::NativeStorageObservation::ExistingPhysical(1u32, 64),
+            )
+            .unwrap();
+        let result = alias.publish(&b_scope);
+        assert_eq!(balances(&pool), before);
+        let retained = if unhealthy.is_some() {
+            assert_eq!(result, Err(WorkingMemoryError::ExecutionFenced));
+            assert!(alias.take(0).is_none());
+            None
+        } else {
+            result.unwrap();
+            Some(alias.take(0).unwrap())
+        };
+        b_scope.certify().unwrap();
+        drop((alias, donor, b, br, bp));
+        if unhealthy.is_none() {
+            assert_eq!(pool.used_bytes().unwrap(), 100);
+            drop(retained);
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+        } else {
+            assert_eq!(
+                pool.used_bytes().unwrap(),
+                200,
+                "quarantine retains the entire account"
+            );
+        }
+    }
+}

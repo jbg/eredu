@@ -2,6 +2,107 @@ use super::*;
 use eredu_checkpoint::store::{CheckpointSource, MemoryWeightStore, SourceStorageIdentity};
 
 #[test]
+fn original_source_alias_preserves_ordinary_load_charge_and_constructor_custody() {
+    let pool = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    let mut buffer = pool
+        .allocate_memory_tensor_buffer(
+            "weight",
+            safetensors::Dtype::F32,
+            &[2],
+            8,
+            crate::working_memory::DependencyMemoryPolicy::default(),
+        )
+        .unwrap();
+    buffer
+        .bytes_mut()
+        .copy_from_slice(&[1.25f32, -3.5].map(f32::to_le_bytes).concat());
+    let store = MemoryWeightStore::from_buffers([buffer]).unwrap();
+    let mut inventory = Vec::new();
+    assert!(store
+        .visit_source_storage(&mut |source| {
+            inventory.push((source.identity(), source.bytes()));
+        })
+        .unwrap());
+    assert_eq!(inventory.len(), 1);
+    let (key, physical) = inventory.pop().unwrap();
+    assert_eq!(physical, 8);
+    let source_charge = pool.used_bytes().unwrap();
+    assert!(source_charge > physical);
+    let (metadata, run) = reservation(&pool, 200, 10_000_000).into_funding().unwrap();
+    let partition = run.take_native_partition(test_receipt(&run, 100)).unwrap();
+    let scope = run.scope().unwrap();
+    let before = balances(&pool);
+    let mut missing = PreparedNativePublication::prepare_slots(partition.clone(), 1);
+    missing
+        .push_source(&key, physical, Some(&key), &pool)
+        .unwrap();
+    assert_eq!(
+        missing.publish(&scope),
+        Err(WorkingMemoryError::IdentityMismatch)
+    );
+    assert_eq!(balances(&pool), before);
+    drop(missing);
+
+    let mut changed = PreparedNativePublication::prepare_slots(partition.clone(), 1);
+    assert!(matches!(
+        changed.push_source(&key, physical + 1, Some(&key), &pool),
+        Err(WorkingMemoryError::StorageCapacityMismatch { .. })
+    ));
+    let foreign = WorkingMemoryPool::new(10_000_000, 0).unwrap();
+    assert_eq!(
+        changed.push_source(&key, physical, Some(&key), &foreign),
+        Err(WorkingMemoryError::IdentityMismatch)
+    );
+    drop(changed);
+    let mut funded = PreparedNativePublication::prepare(
+        partition.clone(),
+        vec![NativePublicationInput::Ordinary(key.clone(), physical)],
+    );
+    funded.publish(&scope).unwrap();
+    let before = balances(&pool);
+    let mut wrong_account = PreparedNativePublication::prepare_slots(partition.clone(), 1);
+    wrong_account
+        .push_source(&key, physical, Some(&key), &pool)
+        .unwrap();
+    assert_eq!(
+        wrong_account.publish(&scope),
+        Err(WorkingMemoryError::IdentityMismatch)
+    );
+    assert_eq!(balances(&pool), before);
+    drop((wrong_account, funded));
+
+    let ordinary = pool.register_storage([(key.clone(), physical)]).unwrap();
+    let before = balances(&pool);
+    let mut alias = PreparedNativePublication::prepare_slots(partition.clone(), 2);
+    for _ in 0..2 {
+        alias
+            .push_source(&key, physical, Some(&key), &pool)
+            .unwrap();
+    }
+    alias.publish(&scope).unwrap();
+    assert_eq!(balances(&pool), before);
+    assert_eq!(alias.rows.len(), 1);
+    let retained = alias.take_input(0).unwrap();
+    {
+        let usage = pool.0.usage.lock().unwrap();
+        let registry = usage
+            .storage
+            .get(&std::any::TypeId::of::<SourceStorageIdentity>())
+            .unwrap()
+            .downcast_ref::<Registry<SourceStorageIdentity>>()
+            .unwrap();
+        let (_, entry) = registry.locate(&key).unwrap();
+        assert!(entry.prepaid.is_none() && entry.funding.is_none());
+        assert_eq!(entry.bytes, physical);
+    }
+    scope.certify().unwrap();
+    drop((alias, metadata, run, partition, ordinary, store, key));
+    assert_eq!(pool.used_bytes().unwrap(), source_charge + physical);
+    drop(retained);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
 fn registered_source_alias_preserves_full_charge_and_refuses_missing_foreign_changed_or_retired_rows(
 ) {
     // Actual ordinary load source: encoded logical length differs from the

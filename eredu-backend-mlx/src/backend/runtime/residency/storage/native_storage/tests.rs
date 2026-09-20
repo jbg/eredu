@@ -237,3 +237,122 @@ fn native_control_owner_layout_counts_finite_custody_and_rejects_unqualified_sou
 }
 
 mod mutable_component;
+
+#[test]
+fn foreign_native_budget_proves_physical_ownership_without_claiming_a_payer() {
+    let runtime = Rc::new(PreparedInputRuntime::prepare().unwrap());
+    let plan = safemlx::OriginalMutablePairPlan::inspect(&runtime).unwrap();
+    let donor = PreparedOriginalBufferBudget::try_new(&runtime, plan.facts().backing_bytes(), ())
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+    let recipient = PreparedOriginalBufferBudget::try_new(&runtime, 0, ())
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+    let root = plan
+        .prepare(
+            [43, 47],
+            donor.clone(),
+            safemlx::OriginalMutablePairCustodies::new((), (), (), (), ()),
+        )
+        .unwrap()
+        .try_construct()
+        .unwrap();
+    let facts = donor.inspect_array(&root).unwrap().unwrap().allocation();
+    let selection = NativeStorageSelection::default();
+    let mechanism = MlxNativeStorage::new(&Ok(runtime.clone()), &selection);
+    let local = mechanism
+        .observe(&donor, NativeStorageRoot::Array(&root))
+        .unwrap();
+    assert!(matches!(
+        MlxNativeStorage::describe(&local),
+        NativeStorageObservation::Originating(StorageIdentity::Native(key), bytes)
+            if key == facts.identity() && bytes == facts.bytes() as u64
+    ));
+    drop(local);
+    let alias = root.clone();
+    drop((root, donor));
+    let foreign = mechanism
+        .observe(&recipient, NativeStorageRoot::Array(&alias))
+        .unwrap();
+    assert!(matches!(
+        MlxNativeStorage::describe(&foreign),
+        NativeStorageObservation::ExistingPhysical(StorageIdentity::Native(key), bytes)
+            if key == facts.identity() && bytes == facts.bytes() as u64
+    ));
+    drop(foreign);
+    assert_eq!(
+        alias.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+        &[43, 47]
+    );
+}
+
+#[test]
+fn immutable_array_proves_physical_ownership_without_claiming_prepaid_funding() {
+    use safemlx::{
+        OriginalScopeObserver, OwnedHostCopyPlan, PreparedPrefillFailure,
+        PreparedSubmissionGraphQuota, PreparedSubmissionRecordQuota, PreparedSubmissionScopeOwner,
+        SubmissionScope,
+    };
+    let runtime = Rc::new(PreparedInputRuntime::prepare().unwrap());
+    let values = vec![2.0f32, -3.0, 7.0];
+    let plan = OwnedHostCopyPlan::<f32>::new(&runtime, &[3], values.capacity()).unwrap();
+    let capacity = plan.facts().backing_bytes();
+    let preparation =
+        PreparedSubmissionGraphQuota::try_new(plan.facts().metadata_bytes(), ()).unwrap();
+    let slot = plan.prepare(preparation).unwrap();
+    let budget = PreparedOriginalBufferBudget::try_new(&runtime, 0, ())
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+    let graph = PreparedSubmissionGraphQuota::try_new(64 << 10, ())
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+    let records = PreparedSubmissionRecordQuota::try_new(
+        PreparedSubmissionRecordQuota::<()>::minimum_layout()
+            .unwrap()
+            .capacity,
+        (),
+    )
+    .unwrap()
+    .try_allocate()
+    .unwrap();
+    let failure = PreparedPrefillFailure::try_new(())
+        .unwrap()
+        .try_allocate()
+        .unwrap();
+    let mut scope = SubmissionScope::try_begin_retaining(
+        PreparedSubmissionScopeOwner::try_new(())
+            .unwrap()
+            .with_graph_quota(graph)
+            .with_record_quota(records),
+    )
+    .unwrap();
+    scope.enable_scoped_observation().unwrap();
+    scope.require_original_native_controls().unwrap();
+    failure.bind_original_scope(&scope).unwrap();
+    scope.enable_original_native_controls().unwrap();
+    let observer = OriginalScopeObserver::require_current().unwrap();
+    let root = slot.try_fill(values, &observer).unwrap();
+    scope.seal();
+    drop((observer, scope, failure));
+    let key = root.try_allocation_info().unwrap().unwrap().identity();
+    let mechanism = MlxNativeStorage::new(&Ok(runtime.clone()), &NativeStorageSelection::default());
+    let observed = mechanism
+        .observe(&budget, NativeStorageRoot::Array(&root))
+        .unwrap();
+    assert!(matches!(observed, Observation::Immutable(_)));
+    assert!(matches!(
+        MlxNativeStorage::describe(&observed),
+        NativeStorageObservation::ExistingPhysical(StorageIdentity::Native(identity), bytes)
+            if identity == key && bytes == capacity as u64
+    ));
+    drop(observed);
+    assert_eq!(budget.occupied_bytes(), 0);
+    assert_eq!(
+        root.evaluated().unwrap().try_as_slice::<f32>().unwrap(),
+        &[2.0, -3.0, 7.0]
+    );
+}

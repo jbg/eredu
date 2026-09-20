@@ -529,8 +529,8 @@ impl Array {
     }
 }
 
-/// Positive immutable prepared-source observation. It grants no source origin:
-/// only an existing prepaid-host canonical row can authorize alias publication.
+/// Positive immutable prepared-source observation. It grants no accounting
+/// origin: the caller must authenticate the existing owner's actual funding.
 #[derive(Debug)]
 pub enum ImmutableSourceInspection<'a> {
     /// Unfinished, foreign source kind or uncertified Data.

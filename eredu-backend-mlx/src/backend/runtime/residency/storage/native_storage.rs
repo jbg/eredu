@@ -467,27 +467,26 @@ impl OriginalNativeStorageMechanism for MlxNativeStorage {
     }
 
     fn describe(observation: &Observation<'_>) -> NativeStorageObservation<StorageIdentity> {
-        let (facts, kind) = match observation {
-            Observation::Origin(witness, _) => (witness.allocation(), 0),
-            Observation::Existing(witness, _) => (witness.allocation(), 1),
-            Observation::Ordinary(witness) => (witness.allocation(), 2),
-            Observation::Immutable(witness) => (witness.allocation(), 3),
-            Observation::Host(witness) => (witness.allocation(), 4),
-            Observation::OrdinaryHostArray(witness) => (witness.allocation(), 2),
-            Observation::HostBuffer(witness, _) => (witness.allocation(), 4),
-            Observation::OrdinaryHost(witness) => (witness.allocation(), 2),
-            Observation::Empty => return NativeStorageObservation::Empty,
+        let Some(facts) = observation.allocation() else {
+            return NativeStorageObservation::Empty;
         };
         let key = StorageIdentity::Native(facts.identity());
         // All supported Rust targets use usize <= u64; preserve the native
         // physical charge rather than logical shape bytes or usable CPU bytes.
         let bytes = facts.bytes() as u64;
-        match kind {
-            0 => NativeStorageObservation::Originating(key, bytes),
-            1 => NativeStorageObservation::Existing(key, bytes),
-            2 => NativeStorageObservation::Ordinary(key, bytes),
-            3 => NativeStorageObservation::ExistingImmutable(key, bytes),
-            _ => NativeStorageObservation::ExistingPhysical(key, bytes),
+        match observation {
+            Observation::Origin(..) => NativeStorageObservation::Originating(key, bytes),
+            Observation::Ordinary(_)
+            | Observation::OrdinaryHostArray(_)
+            | Observation::OrdinaryHost(_) => NativeStorageObservation::Ordinary(key, bytes),
+            // Prepared constructors and foreign budgets can belong to load-time
+            // conversion, saved copies or prepaid requests. Their witnesses
+            // prove ownership; the canonical row supplies the accounting origin.
+            Observation::Existing(..)
+            | Observation::Immutable(_)
+            | Observation::Host(_)
+            | Observation::HostBuffer(..) => NativeStorageObservation::ExistingPhysical(key, bytes),
+            Observation::Empty => NativeStorageObservation::Empty,
         }
     }
 
@@ -607,7 +606,6 @@ fn ordinary_observation(root: &Array) -> Result<Observation<'_>, NativeStorageCa
 
 #[cfg(all(
     test,
-    feature = "metal",
     target_vendor = "apple",
     not(feature = "cuda")
 ))]
