@@ -3,7 +3,6 @@
 //! source/working-storage census as contiguous encoded recipes.
 use super::*;
 use crate::store::{EncodedRange, encoded_selection_plan};
-use std::ops::Range;
 
 fn overflow() -> RecipeError {
     RecipeError::ArithmeticOverflow("encoded recipe range projection")
@@ -35,66 +34,8 @@ fn collect(recipe: &DerivedWeightRecipe, keys: &mut Vec<String>) -> bool {
     }
 }
 
-struct Mapping {
-    ranges: Vec<EncodedRange>,
-    length: usize,
-}
-impl Mapping {
-    fn new() -> Self {
-        Self {
-            ranges: Vec::new(),
-            length: 0,
-        }
-    }
-    fn push(&mut self, source: Range<usize>) -> Result<(), RecipeError> {
-        let length = source.end.checked_sub(source.start).ok_or_else(overflow)?;
-        if length == 0 {
-            return Ok(());
-        }
-        let end = self.length.checked_add(length).ok_or_else(overflow)?;
-        if let Some(last) = self
-            .ranges
-            .last_mut()
-            .filter(|last| last.source.end == source.start)
-        {
-            last.source.end = source.end;
-            last.destination.end = end;
-        } else {
-            self.ranges.push(EncodedRange {
-                source,
-                destination: self.length..end,
-            });
-        }
-        self.length = end;
-        Ok(())
-    }
-    fn append_slice(&mut self, input: &Self, selected: Range<usize>) -> Result<(), RecipeError> {
-        if selected.start > selected.end || selected.end > input.length {
-            return Err(overflow());
-        }
-        let first = input
-            .ranges
-            .partition_point(|row| row.destination.end <= selected.start);
-        for row in &input.ranges[first..] {
-            if row.destination.start >= selected.end {
-                break;
-            }
-            let start = row.destination.start.max(selected.start);
-            let end = row.destination.end.min(selected.end);
-            if start < end {
-                let source_start = row
-                    .source
-                    .start
-                    .checked_add(start - row.destination.start)
-                    .ok_or_else(overflow)?;
-                self.push(
-                    source_start..source_start.checked_add(end - start).ok_or_else(overflow)?,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
+mod mapping;
+use mapping::{Mapping, MappingInput, MappingPlan};
 
 struct Compiler<'a, C: ?Sized> {
     catalog: &'a C,
@@ -127,10 +68,11 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
         };
         let mut ranges = vec![0..0; plan.range_count()];
         plan.fill_into(&mut ranges).map_err(StoreError::from)?;
-        let mut mapped = Mapping::new();
-        for range in ranges {
-            mapped.append_slice(&input, range)?;
-        }
+        let mapped = MappingPlan::new(MappingInput::Selected {
+            input: &input,
+            ranges: &ranges,
+        })?
+        .build()?;
         Ok(Some(mapped))
     }
     fn compile(&mut self, recipe: &DerivedWeightRecipe) -> Result<Option<Mapping>, RecipeError> {
@@ -146,8 +88,8 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                     .source_offset
                     .checked_add(length)
                     .ok_or_else(overflow)?;
-                let mut mapped = Mapping::new();
-                mapped.push(self.source_offset..end)?;
+                let mapped =
+                    MappingPlan::new(MappingInput::Source(self.source_offset..end))?.build()?;
                 self.source_index = self.source_index.checked_add(1).ok_or_else(overflow)?;
                 self.source_offset = end;
                 let metadata = RecipeMetadata {
@@ -186,17 +128,12 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                     chunks.push(chunk);
                     children.push(child);
                 }
-                let mut mapped = Mapping::new();
-                for index in 0..outer {
-                    for (child, chunk) in children.iter().zip(chunks.iter().copied()) {
-                        let start = index.checked_mul(chunk).ok_or_else(overflow)?;
-                        mapped.append_slice(
-                            child,
-                            start..start.checked_add(chunk).ok_or_else(overflow)?,
-                        )?;
-                    }
-                }
-                mapped
+                MappingPlan::new(MappingInput::Interleaved {
+                    children: &children,
+                    chunks: &chunks,
+                    outer,
+                })?
+                .build()?
             }
             DerivedWeightRecipe::Select { input, selection } => {
                 let metadata = input.infer(self.catalog)?;

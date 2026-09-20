@@ -854,6 +854,12 @@ retain their original source owners and restore physical source ordering after
 fill. Counting validates disjoint logical source coordinates and checked span
 layouts; filling refuses wrong destination lengths before writes. This geometry
 plan does not reserve storage or cover source-batch and recipe-mapping creation.
+Recursive byte-preserving recipe mappings likewise bind source, selection or
+interleaved-child coordinates in a counted destination plan. Counting and filling
+share the same adjacency coalescing and slice traversal. Child mappings remain
+borrowed during output construction; exact range storage replaces geometric
+growth, with an additional geometry pass. These layouts alone do not reserve
+storage or cover source metadata, recipe inference and child-array construction.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its
