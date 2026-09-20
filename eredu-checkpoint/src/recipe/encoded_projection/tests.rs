@@ -6,6 +6,76 @@ use safetensors::{
 };
 
 type Recipe = DerivedWeightRecipe;
+
+#[test]
+fn recursive_projection_uses_borrowed_finite_metadata_and_preserves_exact_ranges() {
+    struct BorrowedOnly(TensorMetadata);
+    impl RecipeCatalog for BorrowedOnly {
+        fn tensor_metadata(&self, _: &str) -> Result<TensorMetadata, StoreError> {
+            panic!("uncached projection must use retained borrowed metadata")
+        }
+        fn tensor_metadata_borrowed(&self, key: &str) -> Option<&TensorMetadata> {
+            (key == self.0.name).then_some(&self.0)
+        }
+    }
+    let catalog = BorrowedOnly(TensorMetadata {
+        name: "雪".into(),
+        logical_shape: vec![2, 3],
+        physical_shape: vec![2, 3],
+        stored_dtype: StoredDtype::U8,
+        encoded_byte_len: 6,
+        backing_shard: None,
+    });
+    let tensors = [catalog.0.clone(), catalog.0.clone()];
+    let joined = Recipe::Concatenate {
+        axis: 1,
+        inputs: vec![source("雪", TensorSelection::Full); 2],
+    };
+    let selected = Recipe::Select {
+        input: Box::new(joined),
+        selection: TensorSelection::Indices {
+            axis: 1,
+            indices: vec![5, 0, 5],
+        },
+    };
+    let recipe = Recipe::Transpose {
+        input: Box::new(Recipe::Reshape {
+            input: Box::new(selected),
+            shape: vec![1, 2, 3],
+        }),
+        axes: vec![1, 0, 2],
+    };
+    let output = infer_read_metadata(&recipe, &catalog).unwrap();
+    assert_eq!(output.shape(), [2, 1, 3]);
+    assert_eq!(output.byte_len(), 6);
+    let mut compiler = Compiler {
+        catalog: &catalog,
+        tensors: &tensors,
+        source_index: 0,
+        source_offset: 0,
+    };
+    let mapped = compiler.compile(&recipe).unwrap().unwrap();
+    assert_eq!(mapped.length, 6);
+    assert_eq!(compiler.source_index, 2);
+    assert_eq!(compiler.source_offset, 12);
+    let ranges = mapped
+        .ranges
+        .iter()
+        .map(|row| (row.source.clone(), row.destination.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ranges,
+        [
+            (8..9, 0..1),
+            (0..1, 1..2),
+            (8..9, 2..3),
+            (11..12, 3..4),
+            (3..4, 4..5),
+            (11..12, 5..6)
+        ]
+    );
+}
+
 fn source(key: &str, selection: TensorSelection) -> Recipe {
     Recipe::source(key, selection)
 }

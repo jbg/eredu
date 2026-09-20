@@ -15,6 +15,7 @@ mod read_keys;
 pub use read_keys::{EncodedRecipeKeysBuildError, EncodedRecipeKeysPlan, PreparedEncodedRecipeKeys};
 pub use read_catalog::{ReadBatchCatalog, ReadBatchCatalogBuildError, ReadBatchCatalogPlan};
 mod finite_inference;
+use finite_inference::infer_read_metadata;
 mod uncached_catalog;
 pub use uncached_catalog::UncachedRecipeCatalog;
 pub use finite_inference::{
@@ -1026,13 +1027,14 @@ impl DerivedWeightRecipe {
                 DerivedWeightRecipe::Reshape { input, .. }
                 | DerivedWeightRecipe::View { input, .. } => preserves_bytes(input, catalog),
                 DerivedWeightRecipe::Cast { input, dtype } => {
-                    Ok(preserves_bytes(input, catalog)? && input.infer(catalog)?.dtype == *dtype)
+                    Ok(preserves_bytes(input, catalog)?
+                        && infer_read_metadata(input, catalog)?.dtype == *dtype)
                 }
                 DerivedWeightRecipe::Transpose { input, axes } => {
                     if !preserves_bytes(input, catalog)? {
                         return Ok(false);
                     }
-                    let input = input.infer(catalog)?;
+                    let input = infer_read_metadata(input, catalog)?;
                     validate_permutation(axes, input.shape.len())?;
                     // Empty tensors contain no ordered scalar bytes. Otherwise
                     // non-singleton axes must retain their relative order; size
@@ -1071,7 +1073,7 @@ impl DerivedWeightRecipe {
             output
         } else {
             let catalog = ReadBatchCatalogPlan::new(batch.tensors())?.construct(())?;
-            let output = self.infer(&catalog)?;
+            let output = infer_read_metadata(self, &catalog)?;
             if !preserves_bytes(self, &catalog)? {
                 return Ok(None);
             }
@@ -2507,6 +2509,10 @@ fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeEr
 #[derive(Debug, Clone, thiserror::Error)]
 #[allow(missing_docs)]
 pub enum RecipeError {
+    #[error("finite encoded-read inference is unavailable")]
+    InferenceUnavailable,
+    #[error("finite encoded-read inference reserve failed")]
+    InferenceReserve(#[source] std::collections::TryReserveError),
     #[error("encoded read catalog: {0}")]
     ReadCatalog(#[from] ReadBatchCatalogBuildError<()>),
     #[error("derived-weight source key must not be empty")]

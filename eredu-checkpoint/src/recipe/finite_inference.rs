@@ -372,6 +372,26 @@ impl<'a, C: RecipeCatalog + ?Sized> RecipeInferencePlan<'a, C> {
     }
 }
 
+// Encoded reads pass either an explicitly selected persistent source cache or
+// their own immutable borrowed batch catalog. The uncached path shares the
+// finite worker used by admitted construction; this call grants no admission.
+pub(super) fn infer_read_metadata<C: RecipeCatalog + ?Sized>(
+    recipe: &DerivedWeightRecipe,
+    catalog: &C,
+) -> Result<RecipeMetadata, RecipeError> {
+    if catalog.recipe_cache().is_some() {
+        return recipe.infer(catalog);
+    }
+    RecipeInferencePlan::new(RecipeInferenceInput::Derived(recipe), catalog)
+        .ok_or(RecipeError::InferenceUnavailable)?
+        .infer()
+        .map_err(|cause| match cause {
+            RecipeInferenceError::Unavailable => RecipeError::InferenceUnavailable,
+            RecipeInferenceError::Reserve(cause) => RecipeError::InferenceReserve(cause),
+            RecipeInferenceError::Recipe(cause) => cause,
+        })
+}
+
 /// Executes the same finite worker and retires every metadata allocation before return.
 pub fn infer_recipe_bytes<C: RecipeCatalog + ?Sized>(
     input: RecipeInferenceInput<'_>,

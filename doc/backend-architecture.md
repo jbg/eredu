@@ -885,6 +885,15 @@ source constructors, then compare and construct through the pool; there is no
 second initializer object. Source visibility and prepared-header requirements
 are enforced by the checkpoint plans before admission.
 
+Contiguous and projected encoded reads use the same finite inference worker
+as admitted metadata construction when operating on a borrowed batch catalog.
+Persistent source-cache selection remains explicit; cached reads retain their
+existing cache policy. Recursive projection and byte-preserving validation share
+this metadata path without constructing a second compiler. Ordinary preparation
+still owns its allocations: using the finite worker is not itself an admission
+grant. Finite reserve failures retain their typed allocator cause, and recipe
+validation failures preserve their original variants and diagnostics.
+
 Runtime also admits the checkpoint-owned finite inference plan directly. The
 existing shared initialization result retains the original account alongside
 owned output metadata or a typed inference error after borrowed recipe/catalog

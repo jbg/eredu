@@ -58,7 +58,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
         Ok(Some(mapped))
     }
     fn compile(&mut self, recipe: &DerivedWeightRecipe) -> Result<Option<Mapping>, RecipeError> {
-        let output = recipe.infer(self.catalog)?;
+        let output = infer_read_metadata(recipe, self.catalog)?;
         let mapped = match recipe {
             DerivedWeightRecipe::Source { key, selection } => {
                 let source = self.tensors.get(self.source_index).ok_or_else(overflow)?;
@@ -90,7 +90,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 let mut children = Vec::with_capacity(inputs.len());
                 let mut chunks = Vec::with_capacity(inputs.len());
                 for input in inputs {
-                    let metadata = input.infer(self.catalog)?;
+                    let metadata = infer_read_metadata(input, self.catalog)?;
                     let tail = &metadata.shape[*axis..];
                     let bits = product(tail)?
                         .checked_mul(bytes(metadata.dtype.bit_width()?)?)
@@ -118,7 +118,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 .build()?
             }
             DerivedWeightRecipe::Select { input, selection } => {
-                let metadata = input.infer(self.catalog)?;
+                let metadata = infer_read_metadata(input, self.catalog)?;
                 let Some(input) = self.compile(input)? else {
                     return Ok(None);
                 };
@@ -135,7 +135,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 mapped
             }
             DerivedWeightRecipe::Cast { input, dtype } => {
-                if input.infer(self.catalog)?.dtype != *dtype {
+                if infer_read_metadata(input, self.catalog)?.dtype != *dtype {
                     return Ok(None);
                 }
                 let Some(mapped) = self.compile(input)? else {
@@ -144,7 +144,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
                 mapped
             }
             DerivedWeightRecipe::Transpose { input, axes } => {
-                let metadata = input.infer(self.catalog)?;
+                let metadata = infer_read_metadata(input, self.catalog)?;
                 // Ordinary recipe inference already validated the permutation.
                 if !metadata.shape.contains(&0)
                     && !axes
@@ -186,7 +186,7 @@ pub(super) fn prepare(
     ) -> Result<Option<(RecipeMetadata, Mapping)>, RecipeError> {
         // Preserve ordinary left-to-right geometry/error precedence before
         // deciding whether the fully validated recipe is byte-readable.
-        let output = recipe.infer(catalog)?;
+        let output = infer_read_metadata(recipe, catalog)?;
         let mut compiler = Compiler {
             catalog,
             tensors,
