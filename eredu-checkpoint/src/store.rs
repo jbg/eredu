@@ -15,7 +15,11 @@ use std::{
 use crate::{
     StoredDtype,
     recipe::RecipeInferenceCache,
-    safetensors::{MAX_HEADER_BYTES, SafetensorsDiscoveryLimits, SafetensorsShards},
+    safetensors::{
+        MAX_HEADER_BYTES, SafetensorsDiscoveryLimits, SafetensorsHeaderAdmission,
+        SafetensorsHeaderFailure, SafetensorsHeaderRequest, SafetensorsHeaderReservation,
+        SafetensorsShards,
+    },
 };
 use safetensors::tensor::{Dtype, Metadata};
 
@@ -1756,6 +1760,9 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
+    /// Lazy SafeTensors header admission or construction failure, with custody.
+    #[error("{0}")]
+    SafetensorsHeader(#[source] Arc<SafetensorsHeaderFailure>),
     /// Explicit prepared GGUF reader storage could not supply its destination.
     #[error("GGUF prepared reader storage failed for tensor {key:?}: {source}")]
     GgufPreparedReaderStorage {
@@ -1992,6 +1999,7 @@ pub(crate) struct AdmittedShard {
     pub(crate) file: Arc<AdmittedFile>,
     expected: Option<BTreeSet<String>>,
     max_header_bytes: u64,
+    header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
     header: OnceLock<Result<AdmittedHeader, StoreError>>,
     #[cfg(test)]
     header_reads: AtomicU64,
@@ -2002,6 +2010,7 @@ pub(crate) struct AdmittedHeader {
     pub(crate) metadata: Metadata,
     pub(crate) payload_offset: usize,
     pub(crate) tensors: BTreeMap<String, TensorMetadata>,
+    _reservation: Option<SafetensorsHeaderReservation>,
 }
 
 impl AdmittedShard {
@@ -2009,11 +2018,13 @@ impl AdmittedShard {
         path: &Path,
         expected: Option<BTreeSet<String>>,
         max_header_bytes: u64,
+        header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
     ) -> Result<Self, StoreError> {
         Ok(Self {
             file: Arc::new(AdmittedFile::open(path)?),
             expected,
             max_header_bytes: max_header_bytes.min(MAX_HEADER_BYTES),
+            header_admission,
             header: OnceLock::new(),
             #[cfg(test)]
             header_reads: AtomicU64::new(0),
@@ -2025,51 +2036,67 @@ impl AdmittedShard {
             .get_or_init(|| {
                 #[cfg(test)]
                 self.header_reads.fetch_add(1, Ordering::Relaxed);
-                let (payload_offset, metadata) =
-                    read_safetensors_metadata(path, &self.file, self.max_header_bytes)?;
-                if let Some(expected) = &self.expected {
-                    let actual = metadata.offset_keys().into_iter().collect::<BTreeSet<_>>();
-                    if let Some(key) = expected.difference(&actual).next() {
-                        return Err(StoreError::ContradictoryIndexMapping {
-                            key: key.clone(),
-                            path: path.into(),
-                        });
-                    }
-                    if let Some(key) = actual.difference(expected).next() {
-                        return Err(StoreError::UnindexedShardTensor {
-                            key: key.clone(),
-                            path: path.into(),
-                        });
-                    }
-                }
-                let tensors = metadata
-                    .tensors()
-                    .into_iter()
-                    .map(|(name, info)| {
-                        // Zero dimensions are not model parameters; other geometry was
-                        // established by Metadata's checked offset/shape validation.
-                        if info.shape.contains(&0) {
-                            return Err(io_error(
-                                path,
-                                format!("tensor {name:?} has a zero dimension"),
-                            ));
+                let mut reservation = None;
+                let result = (|| {
+                    let (payload_offset, metadata) = read_safetensors_metadata_admitted(
+                        path,
+                        &self.file,
+                        self.max_header_bytes,
+                        self.header_admission.as_deref(),
+                        &mut reservation,
+                    )?;
+                    if let Some(expected) = &self.expected {
+                        let actual = metadata.offset_keys().into_iter().collect::<BTreeSet<_>>();
+                        if let Some(key) = expected.difference(&actual).next() {
+                            return Err(StoreError::ContradictoryIndexMapping {
+                                key: key.clone(),
+                                path: path.into(),
+                            });
                         }
-                        let tensor = TensorMetadata {
-                            name: name.clone(),
-                            logical_shape: info.shape.clone(),
-                            physical_shape: info.shape.clone(),
-                            stored_dtype: stored_dtype_from_safetensors(info.dtype),
-                            encoded_byte_len: (info.data_offsets.1 - info.data_offsets.0) as u64,
-                            backing_shard: Some(path.into()),
-                        };
-                        Ok((name, tensor))
+                        if let Some(key) = actual.difference(expected).next() {
+                            return Err(StoreError::UnindexedShardTensor {
+                                key: key.clone(),
+                                path: path.into(),
+                            });
+                        }
+                    }
+                    let tensors = metadata
+                        .tensors()
+                        .into_iter()
+                        .map(|(name, info)| {
+                            // Zero dimensions are not model parameters; other geometry was
+                            // established by Metadata's checked offset/shape validation.
+                            if info.shape.contains(&0) {
+                                return Err(io_error(
+                                    path,
+                                    format!("tensor {name:?} has a zero dimension"),
+                                ));
+                            }
+                            let tensor = TensorMetadata {
+                                name: name.clone(),
+                                logical_shape: info.shape.clone(),
+                                physical_shape: info.shape.clone(),
+                                stored_dtype: stored_dtype_from_safetensors(info.dtype),
+                                encoded_byte_len: (info.data_offsets.1 - info.data_offsets.0)
+                                    as u64,
+                                backing_shard: Some(path.into()),
+                            };
+                            Ok((name, tensor))
+                        })
+                        .collect::<Result<_, StoreError>>()?;
+                    Ok(AdmittedHeader {
+                        metadata,
+                        payload_offset,
+                        tensors,
+                        _reservation: reservation.clone(),
                     })
-                    .collect::<Result<_, StoreError>>()?;
-                Ok(AdmittedHeader {
-                    metadata,
-                    payload_offset,
-                    tensors,
-                })
+                })();
+                match (result, reservation) {
+                    (Err(error), Some(reservation)) => Err(StoreError::SafetensorsHeader(
+                        Arc::new(SafetensorsHeaderFailure::new(error, Some(reservation))),
+                    )),
+                    (result, _) => result,
+                }
             })
             .as_ref()
             .map_err(Clone::clone)
@@ -2149,6 +2176,23 @@ impl SafetensorsWeightStore {
         limits: SafetensorsDiscoveryLimits,
     ) -> Result<Self, StoreError> {
         let shards = SafetensorsShards::discover_catalog(path, limits)?;
+        Self::open_admitted(shards, max_cached_shards)
+    }
+
+    /// Opens a source with prospective admission for each lazy header.
+    /// Discovery/index/store metadata and payload storage need separate admission.
+    /// The policy and each accepted reservation survive all shared header aliases.
+    pub fn open_with_header_admission(
+        path: impl AsRef<Path>,
+        max_cached_shards: usize,
+        limits: SafetensorsDiscoveryLimits,
+        admission: Arc<dyn SafetensorsHeaderAdmission>,
+    ) -> Result<Self, StoreError> {
+        let shards = SafetensorsShards::discover_catalog_with_header_admission(
+            path,
+            limits,
+            Some(admission),
+        )?;
         Self::open_admitted(shards, max_cached_shards)
     }
 
@@ -2496,25 +2540,62 @@ impl crate::validation::SafetensorsCatalog for SafetensorsWeightStore {
     }
 }
 
+#[cfg(test)]
 fn read_safetensors_metadata(
     path: &Path,
     admitted_file: &AdmittedFile,
     max_header_bytes: u64,
 ) -> Result<(usize, Metadata), StoreError> {
+    read_safetensors_metadata_admitted(path, admitted_file, max_header_bytes, None, &mut None)
+}
+
+fn read_safetensors_metadata_admitted(
+    path: &Path,
+    admitted_file: &AdmittedFile,
+    max_header_bytes: u64,
+    admission: Option<&dyn SafetensorsHeaderAdmission>,
+    reservation: &mut Option<SafetensorsHeaderReservation>,
+) -> Result<(usize, Metadata), StoreError> {
     let mut file = admitted_file.open_validated(path)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| io_error(path, error))?;
     let file_len = admitted_file.identity.version.length;
-    let metadata = read_safetensors_metadata_from(path, &mut file, file_len, max_header_bytes)?;
+    let metadata = read_safetensors_metadata_from_admitted(
+        path,
+        &mut file,
+        file_len,
+        max_header_bytes,
+        admission,
+        reservation,
+    )?;
     admitted_file.validate_file(path, &file)?;
     Ok(metadata)
 }
 
+#[cfg(test)]
 fn read_safetensors_metadata_from(
     path: &Path,
     reader: &mut impl Read,
     file_len: u64,
     max_header_bytes: u64,
+) -> Result<(usize, Metadata), StoreError> {
+    read_safetensors_metadata_from_admitted(
+        path,
+        reader,
+        file_len,
+        max_header_bytes,
+        None,
+        &mut None,
+    )
+}
+
+fn read_safetensors_metadata_from_admitted(
+    path: &Path,
+    reader: &mut impl Read,
+    file_len: u64,
+    max_header_bytes: u64,
+    admission: Option<&dyn SafetensorsHeaderAdmission>,
+    reservation: &mut Option<SafetensorsHeaderReservation>,
 ) -> Result<(usize, Metadata), StoreError> {
     let mut encoded_header_len = [0u8; 8];
     reader
@@ -2542,6 +2623,21 @@ fn read_safetensors_metadata_from(
     let header_len = usize::try_from(header_len).map_err(|_| StoreError::Overflow {
         context: format!("header length for {}", path.display()),
     })?;
+    if let Some(admission) = admission {
+        *reservation = Some(
+            admission
+                .reserve(SafetensorsHeaderRequest {
+                    json_bytes: header_len,
+                    buffer_bytes: 8 + header_len,
+                    path_bytes: path.as_os_str().len(),
+                })
+                .map_err(|cause| {
+                    StoreError::SafetensorsHeader(Arc::new(SafetensorsHeaderFailure::refused(
+                        cause,
+                    )))
+                })?,
+        );
+    }
     let mut encoded_header = Vec::with_capacity(8 + header_len);
     encoded_header.extend_from_slice(&encoded_header_len);
     encoded_header.resize(8 + header_len, 0);
@@ -4275,3 +4371,6 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod header_admission_tests;

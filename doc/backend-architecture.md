@@ -897,6 +897,17 @@ locations and admission handles. A shared clone allocates no new path maps or
 strings. Owned path export moves the catalog's vector when uniquely owned and
 copies it when aliases remain. Header admissions and leased file/payload owners
 keep their own lifetimes after the last catalog map owner retires.
+SafeTensors discovery and the weight store can inject a neutral admission policy
+for header creation.
+It receives the checked JSON length, byte-buffer request and path length before
+the body is allocated or read. Accepted custody stays with the shared header;
+parse, index-consistency and geometry failures retain it in the cached error.
+Error clones share that failure and its custody, preserving the typed source.
+Concurrent initialization invokes admission once per shard. Header limits and
+file-identity checks still run, and ordinary opening uses the same reader.
+This header contract does not reserve discovery/index/catalog storage, later
+metadata clones, caches or read payloads; runtime policy must fund those owners
+separately and supply its own header estimate/reservation implementation.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that

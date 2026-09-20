@@ -76,22 +76,41 @@ impl SafetensorsShards {
     ) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         let shards = Self::discover_catalog(path, limits)?;
-        for payload in shards.payload_paths() {
-            shards
-                .admission(payload)
-                .header(payload)
-                .map_err(|error| match error {
-                    StoreError::ContradictoryIndexMapping { .. }
-                    | StoreError::UnindexedShardTensor { .. } => {
-                        SafetensorsShardError::MalformedIndex {
-                            path: path.join("model.safetensors.index.json"),
-                            message: error.to_string(),
-                        }
+        shards
+            .validate_headers()
+            .map_err(|(payload, error)| match error {
+                StoreError::ContradictoryIndexMapping { .. }
+                | StoreError::UnindexedShardTensor { .. } => {
+                    SafetensorsShardError::MalformedIndex {
+                        path: path.join("model.safetensors.index.json"),
+                        message: error.to_string(),
                     }
-                    other => malformed_shard(payload, other.to_string()),
-                })?;
-        }
+                }
+                other => malformed_shard(payload, other.to_string()),
+            })?;
         Ok(shards)
+    }
+
+    /// Strict discovery with prospective admission for every shard header.
+    /// Header failures preserve their typed source and accepted custody. Initial
+    /// discovery/index storage requires separate admission by the caller.
+    pub fn discover_with_header_admission(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+        admission: Arc<dyn SafetensorsHeaderAdmission>,
+    ) -> Result<Self, StoreError> {
+        let shards = Self::discover_catalog_with_header_admission(path, limits, Some(admission))?;
+        shards.validate_headers().map_err(|(_, error)| error)?;
+        Ok(shards)
+    }
+
+    fn validate_headers(&self) -> Result<(), (&Path, StoreError)> {
+        for payload in self.payload_paths() {
+            self.admission(payload)
+                .header(payload)
+                .map_err(|error| (payload.as_path(), error))?;
+        }
+        Ok(())
     }
 
     /// Builds an admitted tensor-to-shard catalog without reading payload headers.
@@ -102,9 +121,17 @@ impl SafetensorsShards {
         path: impl AsRef<Path>,
         limits: SafetensorsDiscoveryLimits,
     ) -> Result<Self, SafetensorsShardError> {
+        Self::discover_catalog_with_header_admission(path, limits, None)
+    }
+
+    pub(crate) fn discover_catalog_with_header_admission(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+        header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
+    ) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         if path.is_dir() {
-            return Self::discover_directory(path, limits);
+            return Self::discover_directory(path, limits, header_admission);
         }
         let payload = canonicalize(path)?;
         ShardCatalog {
@@ -114,12 +141,13 @@ impl SafetensorsShards {
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
         }
-        .admit(limits)
+        .admit(limits, header_admission)
     }
 
     fn discover_directory(
         root: &Path,
         limits: SafetensorsDiscoveryLimits,
+        header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
     ) -> Result<Self, SafetensorsShardError> {
         let access_root = canonical_checkpoint_access_root(root)?;
         let index_path = root.join("model.safetensors.index.json");
@@ -132,7 +160,7 @@ impl SafetensorsShards {
                 admissions: BTreeMap::new(),
                 recipes: Arc::default(),
             }
-            .admit(limits);
+            .admit(limits, header_admission);
         }
 
         let mut file =
@@ -186,7 +214,7 @@ impl SafetensorsShards {
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
         }
-        .admit(limits)
+        .admit(limits, header_admission)
     }
 
     /// Input limits retained by this admitted shard set.
@@ -237,6 +265,7 @@ impl ShardCatalog {
     fn admit(
         mut self,
         limits: SafetensorsDiscoveryLimits,
+        header_admission: Option<Arc<dyn SafetensorsHeaderAdmission>>,
     ) -> Result<SafetensorsShards, SafetensorsShardError> {
         let mut expected = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         if let Some(locations) = &self.tensor_locations {
@@ -248,8 +277,13 @@ impl ShardCatalog {
             }
         }
         for path in &self.payload_paths {
-            let shard = AdmittedShard::new(path, expected.remove(path), limits.max_header_bytes)
-                .map_err(|error| malformed_shard(path, error.to_string()))?;
+            let shard = AdmittedShard::new(
+                path,
+                expected.remove(path),
+                limits.max_header_bytes,
+                header_admission.clone(),
+            )
+            .map_err(|error| malformed_shard(path, error.to_string()))?;
             self.admissions.insert(path.clone(), Arc::new(shard));
         }
         Ok(SafetensorsShards {
@@ -294,6 +328,19 @@ impl SafetensorsMetadataCatalog {
         limits: SafetensorsDiscoveryLimits,
     ) -> Result<Self, SafetensorsShardError> {
         Self::from_admitted(SafetensorsShards::discover_with_limits(path, limits)?)
+    }
+
+    /// Discovers exact metadata with prospective admission for each header.
+    /// The separate catalog map and source discovery need their own admission.
+    pub fn discover_with_header_admission(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+        admission: Arc<dyn SafetensorsHeaderAdmission>,
+    ) -> Result<Self, StoreError> {
+        Self::from_admitted(SafetensorsShards::discover_with_header_admission(
+            path, limits, admission,
+        )?)
+        .map_err(StoreError::from)
     }
 
     /// Builds a catalog using the retained shard admissions without rereading headers.
@@ -974,3 +1021,9 @@ mod limits_tests;
 
 #[cfg(test)]
 mod shared_catalog_tests;
+
+mod header_admission;
+pub use header_admission::{
+    SafetensorsHeaderAdmission, SafetensorsHeaderFailure, SafetensorsHeaderRequest,
+    SafetensorsHeaderReservation,
+};
