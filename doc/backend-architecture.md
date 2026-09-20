@@ -885,6 +885,15 @@ source constructors, then compare and construct through the pool; there is no
 second initializer object. Source visibility and prepared-header requirements
 are enforced by the checkpoint plans before admission.
 
+Runtime also admits the checkpoint-owned finite inference plan directly. The
+existing shared initialization result retains the original account alongside
+owned output metadata or a typed inference error after borrowed recipe/catalog
+inputs retire. Inference scratch is destroyed synchronously; no native work or
+independent shared alias escapes this constructor. File and memory read sequences
+can compose key, batch, catalog and inference admission in the same pool. These
+reservations remain separate from recursive mapping, projected spans, child-array
+storage and complete producer construction.
+
 Memory-backed encoded reads inspect their actual immutable store and ordered
 keys before constructing metadata records and source spans. Ordinary reads and
 the runtime-admitted constructor share that worker. Runtime compares the original

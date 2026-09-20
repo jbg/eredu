@@ -9,6 +9,7 @@ mod recipe_keys;
 mod read_catalog;
 mod memory_read;
 mod file_read;
+mod recipe_inference;
 
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public
@@ -57,9 +58,10 @@ pub trait SharedNativeInitializer: Sized {
     ) -> Result<Self::Output, Self::Error>;
 }
 
-/// Shared completed resource plus its original accounting. It cannot yield an
-/// owned output or mint a different domain. The native resource retains another
-/// raw account alias, so dropping this wrapper cannot refund surviving storage.
+/// Completed resource plus its original accounting. It cannot yield an owned
+/// output or mint a different domain. A constructor publishing native aliases
+/// retains another raw account share with those aliases; purely owned host
+/// output needs only this owner's account until its storage is destroyed.
 #[derive(Debug)]
 pub struct InitializedSharedNative<T> {
     output: T,

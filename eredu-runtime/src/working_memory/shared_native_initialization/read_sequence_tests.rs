@@ -2,7 +2,10 @@
 //! fixture prerequisites. This does not grant complete recipe compilation fit.
 use super::*;
 use eredu_checkpoint::{
-    recipe::{DerivedWeightRecipe, EncodedRecipeKeysPlan, ReadBatchCatalogPlan, RecipeCatalog},
+    recipe::{
+        DerivedWeightRecipe, EncodedRecipeKeysPlan, ReadBatchCatalogPlan, RecipeCatalog,
+        RecipeInferenceInput, RecipeInferencePlan,
+    },
     store::{
         MemoryEncodedReadPlan, MemoryWeightStore, SafetensorsEncodedReadPlan,
         SafetensorsWeightStore, TensorSelection,
@@ -59,7 +62,7 @@ macro_rules! sequence {
     ($name:ident, $fixture:ident, $plan:ident) => {
         #[test]
         fn $name() {
-            for short in [false, true] {
+            for refusal_stage in [None, Some("catalog"), Some("inference")] {
                 let (_directory, source) = $fixture();
                 let recipe = DerivedWeightRecipe::Concatenate {
                     axis: 0,
@@ -79,23 +82,39 @@ macro_rules! sequence {
                 let batch = plan.construct(()).unwrap();
                 let catalog_bytes =
                     required(&ReadBatchCatalogPlan::new(batch.tensors()).unwrap()).unwrap();
-                let total = key_bytes + batch_bytes + catalog_bytes;
+                let catalog = ReadBatchCatalogPlan::new(batch.tensors())
+                    .unwrap()
+                    .construct(())
+                    .unwrap();
+                let inference_bytes = required(
+                    &RecipeInferencePlan::new(RecipeInferenceInput::Derived(&recipe), &catalog)
+                        .unwrap(),
+                )
+                .unwrap();
+                let catalog_total = key_bytes + batch_bytes + catalog_bytes;
+                let total = catalog_total + inference_bytes;
+                drop(catalog);
                 drop((batch, keys));
 
-                let pool = WorkingMemoryPool::new(total - u64::from(short), 0).unwrap();
+                let limit = match refusal_stage {
+                    Some("catalog") => catalog_total - 1,
+                    Some("inference") => total - 1,
+                    None => total,
+                    _ => unreachable!(),
+                };
+                let pool = WorkingMemoryPool::new(limit, 0).unwrap();
                 let keys = pool.initialize_shared_native(keys_plan()).unwrap();
                 assert_eq!(pool.used_bytes().unwrap(), key_bytes);
                 let batch = pool
                     .initialize_shared_native($plan::new(&source, keys.output().keys()).unwrap())
                     .unwrap();
                 assert_eq!(pool.used_bytes().unwrap(), key_bytes + batch_bytes);
-                drop((source, recipe));
                 assert_eq!(keys.output().keys(), ["a", "雪", "a"]);
                 assert_eq!(batch.output().byte_len(), 8);
                 let result = pool.initialize_shared_native(
                     ReadBatchCatalogPlan::new(batch.output().tensors()).unwrap(),
                 );
-                if short {
+                let inferred = if refusal_stage == Some("catalog") {
                     let failure = result.unwrap_err();
                     assert!(matches!(
                         failure.accounting_failure(),
@@ -105,9 +124,10 @@ macro_rules! sequence {
                     assert!(failure.constructor_failure().is_none());
                     assert_eq!(pool.used_bytes().unwrap(), key_bytes + batch_bytes);
                     drop(failure);
+                    None
                 } else {
                     let catalog = result.unwrap();
-                    assert_eq!(pool.used_bytes().unwrap(), total);
+                    assert_eq!(pool.used_bytes().unwrap(), catalog_total);
                     assert!(std::ptr::eq(
                         catalog.output().tensor_metadata_borrowed("a").unwrap(),
                         &batch.output().tensors()[2]
@@ -126,26 +146,63 @@ macro_rules! sequence {
                             .tensor_metadata_borrowed("missing")
                             .is_none()
                     );
+                    let result = pool.initialize_shared_native(
+                        RecipeInferencePlan::new(
+                            RecipeInferenceInput::Derived(&recipe),
+                            catalog.output(),
+                        )
+                        .unwrap(),
+                    );
+                    let inferred = if refusal_stage == Some("inference") {
+                        let failure = result.unwrap_err();
+                        assert!(matches!(
+                            failure.accounting_failure(),
+                            Some(WorkingMemoryError::BudgetExceeded { .. })
+                        ));
+                        assert!(failure.rejected_plan().is_some());
+                        assert!(failure.constructor_failure().is_none());
+                        assert_eq!(pool.used_bytes().unwrap(), catalog_total);
+                        drop(failure);
+                        None
+                    } else {
+                        let inferred = result.unwrap();
+                        assert_eq!(inferred.output().shape(), [8]);
+                        assert_eq!(inferred.output().byte_len(), 8);
+                        assert_eq!(pool.used_bytes().unwrap(), total);
+                        Some(inferred)
+                    };
                     drop(catalog);
-                }
-                drop(keys);
-                assert_eq!(pool.used_bytes().unwrap(), batch_bytes);
+                    inferred
+                };
+                drop((keys, source, recipe));
+                let retained_inference = if inferred.is_some() {
+                    inference_bytes
+                } else {
+                    0
+                };
+                assert_eq!(pool.used_bytes().unwrap(), batch_bytes + retained_inference);
                 let mut output = [0; 8];
                 batch.output().read_into(&mut output).unwrap();
                 assert_eq!(output, [3, 7, 11, 13, 29, 3, 7, 11]);
                 drop(batch);
+                assert_eq!(pool.used_bytes().unwrap(), retained_inference);
+                if let Some(inferred) = &inferred {
+                    assert_eq!(inferred.output().shape(), [8]);
+                    assert_eq!(inferred.output().byte_len(), 8);
+                }
+                drop(inferred);
                 assert_eq!(pool.used_bytes().unwrap(), 0);
             }
         }
     };
 }
 sequence!(
-    memory_keys_batch_and_catalog_share_one_pool,
+    memory_keys_batch_catalog_and_inference_share_one_pool,
     memory,
     MemoryEncodedReadPlan
 );
 sequence!(
-    file_keys_batch_and_catalog_share_one_pool,
+    file_keys_batch_catalog_and_inference_share_one_pool,
     file,
     SafetensorsEncodedReadPlan
 );
