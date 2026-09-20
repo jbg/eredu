@@ -6,6 +6,7 @@ use safemlx::{
     OriginalScopeObserver,
 };
 type MaterializationRecovery<T: Retention> = OperationRecovery<T, OriginalTextControlGuard>;
+use operation_slots::WeightMaterializationCustody;
 mod readback;
 
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
@@ -42,8 +43,8 @@ pub(super) fn validate_operation(
     }
     Ok(())
 }
-fn operation_progress<T: Retention>(
-    retained: &MaterializationRecovery<T>,
+fn operation_progress<T: Retention, C: 'static>(
+    retained: &OperationRecovery<T, C>,
     key: &str,
     operation: &'static str,
 ) -> Result<Status, CheckpointMaterializationError> {
@@ -253,7 +254,7 @@ impl Drop for MaterializationUnwind<'_> {
 #[must_use = "checkpoint resources remain retained until exact native completion"]
 pub struct WeightMaterialization {
     key: String,
-    retained: MaterializationRecovery<Rc<MaterializationResources>>,
+    retained: OperationRecovery<Rc<MaterializationResources>, WeightMaterializationCustody>,
 }
 
 fn materialization_error(
@@ -291,6 +292,15 @@ impl WeightMaterialization {
         })?;
         Self::prepare_retained_impl(inputs, sources, Some((ready, observer.clone())))
     }
+
+    /// Activate one supplied slot without allocating input/source transports.
+    pub(crate) fn prepare_original_slot(
+        ready: PreparedWeightMaterialization,
+        observer: &OriginalScopeObserver,
+    ) -> Result<Self, CheckpointMaterializationError> {
+        validate_operation(observer)?;
+        Self::prepare_retained_impl(Vec::new(), Vec::new(), Some((ready, observer.clone())))
+    }
     fn prepare_retained_impl(
         inputs: Vec<Array>,
         sources: Vec<PendingWeightMaterialization>,
@@ -318,7 +328,7 @@ impl WeightMaterialization {
                         children: Cell::new(0),
                         failed: Cell::new(false),
                     });
-                    MaterializationRecovery::ordinary(Recovery::begin(value).map_err(|source| {
+                    OperationRecovery::ordinary(Recovery::begin(value).map_err(|source| {
                         materialization_error(&key, "prepare recovery", source)
                     })?)
                 }
@@ -351,6 +361,35 @@ impl WeightMaterialization {
 
     pub(crate) fn inputs(&self) -> &[Array] {
         &self.retained.retention().inputs
+    }
+
+    /// Check the final input destination before a source producer starts work.
+    pub(crate) fn prepare_input_capacity(
+        &mut self,
+        required: usize,
+    ) -> Result<(), CheckpointMaterializationError> {
+        if let Some(observer) = self.retained.original_observer() {
+            validate_operation(observer)?;
+        }
+        let original = self.retained.original_observer().is_some();
+        let inputs = &mut Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .inputs;
+        if original {
+            operation_slots::require_capacity(inputs, required, "materialization inputs")?;
+        } else {
+            inputs.reserve(required.saturating_sub(inputs.len()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retain_input(&mut self, input: Array) -> Result<(), CheckpointMaterializationError> {
+        self.prepare_input_capacity(self.inputs().len() + 1)?;
+        Rc::get_mut(self.retained.retention_mut())
+            .expect("unpublished owner")
+            .inputs
+            .push(input);
+        Ok(())
     }
 
     /// Authenticate the retained owner before preparing original native work.
@@ -1070,6 +1109,8 @@ mod recovery_tests {
 }
 
 mod operation_slots;
+mod cold_slot;
+pub(crate) use cold_slot::ColdMaterializationSlot;
 pub(crate) use operation_slots::{
     PreparedMaterializationObservation, PreparedPendingWeight, PreparedWeightMaterialization,
 };

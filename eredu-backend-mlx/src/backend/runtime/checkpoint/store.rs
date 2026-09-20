@@ -310,7 +310,8 @@ use leases::WeightLeaseSource;
 mod tests;
 
 pub(crate) use materialization::{
-    PreparedMaterializationObservation, PreparedPendingWeight, PreparedWeightMaterialization,
+    ColdMaterializationSlot, PreparedMaterializationObservation, PreparedPendingWeight,
+    PreparedWeightMaterialization,
 };
 
 pub(crate) use materialization::{MaterializationPayloadShape, OriginalMaterializationSlots};

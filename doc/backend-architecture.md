@@ -780,6 +780,12 @@ and dtype checks precede admission; only a complete successful read publishes an
 immutable source. Escaped array aliases retain the source account independently
 of the constructor wrapper, and failed reads retain their account with the typed
 error. Retained read metadata and runtime initialization are separate prerequisites.
+Cold conversion can admit its fixed materialization slot through the source
+account before a text request exists. Checkout transfers the one prepared node;
+its source account stays with the same completion/recovery owner after the slot
+wrapper is dropped. Request-funded slots retain their text control guard through
+that same driver. Input capacity is checked before source production, and input
+aliases move directly into the final prepared vector without a temporary vector.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

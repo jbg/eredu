@@ -246,15 +246,29 @@ impl PreparedPendingWeight {
     }
 }
 
+/// Original account retained by the shared materialization completion node.
+pub(super) enum WeightMaterializationCustody {
+    Text {
+        _guard: OriginalTextControlGuard,
+    },
+    Source {
+        _guard: eredu_runtime::working_memory::SharedNativeInitializationCustody,
+    },
+}
+
 /// Final empty recovery and shared payload controls, prepared before activation.
 pub(crate) struct PreparedWeightMaterialization {
     value: Rc<MaterializationResources>,
-    ready: PreparedObservedRecovery<Rc<MaterializationResources>, OriginalTextControlGuard>,
+    ready: PreparedObservedRecovery<Rc<MaterializationResources>, WeightMaterializationCustody>,
 }
 impl PreparedWeightMaterialization {
     /// Called only during the closed caller's prepaid bank construction.
     /// Uses the existing Box abort-on-OOM contract; custody remains in the node.
     pub(crate) fn new(custody: OriginalTextControlGuard) -> Self {
+        Self::with_custody(WeightMaterializationCustody::Text { _guard: custody })
+    }
+
+    fn with_custody(custody: WeightMaterializationCustody) -> Self {
         Self {
             value: Rc::new(MaterializationResources {
                 inputs: Vec::new(),
@@ -274,7 +288,23 @@ impl PreparedWeightMaterialization {
         custody: OriginalTextControlGuard,
         shape: MaterializationPayloadShape,
     ) -> Result<Self, (Self, std::collections::TryReserveError)> {
-        let mut ready = Self::new(custody);
+        Self::reserve(Self::new(custody), shape)
+    }
+
+    pub(super) fn try_new_source(
+        custody: eredu_runtime::working_memory::SharedNativeInitializationCustody,
+        shape: MaterializationPayloadShape,
+    ) -> Result<Self, (Self, std::collections::TryReserveError)> {
+        Self::reserve(
+            Self::with_custody(WeightMaterializationCustody::Source { _guard: custody }),
+            shape,
+        )
+    }
+
+    fn reserve(
+        mut ready: Self,
+        shape: MaterializationPayloadShape,
+    ) -> Result<Self, (Self, std::collections::TryReserveError)> {
         let value = Rc::get_mut(&mut ready.value).expect("unissued prepared payload");
         let reserved = (|| {
             value.inputs.try_reserve_exact(shape.inputs)?;
@@ -306,9 +336,9 @@ impl PreparedWeightMaterialization {
     pub(crate) fn bank_layout<F, E>(count: usize) -> Option<BankLayout> {
         let node = PreparedObservedRecovery::<
             Rc<MaterializationResources>,
-            OriginalTextControlGuard,
+            WeightMaterializationCustody,
         >::control_bytes::<Exception>()?;
-        let dispatch = OperationRecovery::<Rc<MaterializationResources>, OriginalTextControlGuard>::control_bytes()?;
+        let dispatch = OperationRecovery::<Rc<MaterializationResources>, WeightMaterializationCustody>::control_bytes()?;
         let native = u64::try_from(OriginalScopeObserver::control_bytes()?).ok()?;
         let slot = node
             .checked_add(dispatch)?
@@ -325,7 +355,7 @@ impl PreparedWeightMaterialization {
         mut sources: Vec<PendingWeightMaterialization>,
         observer: OriginalScopeObserver,
     ) -> Result<
-        OperationRecovery<Rc<MaterializationResources>, OriginalTextControlGuard>,
+        OperationRecovery<Rc<MaterializationResources>, WeightMaterializationCustody>,
         CheckpointMaterializationError,
     > {
         let value = Rc::get_mut(&mut self.value).expect("unissued prepared payload");
@@ -346,7 +376,7 @@ impl PreparedWeightMaterialization {
         sources: &mut Vec<PendingWeightMaterialization>,
         observer: OriginalScopeObserver,
     ) -> Result<
-        OperationRecovery<Rc<MaterializationResources>, OriginalTextControlGuard>,
+        OperationRecovery<Rc<MaterializationResources>, WeightMaterializationCustody>,
         CheckpointMaterializationError,
     > {
         let value = Rc::get_mut(&mut self.value).expect("unissued prepared payload");
