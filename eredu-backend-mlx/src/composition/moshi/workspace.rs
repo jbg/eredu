@@ -1,6 +1,6 @@
 //! Mechanical projections of the actual selected realtime native owners.
 use super::*;
-use crate::backend::nn::workspace::{ExistingArrayProjection,MetalAllocationFacts};
+use crate::backend::nn::workspace::{ExistingArrayProjection,NativeAllocationFacts};
 use crate::backend::runtime::execution::generic::LayerwiseWorkspace;
 use eredu_nn::{ParameterMetadataView,ParameterSourceVisitor,workspace::{WorkspaceContext,WorkspaceTensor,WorkspaceMetadataError,WorkspaceParallelContext}};
 use std::mem::{size_of,size_of_val};
@@ -26,21 +26,21 @@ pub(crate) trait RealtimeWorkspaceVisitor {
 pub(super) trait RealtimeWorkspacePolicy<A>:eredu_runtime::LayerwisePolicy<MlxNeuralBackend,A::Unit>+Sized
 where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueState>+'static,
     A::Error:std::fmt::Display {
-    fn with_workspace_frame(runtime:&SelectedLayerwiseRuntime<A,Self>,allocation:MetalAllocationFacts,
+    fn with_workspace_frame(runtime:&SelectedLayerwiseRuntime<A,Self>,allocation:NativeAllocationFacts,
         context:&WorkspaceContext,parallel:Option<WorkspaceParallelContext>,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error>;
 }
 impl<A> RealtimeWorkspacePolicy<A> for MlxResidentPolicy<A::Unit>
 where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueState>+'static,
     A::Error:std::fmt::Display {
-    fn with_workspace_frame(runtime:&SelectedLayerwiseRuntime<A,Self>,_:MetalAllocationFacts,
+    fn with_workspace_frame(runtime:&SelectedLayerwiseRuntime<A,Self>,_:NativeAllocationFacts,
         context:&WorkspaceContext,parallel:Option<WorkspaceParallelContext>,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error> {resident_in(runtime,context,parallel,visitor)}
 }
 impl<A> RealtimeWorkspacePolicy<A> for MlxLayerwisePolicy<A::Unit,()>
 where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueState>+'static,
     A::Error:std::fmt::Display {
-    fn with_workspace_frame(runtime:&SelectedLayerwiseRuntime<A,Self>,allocation:MetalAllocationFacts,
+    fn with_workspace_frame(runtime:&SelectedLayerwiseRuntime<A,Self>,allocation:NativeAllocationFacts,
         context:&WorkspaceContext,parallel:Option<WorkspaceParallelContext>,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error> {layerwise_in(runtime,allocation,context,parallel,visitor)}
 }
@@ -164,12 +164,12 @@ where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueSt
 }
 
 pub(super) fn layerwise<'a,A>(runtime:&'a SelectedLayerwiseRuntime<A,MlxLayerwisePolicy<A::Unit,()>>,
-    allocation:MetalAllocationFacts,context:&'a WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
+    allocation:NativeAllocationFacts,context:&'a WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
     ->Result<(),Error>
 where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueState>+'static,
     A::Error:std::fmt::Display {layerwise_in(runtime,allocation,context,None,visitor)}
 fn layerwise_in<'a,A>(runtime:&'a SelectedLayerwiseRuntime<A,MlxLayerwisePolicy<A::Unit,()>>,
-    allocation:MetalAllocationFacts,context:&'a WorkspaceContext,parallel:Option<WorkspaceParallelContext>,visitor:&mut dyn RealtimeWorkspaceVisitor)
+    allocation:NativeAllocationFacts,context:&'a WorkspaceContext,parallel:Option<WorkspaceParallelContext>,visitor:&mut dyn RealtimeWorkspaceVisitor)
     ->Result<(),Error>
 where A:moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend,MlxKeyValueState>+'static,
     A::Error:std::fmt::Display {

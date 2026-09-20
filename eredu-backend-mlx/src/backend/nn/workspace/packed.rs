@@ -8,14 +8,14 @@ use eredu_nn::{LinearFormatSpec, LinearRowLayout};
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(op.as_view(), allocation, sink))
 }
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     if matches!(
@@ -170,7 +170,7 @@ struct Fp8Costs {
 fn fp8_costs(
     g: &Geometry<'_>,
     config: eredu_checkpoint::BlockFp8Format,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     output: u64,
 ) -> FactResult<Fp8Costs> {
     let r = |n| capacity(a, n);
@@ -195,7 +195,7 @@ fn fp8_costs(
 
 fn observed_operation_bound(
     op: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let (format, prepare) = match &op.kind {
@@ -470,7 +470,7 @@ impl<'a> Geometry<'a> {
             columns,
         }))
     }
-    fn packed_capacity(&self, allocation: MetalAllocationFacts) -> FactResult<u64> {
+    fn packed_capacity(&self, allocation: NativeAllocationFacts) -> FactResult<u64> {
         buffer_capacity(allocation, self.weight.bytes()?)
     }
 }
@@ -480,7 +480,7 @@ fn quantized_split_scratch(
     n: u64,
     k: u64,
     group: u64,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> FactResult<u64> {
     // Minimum qmv->qmm threshold across supported Metal generations and GPU
     // sizes; a cold selection need not initialize a device to bound the union.

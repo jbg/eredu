@@ -92,7 +92,7 @@ impl Mask {
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     blocks: Option<u32>,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(operation.as_view(), allocation, blocks, sink))
@@ -100,7 +100,7 @@ pub(super) fn operation_bound(
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     blocks: Option<u32>,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
@@ -280,7 +280,7 @@ fn causal_mask_cost(
     q: i32,
     offset: i32,
     distance: i32,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> FactResult<u64> {
     let shape = [
         q,
@@ -320,7 +320,7 @@ fn equation_cost(
     sinks: bool,
     cap: bool,
     arithmetic: AttentionArithmetic,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     blocks: Option<u32>,
 ) -> FactResult<Option<u64>> {
     if arithmetic == AttentionArithmetic::Fused && !cap {
@@ -363,7 +363,7 @@ fn fused_cost(
     g: Geometry,
     mask: Mask,
     sinks: bool,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     blocks: Option<u32>,
 ) -> FactResult<u64> {
     let r = |n| capacity(a, n);
@@ -427,7 +427,7 @@ fn default_blocks(g: Geometry) -> u32 {
     };
     small.max(large)
 }
-fn fallback_cost(g: Geometry, mask: Mask, sinks: bool, a: MetalAllocationFacts) -> FactResult<u64> {
+fn fallback_cost(g: Geometry, mask: Mask, sinks: bool, a: NativeAllocationFacts) -> FactResult<u64> {
     let r = |n| capacity(a, n);
     let mut total = add(mul(3, r(g.query()?)?)?, r(1)?)?;
     let grouped = g.h != g.kv;
@@ -492,7 +492,7 @@ fn explicit_cost(
     sinks: bool,
     cap: bool,
     input_scores: bool,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> FactResult<u64> {
     let r = |n| capacity(a, n);
     let q = [g.b, g.h, g.q, g.d];
@@ -540,7 +540,7 @@ fn product_cost(
     right: &[i32; 4],
     bf16: bool,
     columns: bool,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> FactResult<u64> {
     let plain = matmul_cost(left, right, a)?;
     if !bf16 {

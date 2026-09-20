@@ -3,7 +3,7 @@ use eredu_nn::{Index, Tensor};
 
 fn selected() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 16384 },
+        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
         sdpa_blocks: None,
     }
 }

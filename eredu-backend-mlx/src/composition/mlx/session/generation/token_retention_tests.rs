@@ -216,7 +216,7 @@ fn cpu_retained_tokens_release_model_logits_and_previous_rng_backing() {
 #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 fn metal_emitted_greedy_and_stochastic_tokens_fit_individual_backing_bounds() {
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let allocation = crate::backend::nn::workspace::MetalAllocationFacts::current_host().unwrap();
+    let allocation = crate::backend::nn::workspace::NativeAllocationFacts::current_host().unwrap();
     emitted_tokens_retire_parents(
         &stream,
         "Metal",

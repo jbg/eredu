@@ -384,7 +384,7 @@ impl AddressableQuote {
                 .zip(&self.outputs)
                 .all(|(a, b)| a.shape() == b.shape() && a.dtype() == b.dtype())
     }
-    pub(crate) fn allocation(&self) -> MetalAllocationFacts {
+    pub(crate) fn allocation(&self) -> NativeAllocationFacts {
         self.mechanism.allocation()
     }
     pub(crate) fn identity(

@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::nn::workspace::{MetalAllocationFacts, MlxMetalWorkspaceMechanisms};
+use crate::backend::nn::workspace::{NativeAllocationFacts, MlxMetalWorkspaceMechanisms};
 use eredu_checkpoint::store::{
     CheckpointSource, MemoryWeightStore, SafetensorsWeightStore, TensorSelection,
 };
@@ -340,7 +340,7 @@ fn admitted_roomy_windows_evict_across_group_tails_and_warm_second_forward() {
     let before = f.source.source_diagnostics().unwrap();
     let workspace = f
         .policy
-        .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
+        .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
         .unwrap();
     let identity = workspace.identity();
     let receipt = workspace.disk_receipt().unwrap();
@@ -351,7 +351,7 @@ fn admitted_roomy_windows_evict_across_group_tails_and_warm_second_forward() {
         before,
         "quote must reuse loading metadata"
     );
-    let facts = MetalAllocationFacts::current_host().unwrap();
+    let facts = NativeAllocationFacts::current_host().unwrap();
     assert_eq!(
         workspace.materialization().bytes(),
         Some(facts.buffer_capacity(28).unwrap() + facts.buffer_capacity(44).unwrap())
@@ -374,7 +374,7 @@ fn admitted_roomy_windows_evict_across_group_tails_and_warm_second_forward() {
 #[test]
 fn canonical_owner_full_unit_is_priced_persistent_and_aliases_share_projection() {
     let mut f = fixture(true, 2);
-    let facts = MetalAllocationFacts::current_host().unwrap();
+    let facts = NativeAllocationFacts::current_host().unwrap();
     let workspace = f.policy.layerwise_workspace(facts).unwrap();
     let persistent = facts.buffer_capacity(8).unwrap() + facts.buffer_capacity(12).unwrap();
     let moving = facts.buffer_capacity(28).unwrap() + facts.buffer_capacity(44).unwrap();
@@ -477,7 +477,7 @@ fn managed_inspection_and_wrong_address_reject_before_parameter_construction() {
     let mut f = fixture(false, 2);
     let workspace = f
         .policy
-        .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
+        .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
         .unwrap();
     let receipt = workspace.disk_receipt().unwrap();
     let _guard = receipt.activate().unwrap();
@@ -515,7 +515,7 @@ fn mismatched_dense_depth_does_not_claim_a_two_entry_transfer_quote() {
     let f = fixture(false, 1);
     assert!(f
         .policy
-        .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
+        .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
         .is_err());
 }
 
@@ -524,7 +524,7 @@ fn singleton_groups_accept_equivalent_selected_and_actual_window_depths() {
     let mut f = fixture_with_groups(false, 1, &[1, 1, 1, 1, 1], true);
     let workspace = f
         .policy
-        .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
+        .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
         .unwrap();
     let receipt = workspace.disk_receipt().unwrap();
     let _guard = receipt.activate().unwrap();
@@ -536,7 +536,7 @@ fn ordinary_source_loading_keeps_unquoted_execution_and_typed_unknown_quote() {
     let mut f = fixture_with_groups(false, 2, &[3, 2], false);
     // Ordinary exact read geometry is diagnostic. It does not create the
     // original source identity required by a paid construction context.
-    let allocation = MetalAllocationFacts::current_host().unwrap();
+    let allocation = NativeAllocationFacts::current_host().unwrap();
     f.policy.layerwise_workspace(allocation).unwrap();
     let context = eredu_nn::workspace::WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
     let error = f.policy.layerwise_workspace_with_metadata(allocation, &context).unwrap_err();
@@ -559,7 +559,7 @@ fn admitted_window_physically_retires_old_weight_before_next_constructor_and_ref
     let mut f = fixture(false, 2);
     let workspace = f
         .policy
-        .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
+        .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
         .unwrap();
     let receipt = workspace.disk_receipt().unwrap();
     // Match SessionOperation: this outer scope remains open while each unit
@@ -651,7 +651,7 @@ mod parameter_source_tests {
         let host = Policy::new(f.manager.clone(), f.source.clone(),
             (0..5).map(id).collect(), f.policy.layout.clone(), 2,
             selected, Vec::new(), None, false, false).unwrap();
-        let workspace = host.layerwise_workspace(MetalAllocationFacts::current_host().unwrap()).unwrap();
+        let workspace = host.layerwise_workspace(NativeAllocationFacts::current_host().unwrap()).unwrap();
         assert!(workspace.excludes_parameter("independent.bank"));
         assert!(!workspace.excludes_parameter("missing.unit.weight"));
         let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
@@ -700,7 +700,7 @@ mod parameter_source_tests {
             false,
         )
         .unwrap();
-        let facts = MetalAllocationFacts::current_host().unwrap();
+        let facts = NativeAllocationFacts::current_host().unwrap();
         let workspace = host.layerwise_workspace(facts).unwrap();
         assert!(workspace
             .parameter_source()
@@ -753,7 +753,7 @@ mod parameter_source_tests {
     #[test]
     fn actual_disk_rows_preserve_persistent_companions_and_invocation_lifetimes() {
         let f = fixture(true, 2);
-        let facts = MetalAllocationFacts::current_host().unwrap();
+        let facts = NativeAllocationFacts::current_host().unwrap();
         let workspace = f.policy.layerwise_workspace(facts).unwrap();
         let before = f.source.source_diagnostics().unwrap();
         let counted = workspace.parameter_source().count().unwrap();
@@ -845,7 +845,7 @@ mod parameter_source_tests {
         let mut f = fixture(true, 2);
         let workspace = f
             .policy
-            .layerwise_workspace(MetalAllocationFacts::current_host().unwrap())
+            .layerwise_workspace(NativeAllocationFacts::current_host().unwrap())
             .unwrap();
         let initial = workspace.parameter_source().count().unwrap().counts();
         let receipt = workspace.disk_receipt().unwrap();

@@ -10,7 +10,7 @@ use eredu_nn::{
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 16384 },
+        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
         sdpa_blocks: None,
     }
 }
@@ -330,7 +330,7 @@ fn shared_routing_failure_preserves_one_wrapper_and_ordinary_source_behavior() {
     // Counter used by inspection. Arithmetic fails before projection; its
     // unused layout is not an admission or source-construction witness.
     let make = || Counter {
-        a: MetalAllocationFacts { page_size: 4096 },
+        a: NativeAllocationFacts { page_size: 4096, cpu_header: false },
         spec: &spec,
         rows: u64::MAX,
         projection: WorkspaceOperationFacts {

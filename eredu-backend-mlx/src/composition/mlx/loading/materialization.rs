@@ -311,7 +311,7 @@ pub(in crate::composition::mlx) fn prepared_safetensors_architecture(
 fn selected_workspace_mechanisms(
     _stream: &Stream,
 ) -> Result<Option<crate::backend::nn::workspace::ResidentExecutionMechanisms>, Error> {
-    #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+    #[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
     {
         use crate::backend::nn::workspace::{MlxMetalWorkspaceMechanisms, ResidentExecutionMechanisms};
         let ordinary = MlxMetalWorkspaceMechanisms::current_host()
@@ -319,6 +319,6 @@ fn selected_workspace_mechanisms(
         return ResidentExecutionMechanisms::from_cold_stream(ordinary, _stream)
             .map(Some).map_err(|error| Error::ArchitectureModel(error.to_string()));
     }
-    #[cfg(not(all(target_vendor = "apple", feature = "metal", not(feature = "cuda"))))]
+    #[cfg(not(all(target_vendor = "apple", not(feature = "cuda"))))]
     Ok(None)
 }

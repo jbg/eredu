@@ -17,7 +17,7 @@ impl<'a> Projection<'a> {
         rows: i32,
         inputs: WorkspaceLayoutList<'a>,
         slot: &mut usize,
-        a: MetalAllocationFacts,
+        a: NativeAllocationFacts,
     ) -> FactResult<Option<Self>> {
         let format = spec.format();
         let count = 1
@@ -101,7 +101,7 @@ impl<'a> Projection<'a> {
     // Same dense branch selected by packed_grouped_linear when a reversible
     // overlay publishes floating weights. Its logical bank is independent of
     // the smaller retained packed U32 storage and its U8 companions.
-    fn dense_cost(&self, n: u64, a: MetalAllocationFacts) -> FactResult<Cost> {
+    fn dense_cost(&self, n: u64, a: NativeAllocationFacts) -> FactResult<Cost> {
         let mut cost = Cost::new(a);
         let input = mul(n, self.columns)?;
         let output = mul(n, self.rows)?;
@@ -137,7 +137,7 @@ impl<'a> Projection<'a> {
 
         Ok(cost)
     }
-    pub(super) fn cost(&self, n: u64, a: MetalAllocationFacts) -> FactResult<Cost> {
+    pub(super) fn cost(&self, n: u64, a: NativeAllocationFacts) -> FactResult<Cost> {
         let mut cost = Cost::new(a);
         let input = mul(n, self.columns)?;
         let output = mul(n, self.rows)?;

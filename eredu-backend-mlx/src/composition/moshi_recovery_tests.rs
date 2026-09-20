@@ -20,7 +20,7 @@ impl ErasedRealtimeExecutionContract for TestExecution {
     fn realtime_operation_plan(
         &self,
         _: &Stream,
-        _: crate::backend::nn::workspace::MetalAllocationFacts,
+        _: crate::backend::nn::workspace::NativeAllocationFacts,
         _: &eredu_runtime::working_memory::WorkingMemoryPool,
         _: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<RealtimeOperationPlan, Error> {
@@ -30,7 +30,7 @@ impl ErasedRealtimeExecutionContract for TestExecution {
     }
     fn with_workspace_frame(
         &self,
-        _: crate::backend::nn::workspace::MetalAllocationFacts,
+        _: crate::backend::nn::workspace::NativeAllocationFacts,
         _: &eredu_nn::workspace::WorkspaceContext,
         _: &mut dyn RealtimeWorkspaceVisitor,
     ) -> Result<(), Error> {

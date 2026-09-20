@@ -87,8 +87,8 @@ fn fixture(
     (dir, source, manager)
 }
 
-fn facts() -> MetalAllocationFacts {
-    MetalAllocationFacts::current_host().unwrap()
+fn facts() -> NativeAllocationFacts {
+    NativeAllocationFacts::current_host().unwrap()
 }
 
 fn assert_unknown(result: Result<HostCopyWorkspace, HostCopyWorkspaceError>) {

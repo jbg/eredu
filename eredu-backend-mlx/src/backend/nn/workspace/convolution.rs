@@ -6,14 +6,14 @@ use super::{reduction::capacity_fixed as capacity, *};
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(operation.as_view(), allocation, sink))
 }
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let WorkspaceOperationKindView::Convolution {

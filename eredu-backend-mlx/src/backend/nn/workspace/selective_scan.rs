@@ -49,7 +49,7 @@ pub(super) struct Population {
 }
 // None performs the same descriptor census only. It yields no physical fact.
 struct Counter {
-    allocation: Option<MetalAllocationFacts>,
+    allocation: Option<NativeAllocationFacts>,
     p: Structure,
     bytes: u64,
 }
@@ -277,7 +277,7 @@ impl Worker for Counter {
 
 fn inspect_inner(
     operation: WorkspaceOperationView<'_>,
-    allocation: Option<MetalAllocationFacts>,
+    allocation: Option<NativeAllocationFacts>,
 ) -> FactResult<Option<Population>> {
     let WorkspaceOperationKindView::SelectiveStateSpaceScan(chunk, floor) = operation.kind else {
         return Ok(None);
@@ -359,7 +359,7 @@ pub(super) fn structure(operation: WorkspaceOperationView<'_>) -> FactResult<Opt
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let Some(p) = inspect_inner(operation, Some(allocation))? else {

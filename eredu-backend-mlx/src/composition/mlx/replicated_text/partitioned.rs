@@ -305,13 +305,13 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
 impl<U: 'static> MlxSelectedLayerwisePolicy<U, MlxSelectiveUnitPopulator> {
     pub(super) fn layerwise_workspace(
         &self,
-        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation: crate::backend::nn::workspace::NativeAllocationFacts,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         self.layerwise_workspace_impl(allocation, None)
     }
     pub(super) fn prepared_layerwise_workspace(
         &self,
-        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation: crate::backend::nn::workspace::NativeAllocationFacts,
         context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         let frames = [
@@ -325,7 +325,7 @@ impl<U: 'static> MlxSelectedLayerwisePolicy<U, MlxSelectiveUnitPopulator> {
             std::mem::size_of::<
                 Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error>,
             >(),
-            std::mem::size_of::<crate::backend::nn::workspace::MetalAllocationFacts>(),
+            std::mem::size_of::<crate::backend::nn::workspace::NativeAllocationFacts>(),
         ];
         context
             .charge_metadata(
@@ -341,7 +341,7 @@ impl<U: 'static> MlxSelectedLayerwisePolicy<U, MlxSelectiveUnitPopulator> {
     }
     fn layerwise_workspace_impl(
         &self,
-        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation: crate::backend::nn::workspace::NativeAllocationFacts,
         context: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         let policy = match context {

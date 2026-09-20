@@ -15,7 +15,7 @@ fn invalid() -> MlxWorkspaceFactError {
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary_with(
         |sink| emit(op.as_view(), a, sink),
@@ -99,7 +99,7 @@ pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<Read
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let Some(ReadoutGeometry { batch:b, sequence:s, hidden:h,

@@ -1149,7 +1149,7 @@ where
 
     fn layerwise_workspace(
         &self,
-        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation: crate::backend::nn::workspace::NativeAllocationFacts,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         self.session
             .inspect_runtime(|mechanisms, _| mechanisms.layerwise_workspace(allocation))

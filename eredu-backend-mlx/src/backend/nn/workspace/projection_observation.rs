@@ -28,14 +28,14 @@ pub(super) fn selection(
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(op.as_view(), allocation, sink))
 }
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     if !matches!(

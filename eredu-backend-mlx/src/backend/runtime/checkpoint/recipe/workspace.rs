@@ -1,7 +1,7 @@
 //! Capacity facts for the exact disk-read batch selected by the materializer.
 
 use super::*;
-use crate::backend::nn::workspace::MetalAllocationFacts;
+use crate::backend::nn::workspace::NativeAllocationFacts;
 use eredu_core::WorkspaceBound;
 
 impl BindingReadBatch<'_> {
@@ -18,7 +18,7 @@ impl BindingReadBatch<'_> {
     /// this method neither selects a device nor reads a checkpoint payload.
     pub(crate) fn workspace_bound(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<WorkspaceBound, WeightRecipeError> {
         let Self::Direct { bindings, reads } = self else {
             return Ok(WorkspaceBound::Unknown {
@@ -58,7 +58,7 @@ pub(super) fn validate_direct_output(
 pub(super) fn direct_output_capacity(
     binding: &eredu_runtime::WeightBinding,
     logical: u64,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<u64, WeightRecipeError> {
     validate_direct_output(binding, logical)?;
     allocation
@@ -68,7 +68,7 @@ pub(super) fn direct_output_capacity(
 
 pub(super) fn direct_workspace_bound<'a>(
     outputs: impl IntoIterator<Item = (&'a eredu_runtime::WeightBinding, u64)>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<WorkspaceBound, WeightRecipeError> {
     let mut bytes = 0_u64;
     let mut count = 0_usize;

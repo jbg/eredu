@@ -38,7 +38,7 @@ pub(super) fn geometry(operation: WorkspaceOperationView<'_>) -> FactResult<Opti
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     if geometry(operation)?.is_none() {

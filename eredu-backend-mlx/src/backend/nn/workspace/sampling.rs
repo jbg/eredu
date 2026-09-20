@@ -14,19 +14,19 @@ use eredu_nn::EmbeddingLookupPolicy;
 fn invalid() -> MlxWorkspaceFactError {
     MlxWorkspaceFactError::descriptor("invalid Metal sampling workspace descriptor")
 }
-fn pointwise(a: MetalAllocationFacts, elements: u64, inputs: u64) -> FactResult<u64> {
+fn pointwise(a: NativeAllocationFacts, elements: u64, inputs: u64) -> FactResult<u64> {
     // One possible <=F32 cast per operand, the result, and each scalar operand.
     add(
         mul(inputs + 1, capacity(a, elements)?)?,
         mul(inputs, capacity(a, 1)?)?,
     )
 }
-fn fill(a: MetalAllocationFacts, elements: u64) -> FactResult<u64> {
+fn fill(a: NativeAllocationFacts, elements: u64) -> FactResult<u64> {
     // F32 fill, optional restoration cast, and source/fill/cast scalars.
     add(mul(2, capacity(a, elements)?)?, mul(3, capacity(a, 1)?)?)
 }
 pub(super) fn sort(
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     elements: u64,
     rows: u64,
     width: u64,
@@ -35,7 +35,7 @@ pub(super) fn sort(
 }
 
 pub(super) fn sort_fixed(
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     elements: u64,
     rows: u64,
     width: u64,
@@ -71,14 +71,14 @@ pub(super) fn token_validation_layouts(
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(op.as_view(), a, sink))
 }
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let WorkspaceOperationKindView::Sampling(kind) = &op.kind else {

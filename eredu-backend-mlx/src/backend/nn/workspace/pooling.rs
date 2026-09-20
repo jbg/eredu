@@ -74,7 +74,7 @@ fn output(op: WorkspaceOperationView<'_>, shape: &[i32], dtype: WorkspaceDtype) 
 fn mask_cost(
     mask: Option<WorkspaceLayoutView<'_>>,
     target: &[i32],
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> FactResult<Option<u64>> {
     let Some(mask) = mask else {
         return Ok(Some(0));
@@ -96,7 +96,7 @@ fn mask_cost(
 fn finish(
     total: u64,
     retained: u64,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     detail: &str,
     alias_query: bool,
     sink: &mut Emitter<'_>,
@@ -114,7 +114,7 @@ fn finish(
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     blocks: Option<u32>,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(op.as_view(), a, blocks, sink))
@@ -122,7 +122,7 @@ pub(super) fn operation_bound(
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     blocks: Option<u32>,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
@@ -148,7 +148,7 @@ pub(super) fn emit(
 
 fn pooled(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     blocks: Option<u32>,
     scale: f32,
     lm: bool,
@@ -302,7 +302,7 @@ pub(super) fn indexed_geometry(
 
 fn indexed(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     _scale: f32,
     lm: bool,
     pm: bool,
@@ -424,7 +424,7 @@ pub(super) fn positions_geometry(
 }
 fn positions(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let (g, masked) = positions_geometry(op)?;
@@ -500,7 +500,7 @@ pub(super) fn gather_geometry(
 }
 fn gather(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<WorkspaceOperationFacts> {
     gather_geometry(op)?;

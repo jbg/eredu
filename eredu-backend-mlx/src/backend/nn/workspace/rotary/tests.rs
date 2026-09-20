@@ -3,7 +3,7 @@ use eredu_nn::{NeuralBackend, RotaryOperator, RotaryPosition, RotarySpec};
 
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 16384 },
+        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
         sdpa_blocks: None,
     }
 }

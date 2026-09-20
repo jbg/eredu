@@ -1,5 +1,5 @@
 //! Quote the implementation already carried by the actual borrowed stream.
-use super::{MlxMetalWorkspaceMechanisms, ResidentRecipeRecorder, MetalAllocationFacts, MlxWorkspaceFactError};
+use super::{MlxMetalWorkspaceMechanisms, ResidentRecipeRecorder, NativeAllocationFacts, MlxWorkspaceFactError};
 use eredu_nn::workspace::*;
 use eredu_nn::{Error, workspace::{WorkspaceContext, WorkspaceMetadataError, HostMetadataFunding}};
 use std::mem::{size_of, size_of_val};
@@ -52,7 +52,7 @@ impl ResidentExecutionMechanisms {
     pub(crate) fn ordinary(self) -> MlxMetalWorkspaceMechanisms {
         match self { Self::Metal(facts) | Self::Cpu { ordinary: facts, .. } => facts }
     }
-    pub(crate) fn allocation(self) -> MetalAllocationFacts { self.ordinary().allocation() }
+    pub(crate) fn allocation(self) -> NativeAllocationFacts { self.ordinary().allocation() }
     pub(crate) fn metal(self) -> Option<MlxMetalWorkspaceMechanisms> {
         match self { Self::Metal(facts) => Some(facts), Self::Cpu { .. } => None }
     }

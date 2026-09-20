@@ -50,16 +50,16 @@ mod sampling_state;
 pub(super) use numerical_difference::{difference as difference_population,logarithm as logarithm_population};
 pub(super) use numerical_random::{uniform_unit_interval as uniform_population,categorical as categorical_population};
 
-/// Cold CPU facts paired with their exact recipe selection. The allocator is
-/// shared with the Metal-backed native runtime; operator facts are CPU-specific.
+/// Cold CPU facts paired with their exact recipe selection. Allocation facts
+/// describe the compiled native allocator; operator facts are CPU-specific.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MlxCpuWorkspaceMechanisms {
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     matmul: MlxCpuMatmulMechanism,
 }
 impl MlxCpuWorkspaceMechanisms {
     pub(crate) const fn new(
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
         matmul: MlxCpuMatmulMechanism,
     ) -> Self {
         Self { allocation, matmul }

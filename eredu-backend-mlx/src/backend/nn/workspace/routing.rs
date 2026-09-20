@@ -15,7 +15,7 @@ fn invalid() -> MlxWorkspaceFactError {
 }
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     if matches!(op.kind, WorkspaceOperationKind::GroupSelection { .. }) {
         return selector::bounds(op, a).map(|bound| bound.map(|(tensor, _)| tensor));
@@ -84,7 +84,7 @@ pub(super) fn joint_geometry(op: WorkspaceOperationView<'_>) -> FactResult<Optio
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     if matches!(op.kind, WorkspaceOperationKindView::GroupSelection { .. }) {
@@ -123,7 +123,7 @@ pub(super) fn emit(
 
 pub(super) fn selector_host_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceHostBound>, Error> {
     Ok(selector::bounds(op, a)?.map(|(_, bytes)| WorkspaceHostBound {
         bytes,
@@ -133,7 +133,7 @@ pub(super) fn selector_host_bound(
 
 pub(super) fn emit_selector_host(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut HostEmitter<'_>,
 ) -> FactResult<Option<WorkspaceHostFacts>> {
     let mut tensor = Emitter::count();

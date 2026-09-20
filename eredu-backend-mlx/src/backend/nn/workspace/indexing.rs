@@ -12,14 +12,14 @@ use eredu_nn::EmbeddingLookupPolicy;
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(operation.as_view(), allocation, sink))
 }
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     match &operation.kind {
@@ -37,14 +37,14 @@ pub(super) fn emit(
     }
 }
 
-fn boolean(allocation: MetalAllocationFacts, elements: u64) -> FactResult<u64> {
+fn boolean(allocation: NativeAllocationFacts, elements: u64) -> FactResult<u64> {
     buffer_capacity(allocation, elements.max(1))
 }
 
 fn gather(
     operation: WorkspaceOperationView<'_>,
     axis: usize,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<WorkspaceOperationFacts> {
     if operation.inputs.len() != 2 || operation.outputs.len() != 1 {
@@ -119,7 +119,7 @@ fn gather(
 fn embedding(
     operation: WorkspaceOperationView<'_>,
     policy: EmbeddingLookupPolicy,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<WorkspaceOperationFacts> {
     if operation.inputs.len() != 2 || operation.outputs.len() != 1 {
@@ -162,7 +162,7 @@ pub(super) fn embedding_validation_cost(
     count: u64,
     output_elements: u64,
     policy: EmbeddingLookupPolicy,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<u64, Error> {
     embedding_validation_cost_fixed(count, output_elements, policy, allocation)
         .map_err(MlxWorkspaceFactError::ordinary)
@@ -172,7 +172,7 @@ pub(super) fn embedding_validation_cost_fixed(
     count: u64,
     output_elements: u64,
     policy: EmbeddingLookupPolicy,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> FactResult<u64> {
     let index = capacity(allocation, count)?;
     let mask = boolean(allocation, count)?;

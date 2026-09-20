@@ -24,7 +24,7 @@ use super::{
     transfer::ManagerState,
 };
 use crate::backend::{
-    nn::workspace::MetalAllocationFacts,
+    nn::workspace::NativeAllocationFacts,
     ordinary_retirement::OrdinaryRetirement,
     runtime::checkpoint::recipe::{mlx_dtype, mlx_dtype_if_supported},
 };
@@ -164,7 +164,7 @@ pub(crate) struct HostCopyWorkspaceData {
     manager: super::ManagerWeak,
     stream_handle: usize,
     destination: safemlx::StreamCopyPlan<()>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     units: Vec<HostCopyUnit>,
     copies: Vec<HostCopyBinding>,
     fresh_capacity_bytes: u64,
@@ -628,7 +628,7 @@ impl ResidencyManager {
     pub(crate) fn host_copy_workspace(
         &self,
         ids: &[OffloadUnitId],
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<HostCopyWorkspace, HostCopyWorkspaceError> {
         self.host_copy_workspace_impl(ids, allocation, false)
     }
@@ -638,14 +638,14 @@ impl ResidencyManager {
     pub(crate) fn prepared_host_copy_workspace(
         &self,
         ids: &[OffloadUnitId],
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<HostCopyWorkspace, HostCopyWorkspaceError> {
         self.host_copy_workspace_impl(ids, allocation, true)
     }
     fn host_copy_workspace_impl(
         &self,
         ids: &[OffloadUnitId],
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
         prepared_only: bool,
     ) -> Result<HostCopyWorkspace, HostCopyWorkspaceError> {
         // self.lock() reaps recovery; inspection must not establish readiness.
@@ -721,7 +721,7 @@ impl ResidencyManager {
         &self,
         state: &ManagerState,
         ids: &[OffloadUnitId],
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<HostCopyWorkspace, HostCopyWorkspaceError> {
         let original = self.original_source_custody().is_some();
         self.validate_host_copy_state(state)?;

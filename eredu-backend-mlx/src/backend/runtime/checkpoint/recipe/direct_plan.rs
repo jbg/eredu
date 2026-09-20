@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use eredu_runtime::{working_memory::WorkingMemoryError, WeightBinding};
 
 use super::*;
-use crate::backend::nn::workspace::MetalAllocationFacts;
+use crate::backend::nn::workspace::NativeAllocationFacts;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PreparedDirectReadError {
@@ -55,7 +55,7 @@ impl DirectReadOutput {
     }
     pub(crate) fn capacity_bytes(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<u64, PreparedDirectReadError> {
         super::workspace::direct_output_capacity(&self.binding, self.logical_bytes(), allocation)
             .map_err(Into::into)
@@ -152,7 +152,7 @@ impl PreparedDirectReadPlan {
     }
     pub(crate) fn workspace_bound(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<eredu_core::WorkspaceBound, PreparedDirectReadError> {
         super::workspace::direct_workspace_bound(
             self.outputs

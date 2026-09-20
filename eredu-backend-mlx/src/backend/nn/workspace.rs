@@ -87,22 +87,27 @@ mod storage;
 ))]
 mod text_prompt_tests;
 
-/// Metal buffer-capacity rules in the vendored MLX allocator. This owner has no
+/// Buffer-capacity rules for the compiled CPU or Metal allocator. This owner has no
 /// device, stream, native allocation or mutable allocator setting.
 #[derive(Clone, Copy, Debug)]
-pub struct MetalAllocationFacts {
+pub struct NativeAllocationFacts {
     page_size: u64,
+    cpu_header: bool,
 }
-impl MetalAllocationFacts {
-    /// Captures the Apple host page size without initializing Metal. Only a
-    /// retained selection of the Metal realization may use these facts.
+impl NativeAllocationFacts {
+    /// Captures the actual compiled allocator layout and host page size without
+    /// initializing a device or allocator. The native layout query distinguishes
+    /// CPU storage from shared Metal storage even under Cargo feature unification.
     #[cfg(target_vendor = "apple")]
     pub fn current_host() -> Result<Self, Error> {
+        let layout = safemlx::PreparedInputAllocator::<()>::layout()
+            .map_err(Error::backend_retained_source)?;
         Ok(Self {
             page_size: safemlx::memory::host_page_size().map_err(Error::backend)? as u64,
+            cpu_header: !layout.requires_device,
         })
     }
-    /// Host allocation granularity used by the selected Metal allocator.
+    /// Host page granularity used by original physical allocations.
     pub const fn page_size(self) -> u64 {
         self.page_size
     }
@@ -113,9 +118,10 @@ impl MetalAllocationFacts {
         facts::buffer_capacity(self, bytes)
     }
 
-    /// Upper bound on one active buffer, including page rounding and oversized
-    /// cache reuse. MLX rounds sizes above one page, then accepts a cached
-    /// buffer strictly below `min(2 * size, size + 2 * page_size)`.
+    /// Upper bound on ordinary buffer backing, including oversized cache reuse.
+    /// CPU bounds also cover page-backed original allocations and their size
+    /// header, even for empty payloads. Metal original allocations use their
+    /// separately queried physical capacity; ordinary Metal rounds above a page.
     /// This is an implementation bound, not an allocator observation or limit.
     pub fn buffer_capacity(self, bytes: u64) -> Result<u64, Error> {
         facts::buffer_capacity(self, bytes).map_err(MlxWorkspaceFactError::ordinary)
@@ -127,20 +133,26 @@ impl MetalAllocationFacts {
 /// This is not a claim that the complete native inference path is covered.
 #[derive(Clone, Copy, Debug)]
 pub struct MlxMetalWorkspaceMechanisms {
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sdpa_blocks: Option<u32>,
 }
 impl MlxMetalWorkspaceMechanisms {
-    /// Captures cold host facts for a compiled Metal realization.
-    #[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+    /// Captures shared allocator facts and the selected Metal attention setting.
+    /// CPU equation dispatch uses the same allocator facts with its own workers.
+    #[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
     pub fn current_host() -> Result<Self, Error> {
+        let allocation = NativeAllocationFacts::current_host()?;
         Ok(Self {
-            allocation: MetalAllocationFacts::current_host()?,
-            sdpa_blocks: safemlx::fast::sdpa_blocks_override().map_err(Error::backend)?,
+            allocation,
+            sdpa_blocks: if allocation.cpu_header {
+                None
+            } else {
+                safemlx::fast::sdpa_blocks_override().map_err(Error::backend)?
+            },
         })
     }
     /// The allocation rules retained by this mechanism selection.
-    pub const fn allocation(self) -> MetalAllocationFacts {
+    pub const fn allocation(self) -> NativeAllocationFacts {
         self.allocation
     }
 }
@@ -335,7 +347,7 @@ fn mul(a: u64, b: u64) -> Result<u64, Error> {
 #[cfg(not(feature = "cuda"))]
 fn metal_gated_delta_emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut facts::Emitter<'_>,
 ) -> facts::FactResult<WorkspaceOperationFacts> {
     use facts::{add, mul};
@@ -430,7 +442,7 @@ mod tests {
     fn audited_pointwise_has_explicit_host_fact_and_unknown_equations_stay_unknown() {
         use eredu_nn::Tensor;
         let context = WorkspaceContext::new(MlxMetalWorkspaceMechanisms {
-            allocation: MetalAllocationFacts { page_size: 16_384 },
+            allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
             sdpa_blocks: None,
         });
         let input = WorkspaceTensor::unloaded_f32(&[2, 3], &context).unwrap();
@@ -444,7 +456,7 @@ mod tests {
         let mut unknown = report.operations.last().unwrap().clone();
         unknown.kind = WorkspaceOperationKind::Elementwise("unaudited_operation");
         let selected = MlxMetalWorkspaceMechanisms {
-            allocation: MetalAllocationFacts { page_size: 16_384 },
+            allocation: NativeAllocationFacts { page_size: 16_384, cpu_header: false },
             sdpa_blocks: None,
         };
         assert!(selected.operation_bound(&unknown).unwrap().is_none());
@@ -453,7 +465,7 @@ mod tests {
     #[test]
     fn allocation_capacity_covers_exact_rounding_and_cache_acceptance_boundaries() {
         for page in [4096, 16384] {
-            let facts = MetalAllocationFacts { page_size: page };
+            let facts = NativeAllocationFacts { page_size: page, cpu_header: false };
             for requested in [
                 0,
                 1,
@@ -486,17 +498,102 @@ mod tests {
             }
         }
         assert!(
-            MetalAllocationFacts { page_size: 16384 }
+            NativeAllocationFacts { page_size: 16384, cpu_header: false }
                 .buffer_capacity(u64::MAX)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cpu_allocation_capacity_covers_headers_pages_and_cache_reuse() {
+        let header = std::mem::size_of::<usize>() as u64;
+        for page in [4096_u64, 16384] {
+            let facts = NativeAllocationFacts {
+                page_size: page,
+                cpu_header: true,
+            };
+            for requested in [
+                0,
+                1,
+                page - header,
+                page - header + 1,
+                page,
+                page + 1,
+                37 * page + 3,
+            ] {
+                let bound = facts.buffer_capacity(requested).unwrap();
+                let physical = ((requested + header - 1) / page + 1) * page;
+                assert!(bound >= physical, "original backing for {requested} bytes");
+                assert!(bound < physical + 2 * page);
+                if requested > 0 {
+                    // The ordinary CPU cache uses a 4096-byte search granularity.
+                    let largest_cached_payload = (2 * requested).min(requested + 8192) - 1;
+                    assert!(bound >= largest_cached_payload + header);
+                }
+            }
+            assert!(facts.buffer_capacity(u64::MAX).is_err());
+        }
+        let facts = NativeAllocationFacts {
+            page_size: 16384,
+            cpu_header: true,
+        };
+        assert_eq!(facts.buffer_capacity(0).unwrap(), 32767);
+        assert_eq!(facts.buffer_capacity(16384 - header).unwrap(), 32767);
+        assert_eq!(facts.buffer_capacity(16385 - header).unwrap(), 65535);
+    }
+
+    #[test]
+    #[cfg(target_vendor = "apple")]
+    fn selected_allocation_capacity_covers_native_backing() {
+        const CASE: &str = "selected_allocation_capacity_covers_native_backing";
+        if std::env::var("EREDU_ALLOCATION_FACT_CASE").as_deref() != Ok(CASE) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    &format!("backend::nn::workspace::tests::{CASE}"),
+                    "--nocapture",
+                ])
+                .env("EREDU_ALLOCATION_FACT_CASE", CASE)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("ALLOCATION_FACT_OK"));
+            return;
+        }
+        let facts = NativeAllocationFacts::current_host().unwrap();
+        let runtime = safemlx::PreparedInputRuntime::prepare().unwrap();
+        let page = facts.page_size() as usize;
+        for requested in [0, 1, page - 8, page - 1, page, page + 1, 37 * page + 3] {
+            let bound = facts.buffer_capacity(requested as u64).unwrap();
+            let array = safemlx::Array::from_slice(&vec![0_u8; requested], &[requested as i32]);
+            let allocation = array.allocation_info().unwrap();
+            if requested != 0 {
+                assert!(allocation.is_some());
+            }
+            assert!(allocation.map_or(0, |info| info.bytes()) as u64 <= bound);
+            if facts.cpu_header {
+                let layout =
+                    safemlx::OriginalBufferBudget::request_layout(&runtime, requested).unwrap();
+                assert!(
+                    bound >= layout.capacity() as u64,
+                    "original CPU request {requested}"
+                );
+                assert!(layout.capacity() > 0);
+            }
+        }
+        println!("ALLOCATION_FACT_OK");
     }
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn recurrent_workspace_prices_all_native_chunk_transitions_and_keeps_other_primitives_unknown()
     {
         let mechanism = MlxMetalWorkspaceMechanisms {
-            allocation: MetalAllocationFacts { page_size: 16384 },
+            allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
             sdpa_blocks: None,
         };
         let layout = |shape: &[i32]| WorkspaceLayout::new(shape, WorkspaceDtype::Float32).unwrap();

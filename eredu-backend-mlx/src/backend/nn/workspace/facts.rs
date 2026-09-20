@@ -713,12 +713,17 @@ pub(super) fn mul(a: u64, b: u64) -> FactResult<u64> {
     ))
 }
 
-pub(super) fn buffer_capacity(allocation: MetalAllocationFacts, bytes: u64) -> FactResult<u64> {
-    if bytes == 0 {
+pub(super) fn buffer_capacity(allocation: NativeAllocationFacts, bytes: u64) -> FactResult<u64> {
+    if bytes == 0 && !allocation.cpu_header {
         return Ok(0);
     }
     let page = allocation.page_size();
-    let rounded = if bytes > page {
+    let bytes = if allocation.cpu_header {
+        add(bytes, std::mem::size_of::<usize>() as u64)?
+    } else {
+        bytes
+    };
+    let rounded = if allocation.cpu_header || bytes > page {
         mul(bytes.div_ceil(page), page)?
     } else {
         bytes

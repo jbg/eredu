@@ -18,7 +18,7 @@ fn retained_plan_prices_every_owner_output_without_rereading_or_readmitting_sour
     ];
     let plan = PreparedDirectReadPlan::prepare(store.as_ref(), &bindings).unwrap();
     let prepared = store.source_diagnostics().unwrap();
-    let facts = MetalAllocationFacts::current_host().unwrap();
+    let facts = NativeAllocationFacts::current_host().unwrap();
     let cloned = plan.clone();
     assert_eq!(
         plan.workspace_bound(facts).unwrap(),

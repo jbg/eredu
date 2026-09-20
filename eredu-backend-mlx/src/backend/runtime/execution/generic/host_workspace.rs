@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::backend::{
-    nn::workspace::MetalAllocationFacts,
+    nn::workspace::NativeAllocationFacts,
     runtime::residency::manager::{
         DiskCopyWorkspace, DiskRouteGuard, DiskRouteReceipt, ForegroundDiskIdentity,
         HostCopyIdentity, HostCopyWorkspace,
@@ -662,13 +662,13 @@ impl LayerwiseWorkspace {
 impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
     pub(crate) fn layerwise_workspace(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<LayerwiseWorkspace, Error> {
         self.layerwise_workspace_impl(allocation, None)
     }
     pub(crate) fn layerwise_workspace_with_metadata(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
         context: &WorkspaceContext,
     ) -> Result<LayerwiseWorkspace, Error> {
         let parts = [
@@ -706,7 +706,7 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
     }
     fn layerwise_workspace_impl(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
         context: Option<&WorkspaceContext>,
     ) -> Result<LayerwiseWorkspace, Error> {
         let unknown = || match context {
@@ -802,7 +802,7 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
         }
         let units = copies.units().iter().map(|unit| WorkspaceBound::bounded(
             unit.fresh_capacity_bytes(),
-            "every selected host-copy name can allocate one destination; Metal capacity rounding and oversized reuse included; existing host aliases are already charged; no separate numeric staging",
+            "every selected host-copy name can allocate one destination; selected allocator capacity rounding and oversized reuse included; existing host aliases are already charged; no separate numeric staging",
         )).collect::<Vec<_>>();
         let materialization = eredu_runtime::working_memory::quote_completed_layerwise_window(
             &self.layout,
@@ -855,7 +855,7 @@ impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
 impl<U: 'static, P: MlxUnitPopulator<U>> MlxLayerwisePolicy<U, P> {
     fn disk_workspace(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<LayerwiseWorkspace, Error> {
         use eredu_runtime::working_memory::WorkingMemoryError;
         let plans = self

@@ -113,7 +113,7 @@ impl HostCopyIdentity {
                 &[OffloadUnitId],
                 &ExecutionUnitLayout,
                 usize,
-                MetalAllocationFacts,
+                NativeAllocationFacts,
             )>(),
         ] {
             bytes = bytes.checked_add(control)?;
@@ -181,7 +181,7 @@ impl ResidencyManager {
         ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<(), HostCopyWorkspaceError> {
         if self.inner.host_workspace.get().is_some() {
             return Err(HostCopyWorkspaceError::mismatch(
@@ -200,7 +200,7 @@ impl ResidencyManager {
         ids: &[OffloadUnitId],
         layout: &ExecutionUnitLayout,
         depth: usize,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<HostCopyWorkspace, HostCopyWorkspaceError> {
         if ids.len() != layout.len() {
             return Err(HostCopyWorkspaceError::mismatch(

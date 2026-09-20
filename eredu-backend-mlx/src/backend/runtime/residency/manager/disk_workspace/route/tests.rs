@@ -7,8 +7,8 @@ use std::sync::atomic::AtomicUsize;
 fn id(name: &str) -> OffloadUnitId {
     OffloadUnitId::new(name).unwrap()
 }
-fn facts() -> MetalAllocationFacts {
-    MetalAllocationFacts::current_host().unwrap()
+fn facts() -> NativeAllocationFacts {
+    NativeAllocationFacts::current_host().unwrap()
 }
 fn fixture() -> (
     tempfile::TempDir,

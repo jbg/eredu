@@ -10,7 +10,7 @@ use eredu_checkpoint::LinearFormat;
 pub(super) fn matmul_cost(
     left: &[i32],
     right: &[i32],
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<u64, Error> {
     matmul_cost_fixed(left, right, allocation).map_err(MlxWorkspaceFactError::ordinary)
 }
@@ -18,7 +18,7 @@ pub(super) fn matmul_cost(
 pub(super) fn matmul_cost_fixed(
     left: &[i32],
     right: &[i32],
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> FactResult<u64> {
     Geometry::new(left, right)?.matmul_cost(allocation)
 }
@@ -30,7 +30,7 @@ pub(super) fn einsum_matmul_cost(
     left: &[i32],
     right: &[i32],
     result: &[i32],
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<u64, Error> {
     einsum_matmul_cost_fixed(left, right, result, allocation)
         .map_err(MlxWorkspaceFactError::ordinary)
@@ -40,7 +40,7 @@ pub(super) fn einsum_matmul_cost_fixed(
     left: &[i32],
     right: &[i32],
     result: &[i32],
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> FactResult<u64> {
     add(
         matmul_cost_fixed(left, right, allocation)?,
@@ -56,7 +56,7 @@ pub(super) fn einsum_matmul_cost_fixed(
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(operation.as_view(), allocation, sink))
 }
@@ -133,7 +133,7 @@ fn selected_mixed_row_weight(operation: WorkspaceOperationView<'_>) -> bool {
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let (linear, constructed) = match &operation.kind {
@@ -326,13 +326,13 @@ impl<'a> Geometry<'a> {
             .try_fold(1, |count, extent| mul(count, extent as u64))
     }
 
-    fn matmul_cost(&self, allocation: MetalAllocationFacts) -> FactResult<u64> {
+    fn matmul_cost(&self, allocation: NativeAllocationFacts) -> FactResult<u64> {
         self.matmul_cost_with_compaction(allocation, true)
     }
 
     fn matmul_cost_with_compaction(
         &self,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
         copy_right: bool,
     ) -> FactResult<u64> {
         let result = capacity(allocation, self.output_elements()?)?;

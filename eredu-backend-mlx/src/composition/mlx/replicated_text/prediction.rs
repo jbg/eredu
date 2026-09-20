@@ -1371,7 +1371,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     /// fence. No legacy source construction is allowed on this counted route.
     fn prepared_layerwise_workspace(
         &self,
-        _allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        _allocation: crate::backend::nn::workspace::NativeAllocationFacts,
         _context: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         Err(Error::PrefillControl(
@@ -2074,7 +2074,7 @@ pub(crate) trait ErasedReplicatedTextExecutable {
     /// Exact selected bounded window, without submission or materialization.
     fn layerwise_workspace(
         &self,
-        _allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        _allocation: crate::backend::nn::workspace::NativeAllocationFacts,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         Err(Error::Other(Box::new(
             eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,

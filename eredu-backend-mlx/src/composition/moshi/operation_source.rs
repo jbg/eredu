@@ -5,24 +5,24 @@ use crate::backend::{error::Error,nn::workspace::SpeculativeNumericalRecipe,
     submission_recovery::native_role::realtime::RealtimeOperationClaim};
 use eredu_nn::workspace::{WorkspaceContext,WorkspaceMetadataError,HostMetadataFunding};
 use std::mem::{size_of,size_of_val};
-use crate::backend::nn::workspace::MetalAllocationFacts;
+use crate::backend::nn::workspace::NativeAllocationFacts;
 use eredu_runtime::working_memory::{WorkingMemoryPool,OriginalHostSourceBank,HostSourceConstructionFacts};
 use safemlx::Stream;
 
 /// Actual selected policies supply their own immutable layout and install slot.
 /// The generic parallel wrapper delegates without reconstructing family state.
 pub(super) trait RealtimeOperationPolicy<U:'static> {
-    fn realtime_operation_plan(&self,stream:&Stream,allocation:MetalAllocationFacts,
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:NativeAllocationFacts,
         pool:&WorkingMemoryPool,context:&WorkspaceContext)->Result<RealtimeOperationPlan,Error>;
 }
 impl<U:'static> RealtimeOperationPolicy<U> for MlxResidentPolicy<U> {
-    fn realtime_operation_plan(&self,stream:&Stream,_allocation:MetalAllocationFacts,
+    fn realtime_operation_plan(&self,stream:&Stream,_allocation:NativeAllocationFacts,
         _pool:&WorkingMemoryPool,context:&WorkspaceContext)->Result<RealtimeOperationPlan,Error> {
         RealtimeOperationPlan::new(self.original_realtime_plan(stream,context)?,context)
     }
 }
 impl<U:'static> RealtimeOperationPolicy<U> for MlxLayerwisePolicy<U,()> {
-    fn realtime_operation_plan(&self,stream:&Stream,allocation:MetalAllocationFacts,
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:NativeAllocationFacts,
         pool:&WorkingMemoryPool,context:&WorkspaceContext)->Result<RealtimeOperationPlan,Error> {
         let source=self.layerwise_workspace_with_metadata(allocation,context)?;
         RealtimeOperationPlan::new_bounded(self.realtime_plan(source,stream,pool,context)?,context)

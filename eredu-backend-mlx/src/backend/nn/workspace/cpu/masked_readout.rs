@@ -2,7 +2,7 @@
 use super::*;
 use safemlx::Dtype;
 #[derive(Clone,Copy)]
-struct Program { native:CpuPopulation, bytes:u64, allocation:MetalAllocationFacts }
+struct Program { native:CpuPopulation, bytes:u64, allocation:NativeAllocationFacts }
 impl Program {
     fn physical(&mut self,elements:usize,births:usize)->Option<()> {
         if births==0 {return Some(());}

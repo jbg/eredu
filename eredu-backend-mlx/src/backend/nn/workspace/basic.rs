@@ -165,7 +165,7 @@ pub(super) fn host_transfer_dtype(operation: WorkspaceOperationView<'_>) -> Opti
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary_with(
         |sink| emit(operation.as_view(), allocation, sink),
@@ -175,7 +175,7 @@ pub(super) fn operation_bound(
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     use WorkspaceOperationKindView as Kind;
@@ -841,7 +841,7 @@ fn parameter_placeholder_output(
 /// Broadcast/Full graph, which strict parameter binding replaces before Eval.
 pub(super) fn emit_parameter_placeholder(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<WorkspaceOperationFacts> {
     let output = parameter_placeholder_output(operation)?;
@@ -887,7 +887,7 @@ pub(super) fn check_pointwise_shape(operation: WorkspaceOperationView<'_>) -> Fa
 }
 fn pointwise(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     buffers: u64,
     scalars: u64,
     sink: &mut Emitter<'_>,
@@ -935,7 +935,7 @@ fn pointwise(
 }
 fn one(
     sink: &mut Emitter<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     output: Output<'_>,
     scratch: u64,
     equation: std::fmt::Arguments<'_>,

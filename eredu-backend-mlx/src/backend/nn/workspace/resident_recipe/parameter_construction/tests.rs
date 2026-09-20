@@ -17,7 +17,7 @@ use std::{collections::BTreeMap, sync::Arc};
 fn source(
     device: DeviceType,
     context: &WorkspaceContext,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> (tempfile::TempDir, LayerwiseWorkspace) {
     source_with_constructors(device, context, allocation, false, false)
 }
@@ -25,7 +25,7 @@ fn source(
 fn source_with_constructors(
     device: DeviceType,
     context: &WorkspaceContext,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     independent: bool,
     complete: bool,
 ) -> (tempfile::TempDir, LayerwiseWorkspace) {

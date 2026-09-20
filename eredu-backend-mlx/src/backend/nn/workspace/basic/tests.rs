@@ -115,7 +115,7 @@ fn equation<B: NeuralBackend>(
 }
 fn mechanisms() -> MlxMetalWorkspaceMechanisms {
     MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 16384 },
+        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
         sdpa_blocks: None,
     }
 }
@@ -266,7 +266,12 @@ fn common_equations_have_cold_bounds_and_views_preserve_paid_roots() {
     for shape in [[1, 1], [7, 13], [65, 257]] {
         for case in cases() {
             let context = WorkspaceContext::new(mechanisms());
-            let layout = WorkspaceLayout::new(&shape, WorkspaceDtype::Float32).unwrap();
+            let layout = WorkspaceLayout::new(&shape, WorkspaceDtype::Float32)
+                .unwrap()
+                .with_representation(Some(WorkspaceRepresentation::new(
+                    WorkspaceFloatingType::Float32,
+                    true,
+                )));
             let a = WorkspaceTensor::existing(layout.clone(), &context).unwrap();
             let b = WorkspaceTensor::existing(layout, &context).unwrap();
             let output = equation::<WorkspaceBackend>(case, a, b, &context).unwrap();
@@ -289,7 +294,7 @@ fn common_equations_have_cold_bounds_and_views_preserve_paid_roots() {
 fn unknown_and_wider_integer_operations_cannot_acquire_a_bound() {
     let float = WorkspaceLayout::new(&[3, 7], WorkspaceDtype::Float32).unwrap();
     let mut operation = WorkspaceOperation {
-        kind: WorkspaceOperationKind::Elementwise("masked_scatter"),
+        kind: WorkspaceOperationKind::Elementwise("unknown_test_operation"),
         inputs: vec![float.clone()],
         outputs: vec![float.clone()],
     };

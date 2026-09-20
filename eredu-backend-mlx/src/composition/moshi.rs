@@ -74,11 +74,11 @@ trait ErasedRealtimeExecutionContract {
     fn parallel_communication(&self)->Option<(&crate::backend::MlxDistributedSession,eredu_core::CollectiveGroupId)> {None}
     fn collect_retained_module_storage(&self, storage: &mut crate::backend::runtime::residency::storage::RetainedStorage)
         -> Result<(), Error>;
-    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)
         ->Result<RealtimeOperationPlan,Error>;
 
-    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error>;
 
@@ -150,7 +150,7 @@ where
             RealtimeLayerwiseRuntime::Bounded(runtime) => runtime.visit_retained_values(visitor),
         }))
     }
-    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)
         ->Result<RealtimeOperationPlan,Error> {
         match self.execution.execution() {
@@ -158,7 +158,7 @@ where
             RealtimeLayerwiseRuntime::Bounded(runtime)=>runtime.policy().realtime_operation_plan(stream,allocation,pool,context),
         }
     }
-    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error> {
         match self.execution.execution() {
@@ -277,7 +277,7 @@ where
             eredu_runtime::LayerwiseTraversalRuntime::Partitioned(runtime) => runtime.traversal_executor().runtime().visit_retained_values(visitor),
         }))
     }
-    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)
         ->Result<RealtimeOperationPlan,Error> {
         match &self.execution {
@@ -290,7 +290,7 @@ where
             }
         }
     }
-    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error> {
         match &self.execution {
@@ -801,7 +801,7 @@ impl MlxRealtimeExecution {
     }
 
     pub(crate) fn with_workspace_frame(&self,
-        allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
         ->Result<(),Error> {
         self.ensure_healthy()?;
@@ -811,7 +811,7 @@ impl MlxRealtimeExecution {
     /// Retains the selected policy's actual operation slot and stream source.
     /// This descriptive plan grants no frame occurrence or native submission.
     pub(crate) fn realtime_operation_plan(&self,stream:&Stream,
-        allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation:crate::backend::nn::workspace::NativeAllocationFacts,
         pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)->Result<RealtimeOperationPlan,Error> {
         self.ensure_healthy()?;
         self.validate_stream(stream)?;

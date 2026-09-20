@@ -4,7 +4,7 @@ use super::reduction::{capacity_fixed as capacity, sum_cost_fixed as sum_cost};
 use super::*;
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(op.as_view(), a, sink))
 }
@@ -46,7 +46,7 @@ pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<Geom
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let Some(Geometry { vocabulary, count, .. }) = geometry(op)? else { return Ok(None); };

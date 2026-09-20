@@ -5,7 +5,7 @@ use safemlx::{Device, DeviceType};
 #[test]
 fn direct_materialization_quote_requires_exact_binding_bytes_and_preserves_ordinary_gap() {
     let (_directory, store) = super::super::tests::fixture();
-    let allocation = MetalAllocationFacts::current_host().unwrap();
+    let allocation = NativeAllocationFacts::current_host().unwrap();
     let direct = WeightBinding::new("left", "left", TensorSelection::Full, 16).unwrap();
     let converted = WeightBinding::from_recipe(
         "converted",
@@ -38,7 +38,7 @@ fn metal_direct_materialization_batch_peaks_include_retained_sources_and_stream_
     use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
     let stream = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
     let execution = Stream::new_with_device(&Device::new(DeviceType::Gpu, 0));
-    let allocation = MetalAllocationFacts::current_host().unwrap();
+    let allocation = NativeAllocationFacts::current_host().unwrap();
     for positions in [37, 4097, 16385] {
         let directory = tempfile::tempdir().unwrap();
         let values = (0..positions)

@@ -17,7 +17,7 @@ fn operation(input: &[i32], mask: &[i32], source: &[i32]) -> WorkspaceOperation 
 #[test]
 fn masked_scatter_prices_copies_offsets_and_full_source_cast() {
     let mechanism = MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 4096 },
+        allocation: NativeAllocationFacts { page_size: 4096, cpu_header: false },
         sdpa_blocks: None,
     };
     let op = operation(&[1, 17, 16], &[1, 17], &[4, 16]);
@@ -56,7 +56,7 @@ fn masked_scatter_prices_copies_offsets_and_full_source_cast() {
 
 #[test]
 fn masked_scatter_rejects_bad_shapes_and_unrepresentable_metal_scan_domains() {
-    let allocation = MetalAllocationFacts { page_size: 4096 };
+    let allocation = NativeAllocationFacts { page_size: 4096, cpu_header: false };
     for op in [
         operation(&[1, 17, 16], &[17, 16], &[4, 16]),
         operation(&[1, 17, 16], &[1, 17], &[4, 15]),
@@ -79,7 +79,7 @@ fn masked_scatter_rejects_bad_shapes_and_unrepresentable_metal_scan_domains() {
 #[test]
 fn masked_scatter_scalar_follows_destination_cast_without_inventing_evidence() {
     let mechanism = MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 4096 }, sdpa_blocks: None,
+        allocation: NativeAllocationFacts { page_size: 4096, cpu_header: false }, sdpa_blocks: None,
     };
     for destination in [WorkspaceFloatingType::Float32, WorkspaceFloatingType::Float16, WorkspaceFloatingType::Bfloat16] {
         for source in [None, Some(WorkspaceFloatingType::Float32), Some(WorkspaceFloatingType::Float16), Some(WorkspaceFloatingType::Bfloat16)] {
@@ -104,7 +104,7 @@ fn native_masked_scatter_source_cast_matches_all_reported_destination_types() {
     use safemlx::{Array, Device, DeviceType, Dtype, Stream};
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     let mechanism = MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 4096 }, sdpa_blocks: None,
+        allocation: NativeAllocationFacts { page_size: 4096, cpu_header: false }, sdpa_blocks: None,
     };
     let formats = [(WorkspaceFloatingType::Float32, Dtype::Float32),
         (WorkspaceFloatingType::Float16, Dtype::Float16),

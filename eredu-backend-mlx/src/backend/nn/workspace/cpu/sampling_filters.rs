@@ -2,7 +2,7 @@
 use super::*;
 use safemlx::{CpuUnaryOperation,Dtype};
 
-struct Program { population:CpuPopulation, bytes:u64, seeds:usize, allocation:MetalAllocationFacts }
+struct Program { population:CpuPopulation, bytes:u64, seeds:usize, allocation:NativeAllocationFacts }
 impl Program {
     fn storage(&mut self,elements:usize,itemsize:u64,births:usize)->Option<()> {
         if births==0 {return Some(());}

@@ -7,7 +7,7 @@ use eredu_nn::{RotaryAlgorithm, RotaryArithmetic};
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary_with(
         |sink| emit(operation.as_view(), allocation, sink),
@@ -31,7 +31,7 @@ pub(super) fn ordinary_error(
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     use WorkspaceOperationKindView as K;
@@ -263,7 +263,7 @@ fn fused_cost(
     matrix_elements: u64,
     frequencies: bool,
     half_dims: u64,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> FactResult<u64> {
     // The native dispatcher forms T*D and (N+3) in signed native integers,
     // including when its element-addressing kernel uses 64-bit offsets.

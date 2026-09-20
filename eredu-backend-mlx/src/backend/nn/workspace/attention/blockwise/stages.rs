@@ -5,7 +5,7 @@ use eredu_nn::operation_geometry::AbsoluteAttentionMaskGeometry;
 
 pub(super) fn mask_bytes(
     g: AbsoluteAttentionMaskGeometry,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> FactResult<u64> {
     let queries = capacity(a, g.queries() as u64)?;
     let keys = capacity(a, g.keys() as u64)?;
@@ -29,7 +29,7 @@ pub(super) fn mask_bytes(
 }
 pub(in crate::backend::nn::workspace::attention) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let Some(Descriptor { policy, stage }) = descriptor::decode(operation)? else {

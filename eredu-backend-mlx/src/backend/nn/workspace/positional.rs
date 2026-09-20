@@ -14,13 +14,13 @@ fn count(shape: &[i32]) -> FactResult<u64> {
         .iter()
         .try_fold(1, |n, d| mul(n, u64::try_from(*d).map_err(|_| invalid())?))
 }
-fn wide(a: MetalAllocationFacts, n: u64) -> FactResult<u64> {
+fn wide(a: NativeAllocationFacts, n: u64) -> FactResult<u64> {
     buffer_capacity(a, mul(n.max(1), 8)?)
 }
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary_with(
         |sink| emit(op.as_view(), a, sink),
@@ -36,7 +36,7 @@ pub(super) fn operation_bound(
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     match &op.kind {
@@ -115,7 +115,7 @@ pub(super) fn relative_geometry(op: WorkspaceOperationView<'_>) -> FactResult<Op
 
 fn relative(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let Some(g) = relative_geometry(op)? else { return Ok(None); };
@@ -232,7 +232,7 @@ fn rotary_geometry(op: WorkspaceOperationView<'_>, spec: MultiAxisRotarySpecRef<
 
 fn rotary(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     spec: MultiAxisRotarySpecRef<'_>,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {

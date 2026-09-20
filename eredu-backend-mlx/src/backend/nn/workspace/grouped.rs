@@ -22,12 +22,12 @@ fn invalid() -> MlxWorkspaceFactError {
 
 #[derive(Clone, Copy)]
 struct Cost {
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     tensor: u64,
     host: u64,
 }
 impl Cost {
-    fn new(a: MetalAllocationFacts) -> Self {
+    fn new(a: NativeAllocationFacts) -> Self {
         Self {
             a,
             tensor: 0,
@@ -181,7 +181,7 @@ impl<'a> Bank<'a> {
             }
         }))
     }
-    fn activate(&self, routes: u64, a: MetalAllocationFacts) -> FactResult<Option<Cost>> {
+    fn activate(&self, routes: u64, a: NativeAllocationFacts) -> FactResult<Option<Cost>> {
         let mut cost = Cost::new(a);
         let n = mul(routes, self.units as u64)?;
         match self.activation {
@@ -227,7 +227,7 @@ impl<'a> Bank<'a> {
 
 pub(super) fn bounds(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<(WorkspaceOperationBound, u64)>, Error> {
     let mut host = 0;
     let tensor = facts::ordinary_with(
@@ -265,7 +265,7 @@ pub(super) fn ordinary_error(op: &WorkspaceOperation, error: MlxWorkspaceFactErr
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<(WorkspaceOperationFacts, u64)>> {
     let WorkspaceOperationKindView::Grouped {

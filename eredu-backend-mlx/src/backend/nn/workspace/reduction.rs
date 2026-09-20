@@ -7,14 +7,14 @@ use super::*;
 
 pub(super) fn operation_bound(
     operation: &WorkspaceOperation,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(operation.as_view(), allocation, sink))
 }
 
 pub(super) fn emit(
     operation: WorkspaceOperationView<'_>,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     use facts::{add, mul};
@@ -106,18 +106,18 @@ pub(super) fn emit(
 
 /// Capacity of an at-most-F32 tensor, including a possible scalar backing for
 /// an empty broadcast and Metal reduction's minimum four-byte output buffer.
-pub(super) fn capacity(allocation: MetalAllocationFacts, elements: u64) -> Result<u64, Error> {
+pub(super) fn capacity(allocation: NativeAllocationFacts, elements: u64) -> Result<u64, Error> {
     capacity_fixed(allocation, elements).map_err(MlxWorkspaceFactError::ordinary)
 }
 
-pub(super) fn capacity_fixed(allocation: MetalAllocationFacts, elements: u64) -> FactResult<u64> {
+pub(super) fn capacity_fixed(allocation: NativeAllocationFacts, elements: u64) -> FactResult<u64> {
     facts::buffer_capacity(allocation, facts::mul(elements.max(1), 4)?)
 }
 
 /// All new buffers for one sum, including its result. This also bounds the
 /// same Reduce worker for a floating minimum/maximum, or the accumulation part of a mean or norm. Callers price subsequent arithmetic.
 pub(super) fn sum_cost(
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     input_elements: u64,
     output_elements: u64,
     reduction_extent: u64,
@@ -132,7 +132,7 @@ pub(super) fn sum_cost(
 }
 
 pub(super) fn sum_cost_fixed(
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     input_elements: u64,
     output_elements: u64,
     reduction_extent: u64,

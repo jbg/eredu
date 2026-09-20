@@ -80,7 +80,7 @@ fn floating(op: &WorkspaceOperationView<'_>) -> bool {
 }
 fn finish(
     op: &WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     total: u64,
     detail: &'static str,
     sink: &mut Emitter<'_>,
@@ -102,7 +102,7 @@ fn finish(
 }
 
 /// Hyper preparation always widens before its unfused weightless RMS equation.
-fn prepare(a: MetalAllocationFacts, shape: [i32; 4]) -> FactResult<u64> {
+fn prepare(a: NativeAllocationFacts, shape: [i32; 4]) -> FactResult<u64> {
     let [b, t, s, h] = shape;
     // Dense frontend flattening uses an I32 leading extent.
     let rows = times(b, t)? as u64;
@@ -118,7 +118,7 @@ fn prepare(a: MetalAllocationFacts, shape: [i32; 4]) -> FactResult<u64> {
 
 pub(super) fn operation_bound(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<WorkspaceOperationBound>, Error> {
     facts::ordinary(|sink| emit(op.as_view(), a, sink))
 }
@@ -210,7 +210,7 @@ pub(super) fn geometry(op: WorkspaceOperationView<'_>) -> FactResult<Option<Geom
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<WorkspaceOperationFacts>> {
     let Some(geometry) = geometry(op)? else {

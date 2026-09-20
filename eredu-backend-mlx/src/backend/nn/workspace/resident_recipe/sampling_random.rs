@@ -107,7 +107,7 @@ pub(super) fn is_eager_key_trace(report: &WorkspaceTraceReport) -> bool {
 /// Only this observed constructor is eager and issues no native evaluation.
 pub(super) fn eager_preparation(
     report: &WorkspaceTraceReport,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> Result<Option<(CertifiedSpanStorage, safemlx::ResidentGraphLayout, usize)>, Error> {
     if !is_eager_key_trace(report) {
         return Ok(None);

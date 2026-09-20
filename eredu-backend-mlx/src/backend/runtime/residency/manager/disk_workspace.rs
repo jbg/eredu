@@ -16,7 +16,7 @@ use safemlx::{Array, ArrayAllocationInfo, Dtype, Stream};
 
 use super::{ManagerWeak, ResidencyError, ResidencyManager, transfer::ManagerState};
 use crate::backend::{
-    nn::workspace::MetalAllocationFacts,
+    nn::workspace::NativeAllocationFacts,
     runtime::checkpoint::recipe::{PreparedDirectReadError, PreparedDirectReadPlan},
 };
 
@@ -385,7 +385,7 @@ impl DiskCopyUnit {
 #[derive(Debug, Clone)]
 pub(crate) struct DiskCopyWorkspace {
     plans: PreparedDiskReadPlans,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
     units: Vec<DiskCopyUnit>,
     fresh_capacity_bytes: u64,
     current_device_bytes: u64,
@@ -552,7 +552,7 @@ impl ResidencyManager {
     pub(crate) fn disk_copy_workspace(
         &self,
         plans: &PreparedDiskReadPlans,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
     ) -> Result<DiskCopyWorkspace, DiskCopyWorkspaceError> {
         let state = self
             .inner
@@ -565,7 +565,7 @@ impl ResidencyManager {
     fn disk_copy_workspace_locked(
         &self,
         plans: &PreparedDiskReadPlans,
-        allocation: MetalAllocationFacts,
+        allocation: NativeAllocationFacts,
         state: &ManagerState,
     ) -> Result<DiskCopyWorkspace, DiskCopyWorkspaceError> {
         plans.validate_locked(self, state)?;

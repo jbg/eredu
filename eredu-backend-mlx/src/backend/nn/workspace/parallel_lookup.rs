@@ -20,7 +20,7 @@ pub(super) fn embedding(operation:WorkspaceOperationView<'_>)->FactResult<Option
         inputs:operation.inputs,outputs:operation.outputs}))
 }
 
-pub(super) fn emit(operation:WorkspaceOperationView<'_>,allocation:MetalAllocationFacts,sink:&mut Emitter<'_>)
+pub(super) fn emit(operation:WorkspaceOperationView<'_>,allocation:NativeAllocationFacts,sink:&mut Emitter<'_>)
     ->FactResult<Option<WorkspaceOperationFacts>> {
     let Some(child)=embedding(operation)? else{return Ok(None);};
     let WorkspaceOperationKindView::VocabularyParallelLookup{format,policy,..}=operation.kind else{unreachable!()};

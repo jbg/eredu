@@ -10,7 +10,7 @@ pub(super) fn input_score_cost(
     mask: Mask,
     sinks: bool,
     cap: bool,
-    allocation: MetalAllocationFacts,
+    allocation: NativeAllocationFacts,
 ) -> FactResult<u64> {
     // This native path uses one query at a time when a complete key row is
     // larger than the input-score budget. The caller validates positive shapes.
@@ -54,7 +54,7 @@ fn block_cost(
     mask: Mask,
     sinks: bool,
     cap: bool,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> FactResult<u64> {
     let (common, normalization, values) = block_costs(g, mask, sinks, cap, a, true, None, false)?;
     add(common, normalization.max(values))
@@ -65,7 +65,7 @@ fn block_costs(
     mask: Mask,
     sinks: bool,
     cap: bool,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     input_scores: bool,
     absolute: Option<eredu_nn::operation_geometry::AbsoluteAttentionMaskGeometry>,
     bias: bool,

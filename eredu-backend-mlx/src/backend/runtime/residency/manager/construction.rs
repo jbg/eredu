@@ -505,10 +505,10 @@ impl From<eredu_core::residency::ResidencyAdmissionPreparationError> for Constru
     }
 }
 fn original_allocation_facts()
--> Result<crate::backend::nn::workspace::MetalAllocationFacts, ResidencyError> {
+-> Result<crate::backend::nn::workspace::NativeAllocationFacts, ResidencyError> {
     #[cfg(target_vendor = "apple")]
     {
-        crate::backend::nn::workspace::MetalAllocationFacts::current_host()
+        crate::backend::nn::workspace::NativeAllocationFacts::current_host()
             .map_err(|_| ResidencyError::OriginalCache(WorkingMemoryError::UnknownBound))
     }
     #[cfg(not(target_vendor = "apple"))]

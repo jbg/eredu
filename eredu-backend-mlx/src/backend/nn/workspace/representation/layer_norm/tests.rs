@@ -82,7 +82,7 @@ fn layer_norm_preserves_exact_affine_roles_and_refuses_missing_sources() {
 #[test]
 fn layer_norm_then_projection_keeps_the_actual_collective_input_scalar() {
     let mechanism = MlxMetalWorkspaceMechanisms {
-        allocation: MetalAllocationFacts { page_size: 16384 },
+        allocation: NativeAllocationFacts { page_size: 16384, cpu_header: false },
         sdpa_blocks: None,
     };
     let context = WorkspaceContext::new(mechanism);

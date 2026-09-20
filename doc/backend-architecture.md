@@ -1278,6 +1278,15 @@ An unavailable native stream layout permits ordinary construction; a failure
 after admission propagates. Stream ownership alone does not establish complete
 workspace coverage for the selected allocator and operators.
 
+Cold workspace selection also supports CPU-only Apple builds. Allocation facts
+query the compiled allocator through the native public layout API, independently
+of the selected operator stream. CPU bounds include the size header and page
+rounding used by original allocations, plus ordinary cache reuse. Ordinary Metal
+bounds retain their own rounding rules; original Metal backing uses separately
+queried physical capacities. These buffer bounds do not cover allocator caches
+or establish a process-wide memory ceiling. CPU and Metal equations retain their
+respective mechanism dispatch, and missing operator facts still reject admission.
+
 Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
 selected checkpoint contract. Ordinary and admitted preparation share the same
 descriptor conversion, metadata comparison and provenance construction. Runtime

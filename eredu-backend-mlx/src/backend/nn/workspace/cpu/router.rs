@@ -174,7 +174,7 @@ fn geometry(op: WorkspaceOperationView<'_>) -> facts::FactResult<Option<Geometry
 
 fn storage(
     g: Geometry<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> facts::FactResult<([facts::Output<'static>; 3], u64)> {
     use facts::Output;
     let bytes = |width| a.fixed_buffer_capacity(facts::mul(g.rows as u64, width as u64 * 4)?);

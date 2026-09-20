@@ -1,6 +1,6 @@
 //! Cold inventory and the admitted clone of actual non-target manager rows.
 use super::*;
-use crate::backend::nn::workspace::MetalAllocationFacts;
+use crate::backend::nn::workspace::NativeAllocationFacts;
 use std::num::NonZeroUsize;
 
 pub(super) struct SupplementarySourcePlan {
@@ -84,7 +84,7 @@ impl SupplementarySourcePlan {
             size_of::<Option<HostCopyWorkspace>>(),
             size_of::<Result<HostCopyWorkspace, HostCopyWorkspaceError>>(),
             size_of::<SupplementaryResidencySource>(),
-            size_of::<MetalAllocationFacts>(),
+            size_of::<NativeAllocationFacts>(),
             size_of::<ManagerCustody>(),
         ] {
             add(control)?;

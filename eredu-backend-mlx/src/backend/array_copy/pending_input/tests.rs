@@ -549,9 +549,9 @@ fn pending_prefill_matrix_uses_complete_source_and_shared_copy_program() {
 #[test]
 fn cpu_pending_trace_prices_integer_scalar_and_complete_matrix_worker() {
     use crate::backend::nn::workspace::{
-        MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms, MetalAllocationFacts,
+        MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms, NativeAllocationFacts,
     };
-    let native = MetalAllocationFacts::current_host().unwrap();
+    let native = NativeAllocationFacts::current_host().unwrap();
     let selected = MlxCpuMatmulMechanism::select(
         eredu_nn::CpuMatmulImplementation::Float32Tiles,
     ).unwrap();

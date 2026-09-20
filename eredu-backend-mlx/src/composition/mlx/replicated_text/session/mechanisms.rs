@@ -97,7 +97,7 @@ where
     layerwise_workspace: Option<
         Box<
             dyn Fn(
-                crate::backend::nn::workspace::MetalAllocationFacts,
+                crate::backend::nn::workspace::NativeAllocationFacts,
             ) -> Result<
                 crate::backend::runtime::execution::generic::LayerwiseWorkspace,
                 Error,
@@ -275,7 +275,7 @@ where
 
     pub(super) fn layerwise_workspace(
         &self,
-        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        allocation: crate::backend::nn::workspace::NativeAllocationFacts,
     ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
         self.layerwise_workspace.as_ref().ok_or_else(|| {
             Error::Other(Box::new(

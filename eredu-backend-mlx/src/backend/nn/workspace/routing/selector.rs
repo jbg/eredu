@@ -20,7 +20,7 @@ struct Value {
     storage: Output<'static>,
 }
 struct Counter<'a> {
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     spec: &'a TopKGroupSelectorSpec,
     rows: u64,
     projection: WorkspaceOperationFacts,
@@ -342,7 +342,7 @@ fn allocated(storage: &Output<'_>) -> u64 {
 
 pub(super) fn bounds(
     op: &WorkspaceOperation,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
 ) -> Result<Option<(WorkspaceOperationBound, u64)>, Error> {
     let mut host = 0;
     let tensor = facts::ordinary_with(
@@ -433,7 +433,7 @@ pub(in super::super) fn with_projection<R>(
 
 pub(super) fn emit(
     op: WorkspaceOperationView<'_>,
-    a: MetalAllocationFacts,
+    a: NativeAllocationFacts,
     sink: &mut Emitter<'_>,
 ) -> FactResult<Option<(WorkspaceOperationFacts, u64)>> {
     let WorkspaceOperationKindView::GroupSelection {
