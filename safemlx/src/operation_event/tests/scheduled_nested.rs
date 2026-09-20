@@ -103,6 +103,75 @@ fn cpu_scheduled_host_roots_settle_before_bank_restore() {
     completed_host_roots(DeviceType::Cpu, &stream);
 }
 
+#[test]
+fn cpu_integer_host_copy_preserves_signed_and_unsigned_bits() {
+    for rank in 1..=4 {
+        for store in [false, true] {
+            for tracer in [false, true] {
+                let signed =
+                    OperationEvent::cpu_host_transfer_layout(Dtype::Int32, rank, store, tracer)
+                        .expect("signed integer host-copy worker");
+                let unsigned =
+                    OperationEvent::cpu_host_transfer_layout(Dtype::Uint32, rank, store, tracer)
+                        .expect("unsigned integer host-copy worker");
+                assert_eq!(signed, unsigned, "same-width General-copy storage");
+                assert_eq!(signed.backing_births(), usize::from(!store));
+            }
+        }
+    }
+    fn check<T: crate::ArrayElement + PartialEq + std::fmt::Debug>(expected: &[T], bytes: &[u8]) {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let _runtime = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
+        let mut source = HostTransferBuffer::new(
+            &[expected.len() as i32],
+            T::DTYPE,
+            HostTransferPolicy::Transfer,
+        )
+        .unwrap();
+        source.as_bytes_mut().unwrap().copy_from_slice(bytes);
+        let source = source.freeze();
+        let original = Original::new();
+        let observer = OriginalScopeObserver::require_current().unwrap();
+        let graph_before = original.graph.occupied_bytes();
+        let records_before = original._records.occupied_bytes();
+        let layout = OperationEvent::resident_graph_layout(1, 1, 1).unwrap();
+        let traversal = OperationEvent::eval_traversal_layout(OperationEvalTraversalLimits {
+            roots: 1,
+            arrays: 3,
+            tape_entries: 2,
+            input_edges: 2,
+            output_slots: 2,
+            streams: 1,
+            captures: OperationEvent::eval_record_layout(2, 1, 2)
+                .unwrap()
+                .capture_slots(),
+        })
+        .unwrap();
+        let mut graph = OperationEvent::prepare_resident_graph(layout, &observer).unwrap();
+        graph.configure_nested_completions(&traversal, 1).unwrap();
+        let (array, event) = source
+            .copy_to_array_in_original_scope(&stream, &observer)
+            .unwrap_or_else(|cause| panic!("integer host copy: {cause}; {cause:?}"));
+        event.synchronize().unwrap();
+        assert_eq!(
+            array
+                .completed_in_original_scope(&observer)
+                .unwrap()
+                .try_as_slice::<T>()
+                .unwrap(),
+            expected
+        );
+        crate::try_with_submission_retirement(|| drop((graph, array, event))).unwrap();
+        settle(&observer);
+        assert_eq!(original.graph.occupied_bytes(), graph_before);
+        assert_eq!(original._records.occupied_bytes(), records_before);
+    }
+    let signed = [i32::MIN, -3, 7, i32::MAX];
+    check(&signed, signed.map(i32::to_ne_bytes).as_flattened());
+    let unsigned = [0, 3, 0x8000_0000, u32::MAX];
+    check(&unsigned, unsigned.map(u32::to_ne_bytes).as_flattened());
+}
+
 #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
 #[test]
 fn metal_scheduled_host_roots_preserve_async_completion() {

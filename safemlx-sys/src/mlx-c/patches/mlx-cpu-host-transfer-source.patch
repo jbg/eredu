@@ -29,7 +29,7 @@ diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
 +// The optional Contiguous before store is a distinct ordinary Eval.
 +bool host_transfer_eval_layout(Dtype dtype,size_t rank,bool store,bool tracer,
 +    CopyEvalStorage& out) noexcept {
-+  if(rank==0||rank>4||(dtype!=float32&&dtype!=float16&&dtype!=bfloat16))return false;
++  if(rank==0||rank>4||(dtype!=float32&&dtype!=float16&&dtype!=bfloat16&&dtype!=uint32&&dtype!=int32))return false;
 +  CopyEvalStorage value;
 +  if(!copy_eval_layout(rank,1,true,tracer,value))return false;
 +  if(store)value.backing_births=0;
