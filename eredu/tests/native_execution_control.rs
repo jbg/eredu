@@ -38,19 +38,22 @@ impl<B: eredu_runtime::working_memory::OriginalChatBackend> SourceChatFixture fo
         policy: ChatTemplateRequest,
         capacity: u64,
     ) -> anyhow::Result<eredu::runtime::chat::PreparedChat> {
+        use anyhow::Context;
         let cancel = eredu_core::GenerationCancellationToken::new();
         let tokenizer =
-            self.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)?;
+            self.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+                .context("compile retained tokenizer source")?;
         let source = self
             .compile_managed_chat_source(
                 &tokenizer,
                 ChatSourceInput::RetainedConfiguration,
                 !policy.tools.is_empty(),
                 &cancel,
-            )?
+            ).context("compile retained chat source")?
             .expect("fixture preparation is not cancelled");
         Ok(self
-            .prepare_chat(&source, &policy, capacity, &cancel)?
+            .prepare_chat(&source, &policy, capacity, &cancel)
+            .context("prepare chat from retained sources")?
             .expect("fixture preparation is not cancelled"))
     }
 }
@@ -246,6 +249,52 @@ fn native_cpu_facade_restores_and_forks_sampled_partial_text_without_reopening_a
 )]
 fn native_cpu_controlled_text_restores_and_forks_without_semantic_support() {
     native_facade(LocalDevice::Cpu, true);
+}
+
+#[test]
+#[cfg_attr(feature = "metal", ignore = "run with --no-default-features --features mlx")]
+fn native_cpu_public_reset_preserves_prepared_sources_and_retained_outputs() {
+    for family in ["qwen2", "nanbeige"] {
+        let root = fixture(false);
+        use_family_weights(&root.0, family);
+        let execution = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap());
+        let (mut model, _) =
+            LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
+                .unwrap()
+                .into_parts();
+        // Resetting an unused model must still allow fresh managed sources.
+        model.reset().unwrap();
+        let chat = model.source_chat(ChatTemplateRequest {
+            messages: vec![serde_json::json!({"role":"user", "content":"left"})],
+            add_generation_prompt: true,
+            ..Default::default()
+        }).unwrap();
+        let settings = original_settings(PreparedChatGenerationSettings {
+            overrides: GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(4),
+                ..Default::default()
+            },
+            seed: 17,
+            ..Default::default()
+        });
+        let cancel = eredu_core::GenerationCancellationToken::new();
+        let mut outputs = Vec::new();
+        for _ in 0..3 {
+            let output = model
+                .start_prepared_chat(PreparedChatRequest::new(&chat, settings), &cancel)
+                .unwrap().unwrap()
+                .run(&cancel, &mut |_| {})
+                .unwrap();
+            assert!(!output.token_ids().is_empty());
+            outputs.push(output);
+            assert_eq!(outputs.last().unwrap().token_ids(), outputs[0].token_ids());
+            // The source and every previous output keep their own reservations.
+            model.reset().unwrap();
+        }
+        model.compile_managed_plain_text_source(TokenizerSourceInput::RetainedConfiguration)
+            .unwrap();
+    }
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]

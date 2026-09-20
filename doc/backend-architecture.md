@@ -890,6 +890,16 @@ geometry and cannot create another prediction. See [execution control](execution
 [bounded capture](bounded-capture.md), [interventions](interventions.md) and
 [component analysis](component-analysis.md).
 
+Synchronized public reset passes a move-only core claim for the current session
+to the backend. It adds no per-operation ceiling; existing resource-domain and
+live-account ceilings still apply. MLX sessions with quoted resident KV or hybrid
+state use the same source-bound reset constructor and publication as explicit
+admitted reset. Tokenizer sources and completed outputs retain their independent
+charges across reset. Unquoted native sessions retain their existing allocation
+authority; a reset does not convert or revoke that authority. Embedded prediction
+state has no whole-state admitted reset profile and retains its ordinary reset
+path.
+
 Saved-array and pending-input copy admission selects native resource requirements
 from the retained execution stream. CPU copies use the shared CPU copy worker
 without requiring the Metal feature, with no GPU pipeline lookups. Source

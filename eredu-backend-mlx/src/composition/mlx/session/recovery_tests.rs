@@ -395,6 +395,18 @@ fn native_session(backend: &super::MlxBackend<'_>) -> (tempfile::TempDir, super:
     (artifact, session)
 }
 
+fn native_runtime<'a>(
+    backend: &'a super::MlxBackend<'_>,
+) -> (tempfile::TempDir, eredu_core::ModelRuntime<super::MlxBackend<'a>>) {
+    let artifact = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
+    let model =
+        eredu_core::load_model(backend, artifact.path(), crate::MlxLoadRequest::default()).unwrap();
+    let execution = super::MlxBackend::new(backend.stream(), backend.weights_stream())
+        .with_memory_pool(backend.memory_pool().clone());
+    let runtime = eredu_core::ModelRuntime::from_prepared(execution, model).unwrap();
+    (artifact, runtime)
+}
+
 #[test]
 fn closed_session_payload_preserves_identity_exclusivity_and_active_retirement() {
     use crate::backend::ordinary_retirement;
@@ -439,10 +451,12 @@ fn closed_session_payload_preserves_identity_exclusivity_and_active_retirement()
 fn restored_execution_error_excludes_reuse_until_native_retirement() {
     use eredu_core::Completion as _;
     let stream = crate::test_stream();
-    let backend = super::MlxBackend::new(stream, stream);
-    let (_artifact, mut session) = native_session(&backend);
+    let backend = super::MlxBackend::new(stream, stream).with_memory_pool(
+        eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap(),
+    );
+    let (_artifact, mut runtime) = native_runtime(&backend);
     let native = Rc::new(Cell::new(status(false, false, false)));
-    let error = session
+    let error = runtime.session_mut()
         .test_failed_operation(
             FakeProbe(Rc::clone(&native)),
             super::Error::after_model_call("restored model failure", Some(1), Some(2)),
@@ -452,7 +466,7 @@ fn restored_execution_error_excludes_reuse_until_native_retirement() {
     assert!(error.model_state_preserved());
 
     let entered = Cell::new(false);
-    let pending = session
+    let pending = runtime.session_mut()
         .with_model_operation(|_| {
             entered.set(true);
             Ok(())
@@ -463,23 +477,23 @@ fn restored_execution_error_excludes_reuse_until_native_retirement() {
         "pending recovery must exclude model mutation"
     );
     assert!(!pending.to_string().contains("fenced"));
-    assert!(session.reset().is_err());
+    assert!(runtime.session_mut().reset().is_err());
     for error in [
-        super::MlxBackend::synchronize_session(&backend, &session).unwrap_err(),
-        super::MlxBackend::reset_session(&backend, &mut session).unwrap_err(),
+        runtime.synchronize().unwrap_err(),
+        runtime.reset().unwrap_err(),
     ] {
         assert_eq!(error.kind(), eredu_core::BackendFailureKind::Busy);
         assert!(std::error::Error::source(&error)
             .unwrap()
             .is::<super::Error>());
     }
-    assert!(session.submit_token_decode(&backend, 2).is_err());
+    assert!(runtime.session_mut().submit_token_decode(&backend, 2).is_err());
 
     native.set(status(true, false, false));
-    recovery::wait_for_retirement(|| session.ensure_no_submission_in_flight().is_ok());
-    super::MlxBackend::synchronize_session(&backend, &session).unwrap();
-    super::MlxBackend::reset_session(&backend, &mut session).unwrap();
-    session
+    recovery::wait_for_retirement(|| runtime.session_mut().ensure_no_submission_in_flight().is_ok());
+    runtime.synchronize().unwrap();
+    runtime.reset().unwrap();
+    runtime.session_mut()
         .submit_token_decode(&backend, 2)
         .unwrap()
         .completion
@@ -490,15 +504,17 @@ fn restored_execution_error_excludes_reuse_until_native_retirement() {
 #[test]
 fn restored_execution_error_keeps_late_native_failure_terminal() {
     let stream = crate::test_stream();
-    let backend = super::MlxBackend::new(stream, stream);
+    let backend = super::MlxBackend::new(stream, stream).with_memory_pool(
+        eredu_runtime::working_memory::WorkingMemoryPool::new(u64::MAX, 0).unwrap(),
+    );
     for failed in [
         status(false, true, false),
         status(false, false, true),
         status(true, true, false),
     ] {
-        let (_artifact, mut session) = native_session(&backend);
+        let (_artifact, mut runtime) = native_runtime(&backend);
         let native = Rc::new(Cell::new(status(false, false, false)));
-        assert!(session
+        assert!(runtime.session_mut()
             .test_failed_operation(
                 FakeProbe(Rc::clone(&native)),
                 super::Error::after_model_call("restored model failure", Some(1), Some(2)),
@@ -508,28 +524,28 @@ fn restored_execution_error_keeps_late_native_failure_terminal() {
             .model_state_preserved());
         native.set(failed);
         recovery::wait_for_retirement(|| {
-            session
+            runtime.session_mut()
                 .ensure_no_submission_in_flight()
                 .unwrap_err()
                 .to_string()
                 .contains("fenced")
         });
         native.set(status(true, false, false));
-        recovery::wait_for_retirement(|| session.test_payload_owner_count() == 1);
-        assert!(session.reset().unwrap_err().to_string().contains("fenced"));
+        recovery::wait_for_retirement(|| runtime.session_mut().test_payload_owner_count() == 1);
+        assert!(runtime.session_mut().reset().unwrap_err().to_string().contains("fenced"));
         assert_eq!(
-            super::MlxBackend::synchronize_session(&backend, &session)
+            runtime.synchronize()
                 .unwrap_err()
                 .kind(),
             eredu_core::BackendFailureKind::InvalidSession,
         );
         assert_eq!(
-            super::MlxBackend::reset_session(&backend, &mut session)
+            runtime.reset()
                 .unwrap_err()
                 .kind(),
             eredu_core::BackendFailureKind::InvalidSession,
         );
-        assert!(session.submit_token_decode(&backend, 2).is_err());
+        assert!(runtime.session_mut().submit_token_decode(&backend, 2).is_err());
     }
 }
 
@@ -624,12 +640,20 @@ fn deferred_capture_admission_failure_allows_native_session_reuse_after_settleme
         points: vec![],
         capture: CaptureCapabilities::default(),
     };
+    // Even an empty observed step retains its immutable receipt envelope.
+    let frame = CaptureUsage {
+        host_bytes: PreparedCapturedStep::retained_control_bytes::<
+            eredu_core::HostPreparationAuthority,
+        >()
+        .unwrap(),
+        ..Default::default()
+    };
     let plan = CapturePlan {
         schema_version: 1,
         selections: vec![],
         limits: CaptureLimits {
-            per_step: CaptureUsage::default(),
-            cumulative: CaptureUsage::default(),
+            per_step: frame,
+            cumulative: frame,
             physical_native_bytes: None,
             on_limit: CaptureLimitPolicy::Fail,
         },

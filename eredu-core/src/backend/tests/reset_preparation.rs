@@ -140,8 +140,17 @@ impl<const MODE: u8> TextGenerationBackend for ResetBackend<MODE> {
     ) -> Result<(), BackendFailure> {
         Ok(())
     }
-    fn reset_session(backend: &Self, session: &mut ResetSession) -> Result<(), BackendFailure> {
+    fn reset_session(
+        backend: &Self,
+        session: &mut ResetSession,
+        claim: crate::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         backend.0.note("ordinary_reset");
+        claim.validate_session(session).unwrap();
+        claim
+            .validate_capabilities(<ResetSession as BackendSession<Self>>::capabilities(session))
+            .unwrap();
+        assert_eq!(claim.limits(), crate::SessionResetLimits::new(u64::MAX));
         session.state = 0;
         Ok(())
     }

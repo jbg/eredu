@@ -3858,13 +3858,25 @@ impl<'a> TextGenerationBackend for MlxBackend<'a> {
         }
     }
 
-    fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
+    fn reset_session(
+        backend: &Self,
+        session: &mut Self::Session,
+        claim: eredu_core::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         session
             .validate_backend(backend)
             .map_err(|error| BackendFailure::new(BackendFailureKind::InvalidSession, error))?;
-        session
-            .reset_in(Some(backend.memory_pool()))
-            .map_err(|error| session.lifecycle_failure(error))
+        claim.validate_session(session).map_err(BackendFailure::from_error)?;
+        let quoted = session.payload._memory_owner.is_none()
+            && session.payload.operation_memory.borrow().owners().is_empty()
+            && session.payload.state_memory.owners().is_empty();
+        if quoted && session.payload.model.erased().resident_reset_profile().is_some() {
+            session.publish_prepared_resident_reset(backend.memory_pool(), claim)
+        } else {
+            session
+                .reset_in(Some(backend.memory_pool()))
+                .map_err(|error| session.lifecycle_failure(error))
+        }
     }
 
     // The production provider keeps the default rejection. This scoped fixture

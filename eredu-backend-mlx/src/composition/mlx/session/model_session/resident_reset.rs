@@ -220,7 +220,7 @@ impl MlxModelSession {
     /// the genuine core claim. Distributed readiness uses its paid, bounded
     /// coordinator; state construction/publication performs no native work or
     /// global housekeeping.
-    fn publish_prepared_resident_reset(
+    pub(super) fn publish_prepared_resident_reset(
         &mut self,
         pool: &WorkingMemoryPool,
         claim: eredu_core::SessionResetClaim<'_>,

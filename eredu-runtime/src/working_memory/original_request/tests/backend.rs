@@ -333,7 +333,11 @@ impl TextGenerationBackend for Backend {
     fn finish_text_step(permit: InferenceTextStep) -> Result<(), Self::Error> {
         permit.finish()
     }
-    fn reset_session(_: &Self, _: &mut Session) -> Result<(), BackendFailure> {
+    fn reset_session(
+        _: &Self,
+        _: &mut Session,
+        _claim: eredu_core::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         Ok(())
     }
     fn synchronize_session(_: &Self, _: &Session) -> Result<(), BackendFailure> {

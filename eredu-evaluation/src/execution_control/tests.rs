@@ -207,7 +207,11 @@ impl TextGenerationBackend for Host {
         Ok(())
     }
 
-    fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
+    fn reset_session(
+        _: &Self,
+        session: &mut Self::Session,
+        _claim: eredu_core::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         session.native = NativeState::default();
         Ok(())
     }

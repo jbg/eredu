@@ -729,6 +729,7 @@ impl TextGenerationBackend for MockBackend {
     fn reset_session(
         _: &Self,
         session: &mut Self::Session,
+        _claim: eredu_core::SessionResetClaim<'_>,
     ) -> Result<(), eredu_core::BackendFailure> {
         session.authority.require_idle()?;
         Ok(())

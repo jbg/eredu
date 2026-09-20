@@ -294,7 +294,11 @@ impl TextGenerationBackend for StatefulBackend {
         }
         Ok(result)
     }
-    fn reset_session(_: &Self, session: &mut Session) -> Result<(), BackendFailure> {
+    fn reset_session(
+        _: &Self,
+        session: &mut Session,
+        _claim: eredu_core::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         session.authority.require_idle()?;
         if session.state.fail_reset.get() {
             return Err(BackendFailure::new(

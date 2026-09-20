@@ -494,7 +494,11 @@ impl TextGenerationBackend for Backend {
             Status::Cancelled => Outcome::Cancelled,
         })
     }
-    fn reset_session(_: &Self, _: &mut Self::Session) -> Result<(), BackendFailure> {
+    fn reset_session(
+        _: &Self,
+        _: &mut Self::Session,
+        _claim: crate::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         Ok(())
     }
     fn synchronize_session(_: &Self, _: &Self::Session) -> Result<(), BackendFailure> {

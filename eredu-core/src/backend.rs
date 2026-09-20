@@ -1517,7 +1517,12 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
     /// preserved. Failure does not establish that the session can be reused.
     pub fn reset(&mut self) -> Result<(), BackendFailure> {
         self.synchronize()?;
-        B::reset_session(&self.backend, &mut self.session)
+        let claim = crate::SessionResetClaim::new(
+            &self.session,
+            &self.admission,
+            crate::SessionResetLimits::new(u64::MAX),
+        );
+        B::reset_session(&self.backend, &mut self.session, claim)
     }
 
     /// Requests an originally funded reset without implicitly waiting for prior work.
@@ -2569,8 +2574,15 @@ pub trait TextGenerationBackend: BackendProvider {
     /// parameters, model identity, selected placement and admitted capabilities.
     /// Any work submitted by reset itself must be settled before success. Never
     /// clear an unresolved submission lease or silently recover a poisoned session.
+    /// The claim identifies this synchronized session and permits source-bound
+    /// admission under the backend's existing domain limits, without an extra
+    /// per-operation ceiling. It grants no allocation or completion authority.
     /// Stateless backends must explicitly implement this as a no-op.
-    fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure>;
+    fn reset_session(
+        backend: &Self,
+        session: &mut Self::Session,
+        _claim: crate::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure>;
 
     /// Explicit original-reset opt-in. Validate the genuine claim against this
     /// exact session, bind selected source/geometry and admit all construction
@@ -4531,7 +4543,11 @@ mod tests {
         ) -> Result<(), BackendFailure> {
             Ok(())
         }
-        fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
+        fn reset_session(
+            _: &Self,
+            session: &mut Self::Session,
+            _claim: crate::SessionResetClaim<'_>,
+        ) -> Result<(), BackendFailure> {
             session.tokens.clear();
             Ok(())
         }

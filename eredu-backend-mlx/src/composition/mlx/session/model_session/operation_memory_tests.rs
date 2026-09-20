@@ -165,13 +165,12 @@ fn ordinary_reset_rejects_reserved_backend_domain_without_clearing_populated_sta
     settle(&runtime, &pool);
     let state = runtime.session().payload.model.erased().state_snapshot();
     assert!(state.iter().any(|(offset, _)| *offset > 0));
-    let backend = MlxBackend::new(&stream, &stream).with_memory_pool(pool.clone());
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
     let before = paths::snapshot();
     let resets = paths::session_reset_attempts();
-    assert_reserved(&MlxBackend::reset_session(&backend, runtime.session_mut()).unwrap_err());
+    assert_reserved(&runtime.reset().unwrap_err());
     assert_eq!(
         runtime.session().payload.model.erased().state_snapshot(),
         state

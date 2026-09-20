@@ -471,7 +471,11 @@ impl TextGenerationBackend for MockBackend {
         }
         Ok(result)
     }
-    fn reset_session(_: &Self, _: &mut Self::Session) -> Result<(), eredu_core::BackendFailure> {
+    fn reset_session(
+        _: &Self,
+        _: &mut Self::Session,
+        _claim: eredu_core::SessionResetClaim<'_>,
+    ) -> Result<(), eredu_core::BackendFailure> {
         Ok(())
     }
 

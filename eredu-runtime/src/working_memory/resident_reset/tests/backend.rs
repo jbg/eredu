@@ -78,7 +78,11 @@ impl TextGenerationBackend for Backend {
         backend.construct(session, claim)
     }
 
-    fn reset_session(_: &Self, _: &mut Session) -> Result<(), BackendFailure> {
+    fn reset_session(
+        _: &Self,
+        _: &mut Session,
+        _claim: eredu_core::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
         Ok(())
     }
     fn synchronize_session(_: &Self, _: &Session) -> Result<(), BackendFailure> {
