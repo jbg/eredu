@@ -642,6 +642,7 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                 let source = source.into();
                 let metadata_policy = eredu_runtime::working_memory::DependencyMemoryPolicy::default();
                 let conversion = admission::ColdConversion {
+                    destinations: None,
                     source: &source, plan: &plan, pool: &pool, resources: &resources, metadata_policy,
                 };
                 let metadata_bytes = WorkingMemoryPool::shared_native_initialization_required_bytes(&conversion).unwrap();
@@ -746,7 +747,7 @@ fn check_cold_metadata_refusals(
         [BoundedQuantizationTarget::direct("weight", "scales", Some("biases")).unwrap()],
     ).unwrap();
     let metadata_policy = DependencyMemoryPolicy::default();
-    let conversion = || admission::ColdConversion { source: &source, plan: &plan, pool, resources, metadata_policy };
+    let conversion = || admission::ColdConversion { destinations: None, source: &source, plan: &plan, pool, resources, metadata_policy };
     let required = WorkingMemoryPool::shared_native_initialization_required_bytes(&conversion()).unwrap();
     let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
     let refusal = admission::ColdConversion { pool: &short, ..conversion() }.prepare().unwrap_err();
@@ -778,6 +779,23 @@ fn check_cold_metadata_refusals(
     assert_eq!(pool.used_bytes().unwrap(), persistent + required);
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
     drop(failure);
+    assert_eq!(pool.used_bytes().unwrap(), persistent);
+
+    // Exact native destinations are checked after metadata admission but before
+    // output allocation or the first payload read.
+    let clean = Arc::new(MemoryWeightStore::from_safetensors([
+        ("weight".into(), SafeDtype::F32, vec![1, 32], vec![0; 128]),
+    ]).unwrap()).into();
+    let destinations = std::collections::BTreeMap::new();
+    let invalid = admission::ColdConversion {
+        source: &clean, destinations: Some(&destinations), ..conversion()
+    };
+    let required = WorkingMemoryPool::shared_native_initialization_required_bytes(&invalid).unwrap();
+    let error = invalid.prepare().unwrap_err();
+    assert!(error.to_string().contains("destination"), "{error}");
+    assert_eq!(pool.used_bytes().unwrap(), persistent + required);
+    assert_eq!(clean.source_diagnostics().unwrap().physical_reads, 0);
+    drop(error);
     assert_eq!(pool.used_bytes().unwrap(), persistent);
 }
 

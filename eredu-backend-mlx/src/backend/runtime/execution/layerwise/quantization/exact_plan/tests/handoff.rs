@@ -59,7 +59,7 @@ fn complete(
     stream: &safemlx::Stream,
 ) -> ConvertedQuantization {
     let slots = destinations(2, affine());
-    let prepared = prepare_exact_quantization_from_destinations(
+    let prepared = prepare_destinations(
         source.clone().into(),
         &[&slots],
         layout,

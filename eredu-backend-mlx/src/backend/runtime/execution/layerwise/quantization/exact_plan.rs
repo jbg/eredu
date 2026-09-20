@@ -1,19 +1,19 @@
 //! Shared exact-task planning from cold or native parameter-slot geometry.
 use super::*;
 use crate::backend::runtime::checkpoint::{
-    binding::mlx_workspace_binding_targets, bounded_quantization::ColdQuantization,
+    binding::mlx_workspace_binding_targets,
 };
 use eredu_runtime::ParameterBindingTarget;
 
 /// The source recipe and destination projection determine the same packed plan
 /// used by ordinary loading. No stream, native tensor or payload lease is created.
-pub(crate) fn prepare_exact_quantization_from_destinations(
-    store: RetainedCheckpointSource,
+pub(crate) fn plan_exact_quantization_from_destinations(
+    store: &RetainedCheckpointSource,
     modules: &[&BTreeMap<String, eredu_nn::workspace::WorkspaceLayout>],
     source_layout: Option<&eredu_runtime::LocalModelLayout>,
     quantization: WeightQuantization,
     tasks: &[&ReplicatedTextMaterializationTask],
-) -> Result<ColdQuantization, Error> {
+) -> Result<(BoundedQuantizationPlan, BTreeMap<String, ParameterBindingTarget>), Error> {
     let targets = modules
         .iter()
         .map(|module| {
@@ -22,10 +22,7 @@ pub(crate) fn prepare_exact_quantization_from_destinations(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (plan, destinations) = build(store.as_ref(), &targets, source_layout, quantization, tasks)?;
-    let cold = ColdQuantization::prepare(store, plan)?;
-    cold.validate_destinations(&destinations)?;
-    Ok(cold)
+    build(store.as_ref(), &targets, source_layout, quantization, tasks)
 }
 
 pub(super) fn build(

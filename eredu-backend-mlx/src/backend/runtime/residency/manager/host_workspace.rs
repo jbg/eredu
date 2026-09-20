@@ -619,8 +619,8 @@ fn add(left: u64, right: u64) -> Result<u64, HostCopyWorkspaceError> {
 impl ResidencyManager {
     /// Snapshots the exact initialized host bindings used by the native copy
     /// loop. No completion polling, recovery, payload reads, eviction, array
-    /// creation, or fallback materialization occurs. Only selected Metal copy
-    /// facts and immutable MetalShared/Transfer sources are accepted.
+    /// creation, or fallback materialization occurs. Sources must be immutable
+    /// Transfer buffers supported by the selected CPU or Metal copy worker.
     ///
     /// Alias names remain separate destination opportunities because
     /// `prepare_copy_to_device` calls `copy_to_array` for every stored name.
@@ -806,10 +806,12 @@ impl ResidencyManager {
                         })?
                 };
                 if metadata.policy() != HostTransferPolicy::Transfer
-                    || metadata.storage_kind() != HostTransferStorageKind::MetalShared
+                    || !(metadata.storage_kind() == HostTransferStorageKind::MetalShared
+                        || (destination.device_type() == safemlx::DeviceType::Cpu
+                            && metadata.storage_kind() == HostTransferStorageKind::Cpu))
                 {
                     return Err(HostCopyWorkspaceError::unknown(
-                        "host source is not MetalShared transfer storage",
+                        "host transfer storage is incompatible with the destination device",
                     ));
                 }
                 if !copy_shape_is_supported(destination.device_type(), metadata.shape()) {

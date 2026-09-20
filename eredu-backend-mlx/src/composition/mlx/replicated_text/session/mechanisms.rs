@@ -360,17 +360,24 @@ where
                 .map_err(|error| Error::Quantization(error.to_string()))?;
             #[cfg(test)]
             crate::tests::support::path_instrumentation::materialization();
-            let (store, report) = quantize_exact_replicated_text_tasks(
-                self.store.clone(),
-                source_static,
-                target_static,
-                source_units,
-                target_units,
-                source_layout,
-                group.quantization(),
-                &exact_tasks,
-                &self.stream,
-            )?;
+            let (store, report) = if let Some(manager) = &mut self.prepared_layerwise_manager {
+                crate::backend::runtime::execution::layerwise::adopt_exact_replicated_text_quantization(
+                    manager.take_conversion()?, self.store.clone(), source_static, target_static,
+                    source_units, target_units, source_layout, group.quantization(), &exact_tasks,
+                )?
+            } else {
+                quantize_exact_replicated_text_tasks(
+                    self.store.clone(),
+                    source_static,
+                    target_static,
+                    source_units,
+                    target_units,
+                    source_layout,
+                    group.quantization(),
+                    &exact_tasks,
+                    &self.stream,
+                )?
+            };
             self.store = store;
             combined.merge(report);
         }

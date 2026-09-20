@@ -1,4 +1,19 @@
 use super::*;
+use crate::backend::runtime::checkpoint::bounded_quantization::ColdQuantization;
+
+fn prepare_destinations(
+    store: RetainedCheckpointSource,
+    modules: &[&BTreeMap<String, eredu_nn::workspace::WorkspaceLayout>],
+    layout: Option<&eredu_runtime::LocalModelLayout>,
+    quantization: WeightQuantization,
+    tasks: &[&ReplicatedTextMaterializationTask],
+) -> Result<ColdQuantization, Error> {
+    let (plan, destinations) = plan_exact_quantization_from_destinations(&store, modules, layout, quantization, tasks)?;
+    let cold = ColdQuantization::prepare(store, plan)?;
+    cold.validate_destinations(&destinations)?;
+    Ok(cold)
+}
+
 use crate::backend::{nn::shared::MlxNeuralBackend, ExecutionContext};
 use eredu_checkpoint::{
     store::{
@@ -239,7 +254,7 @@ fn cold_plans_use_real_projection_slots_and_preserve_source_precision_without_re
                     expected_mx
                 }
             );
-            prepare_exact_quantization_from_destinations(
+            prepare_destinations(
                 source.into(),
                 &[&slots],
                 None,
@@ -291,7 +306,7 @@ fn cold_plan_checks_rank_local_geometry_and_complete_target_consumption() {
             .shape(),
         [2, 64]
     );
-    prepare_exact_quantization_from_destinations(
+    prepare_destinations(
         source.clone(),
         &[&slots],
         Some(&layout),
@@ -299,7 +314,7 @@ fn cold_plan_checks_rank_local_geometry_and_complete_target_consumption() {
         &[&task],
     )
     .unwrap();
-    let error = cold_failure(prepare_exact_quantization_from_destinations(
+    let error = cold_failure(prepare_destinations(
         source.clone(),
         &[&slots],
         None,
@@ -309,7 +324,7 @@ fn cold_plan_checks_rank_local_geometry_and_complete_target_consumption() {
     assert!(error
         .to_string()
         .contains("incompatible with selected destination"));
-    let error = cold_failure(prepare_exact_quantization_from_destinations(
+    let error = cold_failure(prepare_destinations(
         source.clone(),
         &[],
         Some(&layout),
@@ -317,7 +332,7 @@ fn cold_plan_checks_rank_local_geometry_and_complete_target_consumption() {
         &[&task],
     ));
     assert!(error.to_string().contains("not consumed exactly once"));
-    let error = cold_failure(prepare_exact_quantization_from_destinations(
+    let error = cold_failure(prepare_destinations(
         source,
         &[&slots, &slots],
         Some(&layout),
@@ -361,7 +376,7 @@ fn cold_plan_rejects_companion_shape_dtype_identity_and_format_mismatches() {
                 malformed.remove(name);
             }
         }
-        cold_failure(prepare_exact_quantization_from_destinations(
+        cold_failure(prepare_destinations(
             source.clone(),
             &[&malformed],
             None,
@@ -369,7 +384,7 @@ fn cold_plan_rejects_companion_shape_dtype_identity_and_format_mismatches() {
             &[&task],
         ));
     }
-    let error = cold_failure(prepare_exact_quantization_from_destinations(
+    let error = cold_failure(prepare_destinations(
         source.clone(),
         &[&slots],
         None,
@@ -377,7 +392,7 @@ fn cold_plan_rejects_companion_shape_dtype_identity_and_format_mismatches() {
         &[&task, &task],
     ));
     assert!(error.to_string().contains("requested more than once"));
-    let error = cold_failure(prepare_exact_quantization_from_destinations(
+    let error = cold_failure(prepare_destinations(
         source,
         &[&slots],
         None,
@@ -441,7 +456,7 @@ fn native_and_original_cold_paths_share_the_plan_and_preserve_native_source_chec
     .into();
     let task = task(2, StoredDtype::F32, affine());
     let slots = destinations(2, affine());
-    let cold = prepare_exact_quantization_from_destinations(
+    let cold = prepare_destinations(
         source.clone(),
         &[&slots],
         None,

@@ -2,7 +2,7 @@
 
 use super::*;
 mod exact_plan;
-pub(crate) use exact_plan::prepare_exact_quantization_from_destinations;
+pub(crate) use exact_plan::plan_exact_quantization_from_destinations;
 
 /// Architecture-declared identities and scalar format of packed companions.
 #[derive(Debug, Clone, Eq, PartialEq)]

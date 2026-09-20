@@ -124,9 +124,9 @@ enum Failure {
 
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
-pub(super) struct ResourceError(#[from] Failure);
+pub(crate) struct ResourceError(#[from] Failure);
 impl ResourceError {
-    pub(super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+    pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
         use eredu_core::BackendFailure;
         match self.0 {
             Failure::Policy(cause) => BackendFailure::from_error(cause),
@@ -168,9 +168,9 @@ impl From<MaterializationSourceWorkerError> for ResourceError {
 /// process lifetime. Dropping these wrappers cannot refund those native owners.
 /// Read/recipe metadata, cache/queue/output storage and per-tile work are separate.
 #[derive(Debug)]
-pub(super) struct CpuTileResources(InitializedSharedNative<Resources>);
+pub(crate) struct CpuTileResources(InitializedSharedNative<Resources>);
 impl CpuTileResources {
-    pub(super) fn prepare(pool: &WorkingMemoryPool) -> Result<Self, ResourceError> {
+    pub(crate) fn prepare(pool: &WorkingMemoryPool) -> Result<Self, ResourceError> {
         if !pool.same_domain(&managed_memory::domain()) {
             return Err(WorkingMemoryError::IdentityMismatch.into());
         }

@@ -67,3 +67,5 @@ use layout::allocator_cache_requires_clear;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use pipeline::{ColdConversion, CpuTileResources};

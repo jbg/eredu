@@ -11,15 +11,26 @@ use eredu_nn::workspace::{
 };
 use eredu_runtime::working_memory::WorkingMemoryPool;
 mod partitioned;
+mod conversion;
+#[cfg(test)]
+mod tests;
+use crate::backend::runtime::checkpoint::bounded_quantization::ConvertedQuantization;
 
 /// Move-only adoption of a manager born under its original source account.
-/// Cold planning maps are discarded; validation borrows the manager's funded
-/// declarations instead of retaining another unaccounted copy in this wrapper.
+/// Residency validation borrows the manager's funded declarations. Completed
+/// conversions retain their admitted plans until native construction adopts them.
 pub(crate) struct PreparedLayerwiseManager {
     manager: ResidencyManager,
+    conversions: std::vec::IntoIter<ConvertedQuantization>,
 }
 
 impl PreparedLayerwiseManager {
+    pub(crate) fn take_conversion(&mut self) -> Result<ConvertedQuantization, Error> {
+        self.conversions.next().ok_or_else(|| Error::Quantization(
+            "prepared residency has no remaining selected conversion".into(),
+        ))
+    }
+
     pub(crate) fn parameter_exclusions(&self, selected: &BTreeSet<String>)
         -> Result<super::super::MlxParameterExclusions, Error> {
         let source = self.manager.original_parameter_exclusions()
@@ -33,6 +44,9 @@ impl PreparedLayerwiseManager {
         source_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<ResidencyManager, Error> {
+        if !self.conversions.as_slice().is_empty() {
+            return Err(Error::Quantization("prepared residency has unconsumed conversions".into()));
+        }
         self.manager.validate_original_layerwise_preparation(
             &declarations.store,
             &declarations.sources,
@@ -93,18 +107,17 @@ fn prepare_selected_layerwise_manager(
         if options.samples_backend_memory() || options.samples_process_memory()) {
         return Ok(None);
     }
-    // Transforming payload producers must fund their own source and output
-    // construction; the direct ready-host reader cannot certify them.
-    if selected.materialization_tasks().iter().chain(selected.auxiliary_materialization_tasks()).any(|task| {
-        matches!(
-            task.lowering(),
-            eredu_runtime::WeightLoweringKind::Transform
-                | eredu_runtime::WeightLoweringKind::DerivedTransform
-        )
-    }) {
+    let transforms = |tasks: &[eredu_runtime::ReplicatedTextMaterializationTask]| tasks.iter().any(|task| {
+        matches!(task.lowering(), eredu_runtime::WeightLoweringKind::Transform
+            | eredu_runtime::WeightLoweringKind::DerivedTransform)
+    });
+    if transforms(selected.auxiliary_materialization_tasks()) {
         return Ok(None);
     }
     if sources.selected().execution().parallel_topology().is_some() {
+        if transforms(selected.materialization_tasks()) {
+            return Ok(None);
+        }
         return partitioned::prepare(sources,pool,source_stream,execution_stream);
     }
     let context = WorkspaceContext::new(DestinationFacts);
@@ -123,6 +136,11 @@ fn prepare_selected_layerwise_manager(
     let selected = contract.selected();
     let layout = selected.requirements().execution_units();
     let tasks = contract.materialization_tasks();
+    let modules = std::iter::once(projected.static_parameters()).chain(projected.units()).collect::<Vec<_>>();
+    let Some((store, conversions)) = conversion::prepare(
+        sources.target(), &modules, tasks, pool, execution_stream,
+    )? else { return Ok(None) };
+
     let partitions = eredu_runtime::plan_replicated_text_materialization_tasks(tasks, layout)
         .map_err(|cause| Error::ArchitectureModel(cause.to_string()))?;
     let static_tasks = partitions
@@ -145,7 +163,7 @@ fn prepare_selected_layerwise_manager(
         })?;
         eredu_runtime::build_exact_replicated_text_bindings_for_targets(
             &targets,
-            sources.target().as_ref(),
+            store.as_ref(),
             tasks,
             &addressable,
             None,
@@ -204,7 +222,7 @@ fn prepare_selected_layerwise_manager(
         });
     }
     let declarations = prepare_layerwise_declarations(
-        sources.target().clone(),
+        store,
         selected.residency(),
         |key| ignored.contains(key),
         layout,
@@ -215,8 +233,16 @@ fn prepare_selected_layerwise_manager(
     let constructors = projected.units().iter().map(ParameterConstructors::from_layouts)
         .collect::<Option<Vec<_>>>()
         .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Overflow))?;
-    prepare_manager_from_declarations(declarations, selected.residency(), layout, &addressable,
-        Some(&constructors), pool, source_stream, execution_stream)
+    let manager = prepare_manager_from_declarations(declarations, selected.residency(), layout, &addressable,
+        Some(&constructors), pool, source_stream, execution_stream)?;
+    match manager {
+        Some(mut manager) => {
+            manager.conversions = conversions.into_iter();
+            Ok(Some(manager))
+        }
+        None if conversions.is_empty() => Ok(None),
+        None => Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound)),
+    }
 }
 
 pub(crate) fn prepare_manager_from_declarations(
@@ -296,7 +322,7 @@ pub(crate) fn prepare_manager_from_declarations(
         _ => return Ok(None),
     }
     .map_err(|cause| Error::Other(Box::new(cause)))?;
-    Ok(manager.map(|manager| PreparedLayerwiseManager { manager }))
+    Ok(manager.map(|manager| PreparedLayerwiseManager { manager, conversions: Vec::new().into_iter() }))
 }
 
 /// Destination construction uses only geometry. This planner supplies no

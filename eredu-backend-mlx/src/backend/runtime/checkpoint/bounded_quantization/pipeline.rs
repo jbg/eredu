@@ -680,3 +680,5 @@ fn write_tile(
         .map_err(|cause| Error::Other(Box::new(cause)))?;
     Ok(())
 }
+
+pub(crate) use producer::{ColdConversion, CpuTileResources};

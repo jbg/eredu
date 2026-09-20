@@ -742,6 +742,23 @@ compares the retained plan and source, and returns that same overlay and report.
 Adoption reads metadata only. It neither requantizes the payload nor grants new
 storage admission; output buffers retain their original constructor custody.
 
+For replicated CPU affine loading, the source-prepared residency manager carries
+completed conversions in selected format-group order. Native construction consumes
+and validates each conversion before adopting its overlay; the manager refuses
+adoption if a conversion remains unconsumed. Conversion eligibility checks the
+complete encoded source/recipe selection and native accounting domain before
+creating native resources. Once
+conversion starts, resource, payload, or residency errors propagate with their
+typed causes; they cannot trigger ordinary requantization. Parallel, auxiliary,
+computational-recipe and other-device/format selections use ordinary construction
+when this producer cannot prepare the complete selection. Both routes retain the
+shared exact-task planner and bounded tile driver. Host-copy snapshots validate
+the actual storage kind against the destination: CPU transfer buffers are
+accepted for CPU workers, while MetalShared transfer storage retains its native
+copy qualification. Foreground disk rows use the allocator's exact single-buffer
+request geometry, including the CPU allocation header, for their retained copy
+capacity.
+
 Writable tensor buffers in `eredu-checkpoint` retain constructor custody before
 allocating their metadata and payload. Publication moves those bytes into the
 immutable memory store; leases, detached readers and weak storage identities

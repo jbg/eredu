@@ -12,16 +12,17 @@ use std::{cell::Cell, mem::size_of};
 
 /// Borrows declarations until admission. Source/header construction and the
 /// native resource owner have their own independent admission contracts.
-pub(super) struct ColdConversion<'a> {
-    pub(super) source: &'a RetainedCheckpointSource,
-    pub(super) plan: &'a BoundedQuantizationPlan,
-    pub(super) pool: &'a WorkingMemoryPool,
-    pub(super) resources: &'a cpu_resources::CpuTileResources,
-    pub(super) metadata_policy: DependencyMemoryPolicy,
+pub(crate) struct ColdConversion<'a> {
+    pub(crate) source: &'a RetainedCheckpointSource,
+    pub(crate) plan: &'a BoundedQuantizationPlan,
+    pub(crate) pool: &'a WorkingMemoryPool,
+    pub(crate) resources: &'a cpu_resources::CpuTileResources,
+    pub(crate) metadata_policy: DependencyMemoryPolicy,
+    pub(crate) destinations: Option<&'a std::collections::BTreeMap<String, eredu_runtime::ParameterBindingTarget>>,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum ConstructionError {
+pub(crate) enum ConstructionError {
     #[error("cold conversion resources: {0}")]
     Resources(#[source] cpu_resources::ResourceError),
     #[error("cold conversion preparation: {0}")]
@@ -66,7 +67,7 @@ impl RecipeSourceVisitor for MetadataInputs<'_> {
 }
 
 impl ColdConversion<'_> {
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         self,
     ) -> Result<
         ConvertedQuantization,
@@ -128,8 +129,11 @@ impl SharedNativeInitializer for ColdConversion<'_> {
         let prepared = super::super::super::preparation::ColdQuantization::prepare(
             self.source.clone(),
             self.plan.clone(),
-        )?
-        .allocate_original(
+        )?;
+        if let Some(destinations) = self.destinations {
+            prepared.validate_destinations(destinations)?;
+        }
+        let prepared = prepared.allocate_original(
             self.pool,
             self.metadata_policy,
             self.resources.streams()[0],

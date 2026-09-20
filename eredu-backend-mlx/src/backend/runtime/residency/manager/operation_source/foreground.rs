@@ -323,10 +323,9 @@ impl ForegroundDiskIdentity {
                     return Err(bad());
                 }
                 let bytes = metadata.byte_len();
-                let physical = safemlx::OriginalBufferBudget::metal_population_layout(
+                let physical = safemlx::OriginalBufferBudget::request_layout(
                     runtime,
                     usize::try_from(bytes).map_err(|_| overflow())?,
-                    usize::from(bytes != 0),
                 )
                 .map_err(OperationSourceFailure::Allocation)?;
                 let capacity = u64::try_from(physical.capacity()).map_err(|_| overflow())?;
@@ -416,7 +415,7 @@ impl ResidencyManager {
             return Err(WorkingMemoryError::IdentityMismatch);
         }
         let runtime = crate::backend::managed_memory::input_allocator::borrow_admitted(pool)?;
-        let query = safemlx::OriginalBufferBudget::metal_population_layout(&runtime, 0, 0)
+        let query = safemlx::OriginalBufferBudget::request_layout(&runtime, 0)
             .map_err(|_| WorkingMemoryError::UnknownBound)?;
         let rows = units
             .iter()

@@ -119,3 +119,6 @@ impl super::super::preparation::PreparedQuantization {
         )
     }
 }
+
+pub(crate) use admission::ColdConversion;
+pub(crate) use cpu_resources::CpuTileResources;
