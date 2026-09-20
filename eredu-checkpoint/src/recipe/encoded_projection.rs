@@ -249,6 +249,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
 pub(super) fn prepare(
     recipe: &DerivedWeightRecipe,
     source: &dyn CheckpointSource,
+    use_source_cache: bool,
 ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
     let mut keys = Vec::new();
     if !collect(recipe, &mut keys) {
@@ -289,7 +290,7 @@ pub(super) fn prepare(
         }
         Ok(Some((output, mapping)))
     }
-    let compiled = if source.recipe_cache().is_some() {
+    let compiled = if use_source_cache && source.recipe_cache().is_some() {
         compile(recipe, source, batch.tensors(), batch.byte_len())?
     } else {
         let catalog = Catalog(

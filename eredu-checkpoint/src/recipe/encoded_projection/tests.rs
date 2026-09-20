@@ -1,8 +1,8 @@
 use super::*;
 use crate::store::{EncodedTensorLease, ReadPolicy, SafetensorsWeightStore, TensorReadRequest};
 use safetensors::{
+    tensor::{serialize_to_file, TensorView},
     Dtype,
-    tensor::{TensorView, serialize_to_file},
 };
 
 type Recipe = DerivedWeightRecipe;
@@ -247,5 +247,165 @@ fn packed_row_projection_keeps_the_shared_byte_alignment_refusal() {
         source("packed", TensorSelection::Full),
     ]);
     assert!(joined.prepare_encoded_read(&store).unwrap().is_none());
+    assert_eq!(store.source_diagnostics().unwrap().physical_read_bytes, 0);
+}
+
+#[test]
+fn uncached_reads_preserve_bytes_and_leave_existing_source_cache_unchanged() {
+    use crate::store::MemoryWeightStore;
+    let (_directory, file, joined) = fixture();
+    let mut tensors = Vec::new();
+    for key in ["gate", "up", "interleaved"] {
+        let values = (0..2)
+            .flat_map(|expert| {
+                (0..3).flat_map(move |row| {
+                    let sides = match key {
+                        "gate" => 0..1,
+                        "up" => 1..2,
+                        _ => 0..2,
+                    };
+                    sides.flat_map(move |side| {
+                        (0..4).flat_map(move |column| {
+                            ((expert * 100 + side * 40 + row * 4 + column) as f32 + 0.125)
+                                .to_le_bytes()
+                        })
+                    })
+                })
+            })
+            .collect();
+        tensors.push((
+            key.into(),
+            Dtype::F32,
+            vec![2, if key == "interleaved" { 6 } else { 3 }, 4],
+            values,
+        ));
+    }
+    let memory = MemoryWeightStore::from_safetensors(tensors).unwrap();
+    for store in [&file as &dyn CheckpointSource, &memory] {
+        // Retain an existing unrelated inference entry; uncached preparation
+        // must neither add entries nor clear a cache owned by another caller.
+        source("gate", TensorSelection::Full).infer(store).unwrap();
+        let cache = store.recipe_cache().unwrap();
+        let entries = cache.entries.lock().unwrap().len();
+        assert!(entries > 0);
+        let validations = cache.validations.lock().unwrap().len();
+        let selected = selected_rows(vec![5, 1, 5]);
+        let expected_selected = (0..2)
+            .flat_map(|expert| {
+                [5, 1, 5].into_iter().flat_map(move |index| {
+                    (0..4).flat_map(move |column| {
+                        ((expert * 100 + (index % 2) * 40 + (index / 2) * 4 + column) as f32
+                            + 0.125)
+                            .to_le_bytes()
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected_gate = (0..2)
+            .flat_map(|expert| {
+                (0..12)
+                    .flat_map(move |offset| ((expert * 100 + offset) as f32 + 0.125).to_le_bytes())
+            })
+            .collect::<Vec<_>>();
+        let recipes = [
+            (
+                source("gate", TensorSelection::Full),
+                vec![2, 3, 4],
+                expected_gate.clone(),
+            ),
+            (
+                Recipe::Concatenate {
+                    axis: 0,
+                    inputs: vec![source("gate", TensorSelection::Full); 2],
+                },
+                vec![4, 3, 4],
+                expected_gate.repeat(2),
+            ),
+            (
+                concatenate(vec![
+                    source("gate", TensorSelection::Full),
+                    source("up", TensorSelection::Full),
+                ]),
+                vec![2, 6, 4],
+                joined.clone(),
+            ),
+            (selected.clone(), vec![2, 3, 4], expected_selected.clone()),
+            (
+                Recipe::Reshape {
+                    input: Box::new(selected),
+                    shape: vec![6, 4],
+                },
+                vec![6, 4],
+                expected_selected,
+            ),
+        ];
+        let before = store.source_diagnostics().unwrap().physical_read_bytes;
+        let reads = recipes
+            .iter()
+            .map(|(recipe, shape, expected)| {
+                let read = recipe
+                    .prepare_encoded_read_uncached(store)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(read.output().shape(), shape);
+                assert_eq!(read.output().dtype(), &RecipeDtype::F32);
+                assert_eq!(read.output().byte_len(), expected.len() as u64);
+                read
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            store.source_diagnostics().unwrap().physical_read_bytes,
+            before
+        );
+        for (read, (_, _, expected)) in reads.into_iter().zip(recipes) {
+            let mut output = vec![0; expected.len()];
+            read.read_into(&mut output).unwrap();
+            assert_eq!(output, expected);
+        }
+        assert_eq!(cache.entries.lock().unwrap().len(), entries);
+        assert_eq!(cache.validations.lock().unwrap().len(), validations);
+    }
+}
+
+#[test]
+fn uncached_read_preparation_does_not_depend_on_source_cache_health() {
+    let (_directory, store, _) = fixture();
+    let cache = CheckpointSource::recipe_cache(&store).unwrap();
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = cache.entries.lock().unwrap();
+        panic!("injected cache failure");
+    }));
+    assert!(poisoned.is_err());
+    let whole = source("gate", TensorSelection::Full);
+    assert!(whole.prepare_encoded_read(&store).is_err());
+    assert!(whole
+        .prepare_encoded_read_uncached(&store)
+        .unwrap()
+        .is_some());
+    assert!(selected_rows(vec![4, 0])
+        .prepare_encoded_read_uncached(&store)
+        .unwrap()
+        .is_some());
+    let conversion = Recipe::Cast {
+        input: Box::new(whole),
+        dtype: RecipeDtype::U32,
+    };
+    assert!(conversion
+        .prepare_encoded_read_uncached(&store)
+        .unwrap()
+        .is_none());
+    let invalid = selected_rows(vec![usize::MAX]);
+    assert!(matches!(
+        invalid.prepare_encoded_read_uncached(&store),
+        Err(RecipeError::InvalidIndices { .. })
+    ));
+    let invalid_permutation = Recipe::Transpose {
+        input: Box::new(source("gate", TensorSelection::Full)),
+        axes: vec![0, 0, 2],
+    };
+    assert!(matches!(
+        invalid_permutation.prepare_encoded_read_uncached(&store),
+        Err(RecipeError::InvalidPermutation { .. })
+    ));
     assert_eq!(store.source_diagnostics().unwrap().physical_read_bytes, 0);
 }

@@ -976,6 +976,29 @@ impl DerivedWeightRecipe {
         &self,
         source: &dyn CheckpointSource,
     ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
+        self.prepare_encoded_read_with_cache(source, true)
+    }
+
+    /// Compiles the same encoded ranges without consulting or growing the
+    /// source's persistent recipe-inference cache. Inference uses the exact
+    /// metadata retained by this read batch; temporary inference results retire
+    /// before return. The caller still owns admission for construction metadata,
+    /// the returned read and its later read scratch.
+    ///
+    /// This preserves the ordinary compiler's geometry, source validation and
+    /// unsupported-transform behavior. It does not read tensor payloads.
+    pub fn prepare_encoded_read_uncached(
+        &self,
+        source: &dyn CheckpointSource,
+    ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
+        self.prepare_encoded_read_with_cache(source, false)
+    }
+
+    fn prepare_encoded_read_with_cache(
+        &self,
+        source: &dyn CheckpointSource,
+        use_source_cache: bool,
+    ) -> Result<Option<EncodedRecipeRead>, RecipeError> {
         fn collect(recipe: &DerivedWeightRecipe, keys: &mut Vec<String>) -> bool {
             match recipe {
                 DerivedWeightRecipe::Source {
@@ -1039,7 +1062,7 @@ impl DerivedWeightRecipe {
         }
         let mut keys = Vec::new();
         if !collect(self, &mut keys) {
-            return encoded_projection::prepare(self, source);
+            return encoded_projection::prepare(self, source, use_source_cache);
         }
         let Some(batch) = source.prepare_encoded_read(&keys)? else {
             return Ok(None);
@@ -1053,7 +1076,7 @@ impl DerivedWeightRecipe {
                     .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
             }
         }
-        let output = if source.recipe_cache().is_some() {
+        let output = if use_source_cache && source.recipe_cache().is_some() {
             // Immutable sources bind read batches to the same admitted catalog.
             // Validate the whole recipe first, preserving ordinary left-to-right
             // error precedence before checking the byte-preserving subset.

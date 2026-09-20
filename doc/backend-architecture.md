@@ -822,6 +822,11 @@ slot within the role and returns their original failures. Earlier queued tiles
 retire independently when a later constructor fails, without publishing a partial
 converted store. Runtime, stream and retained read metadata funding remains a
 separate prerequisite of this constructor.
+Encoded recipe preparation also offers an uncached entry through the same
+contiguous/projection compiler. It infers against metadata retained by the read
+batch, so temporary inference does not consult or populate the source's
+persistent cache. Construction metadata, the retained read and read scratch
+still require their own admission; disabling inference caching grants none.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its
