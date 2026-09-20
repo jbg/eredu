@@ -203,6 +203,17 @@ pub(super) fn output(
             promote(dtype(operation, 0)?, dtype(operation, 1)?),
             dtype(operation, 2)?,
         ),
+        // The direct explicit worker casts probabilities to query precision,
+        // then its final matmul promotes them with the value precision. Key,
+        // mask and sink types affect scores but not that final product type.
+        K::Attention { window: None, arithmetic, .. }
+            if arithmetic == eredu_nn::AttentionArithmetic::Fused
+                || operation.inputs.get(0)?.shape().get(2).zip(operation.inputs.get(1)?.shape().get(2))
+                    .is_some_and(|(&q,&k)| i64::from(q)*i64::from(k)
+                        <= i64::from(crate::backend::nn::attention::INPUT_SCORE_ROW_BUDGET)) =>
+        {
+            promote(dtype(operation, 0)?, dtype(operation, 2)?)
+        }
         // Explicit score policies have multiple rounded/bounded product paths;
         // their F32 Q/K/V case is invariant across every selected path.
         K::Attention { .. } if (0..3).all(|input| dtype(operation, input) == Some(F::Float32)) => {

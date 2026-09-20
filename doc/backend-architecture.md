@@ -752,6 +752,13 @@ counts that cast/add sequence, its scalar source and vector backing, and the F32
 result. Width-one means retain their actual identity-cast reduction. Grouped RMS
 keeps its distinct reshape and final input-precision cast sequence.
 
+The explicit CPU attention recipe follows the shared score-policy worker:
+K/V head expansion, score-precision casts and products, optional soft-capping,
+Boolean or additive masks, optional sink logits, F32 softmax, and the final
+query/value-precision product. It uses retained scalar and stride facts for
+reshape and matrix-copy admission. Its source population is distinct from the
+native fused SDPA fallback and from bounded query/key recurrence.
+
 The neutral `zeros_like` trace delegates to the existing typed zero constructor,
 using the prototype's authenticated scalar precision and shape without claiming
 its values as graph inputs. Generic host initialization remains a separate
