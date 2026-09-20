@@ -51,6 +51,20 @@ pub(crate) struct PreparedQuantization {
     pub(super) materialized_source_shards: BTreeSet<PathBuf>,
 }
 
+// Collect directly into the retained provenance set. Repeated source selections
+// and keys shared by targets require only one owned name.
+struct MaterializedKeys(BTreeSet<String>);
+impl eredu_checkpoint::recipe::RecipeSourceVisitor for MaterializedKeys {
+    type Error = std::convert::Infallible;
+
+    fn source(&mut self, key: &str, _: &TensorSelection) -> Result<(), Self::Error> {
+        if !self.0.contains(key) {
+            self.0.insert(key.to_owned());
+        }
+        Ok(())
+    }
+}
+
 impl ColdQuantization {
     /// Authenticate a completed conversion against this source and exact plan.
     pub(crate) fn validate_conversion(
@@ -91,12 +105,14 @@ impl ColdQuantization {
             ));
         }
         preflight_source_collisions(source.as_ref(), &plan)?;
-        let materialized_source_keys = plan
-            .targets
-            .iter()
-            .flat_map(|target| target.source.source_keys())
-            .map(ToString::to_string)
-            .collect::<BTreeSet<_>>();
+        let mut materialized_source_keys = MaterializedKeys(BTreeSet::new());
+        for target in &plan.targets {
+            match target.source.visit_sources(&mut materialized_source_keys) {
+                Ok(()) => {}
+                Err(never) => match never {},
+            }
+        }
+        let materialized_source_keys = materialized_source_keys.0;
         let mut materialized_source_shards = source
             .materialized_source_shards()
             .into_iter()

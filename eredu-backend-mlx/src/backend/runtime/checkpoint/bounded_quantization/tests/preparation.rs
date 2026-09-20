@@ -15,6 +15,103 @@ impl Drop for Custody {
 }
 
 #[test]
+fn companion_collisions_use_only_the_catalog_and_preserve_target_order() {
+    struct CatalogOnly(Vec<&'static str>);
+    impl CheckpointSource for CatalogOnly {
+        fn source_keys(&self) -> Vec<String> {
+            self.0.iter().map(|key| (*key).to_owned()).collect()
+        }
+        fn source_metadata(
+            &self,
+            _: &str,
+        ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
+            panic!("collision checks must not initialize metadata")
+        }
+        fn acquire_lease(&self, _: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+            panic!("collision checks must not read payloads")
+        }
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+            panic!("collision checks must not request diagnostics")
+        }
+    }
+    let plan = BoundedQuantizationPlan::new(
+        AffineQuantization::default(),
+        640,
+        [
+            direct_test_target("b.weight"),
+            direct_test_target("a.weight"),
+        ],
+    )
+    .unwrap();
+    for keys in [vec![], vec!["z.weight", "a.weight", "a.weight"]] {
+        super::super::preflight::preflight_source_collisions(&CatalogOnly(keys), &plan).unwrap();
+    }
+    for (keys, target) in [
+        (vec!["b.scales", "a.scales", "b.scales"], "a.weight"),
+        (vec!["b.scales", "a.weight", "b.scales"], "b.weight"),
+        (vec!["z.weight", "a.biases"], "a.weight"),
+    ] {
+        let error = super::super::preflight::preflight_source_collisions(&CatalogOnly(keys), &plan)
+            .unwrap_err();
+        assert!(error.to_string().contains(target), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("implicit transcoding is unsupported")
+        );
+    }
+}
+
+#[test]
+fn preparation_collects_unique_provenance_across_nested_recipes_and_targets() {
+    let source = Arc::new(
+        MemoryWeightStore::from_safetensors(["a.weight", "b.weight"].map(|key| {
+            (
+                key.into(),
+                SafeDtype::F32,
+                vec![1, 64],
+                float_bytes(&matrix_values(1, 1, 64)),
+            )
+        }))
+        .unwrap(),
+    );
+    let joined = DerivedWeightRecipe::Concatenate {
+        axis: 0,
+        inputs: ["b.weight", "a.weight", "b.weight"]
+            .map(|key| DerivedWeightRecipe::source(key, TensorSelection::Full))
+            .into(),
+    };
+    let nested = DerivedWeightRecipe::Reshape {
+        input: Box::new(joined),
+        shape: vec![3, 64],
+    };
+    let plan = BoundedQuantizationPlan::new(
+        AffineQuantization::default(),
+        640,
+        [
+            test_target("joined.weight", nested),
+            test_target(
+                "copy.weight",
+                DerivedWeightRecipe::source("a.weight", TensorSelection::Full),
+            ),
+        ],
+    )
+    .unwrap();
+    let prepared = ColdQuantization::prepare(source.into(), plan)
+        .unwrap()
+        .allocate_ordinary(cpu_context().stream())
+        .unwrap();
+    assert_eq!(
+        prepared
+            .materialized_source_keys
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["a.weight", "b.weight"]
+    );
+    assert!(prepared.materialized_source_shards.is_empty());
+}
+
+#[test]
 fn later_target_working_set_failure_precedes_every_output_allocation() {
     let source = Arc::new(
         MemoryWeightStore::from_safetensors([

@@ -4,13 +4,14 @@ pub(super) fn preflight_source_collisions(
     source: &dyn eredu_checkpoint::store::CheckpointSource,
     plan: &BoundedQuantizationPlan,
 ) -> Result<(), Error> {
-    let source_keys = source.source_keys().into_iter().collect::<BTreeSet<_>>();
+    let mut source_keys = source.source_keys();
+    source_keys.sort_unstable();
     for target in &plan.targets {
-        if source_keys.contains(&target.scales_name)
+        if source_keys.binary_search(&target.scales_name).is_ok()
             || target
                 .biases_name
                 .as_ref()
-                .is_some_and(|name| source_keys.contains(name))
+                .is_some_and(|name| source_keys.binary_search(name).is_ok())
         {
             return Err(quantization_error(format!(
                 "bounded quantization target {:?} already has checkpoint quantization companions; implicit transcoding is unsupported",
