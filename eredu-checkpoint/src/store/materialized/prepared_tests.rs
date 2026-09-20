@@ -23,13 +23,12 @@ fn snapshot(source: RetainedCheckpointSource) -> PreparedCheckpointSource {
     PreparedCheckpointSource::new(source, catalog).unwrap()
 }
 fn overlay(source: RetainedCheckpointSource) -> RetainedCheckpointSource {
-    Arc::new(MaterializedCheckpointSource::new(
+    RetainedCheckpointSource::from_materialized(MaterializedCheckpointSource::new(
         source,
         memory(&[("replacement", &[9, 8])]),
         BTreeSet::new(),
         BTreeSet::new(),
     ))
-    .into()
 }
 fn fixtures() -> (tempfile::TempDir, [RetainedCheckpointSource; 2]) {
     let directory = tempfile::tempdir().unwrap();

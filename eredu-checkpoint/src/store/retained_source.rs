@@ -36,6 +36,7 @@ enum Owner {
     Ordinary(SharedCheckpointSource),
     Gguf(SourceHandle<GgufWeightStore>),
     Composite(SourceHandle<CompositeCheckpointSource>),
+    Materialized(SourceHandle<super::MaterializedCheckpointSource>),
     Closed(CheckpointSourceHandle),
 }
 impl From<SharedCheckpointSource> for RetainedCheckpointSource {
@@ -63,11 +64,33 @@ impl AsRef<dyn CheckpointSource> for RetainedCheckpointSource {
             Owner::Ordinary(source) => source.as_ref(),
             Owner::Gguf(source) => &**source,
             Owner::Composite(source) => &**source,
+            Owner::Materialized(source) => &**source,
             Owner::Closed(source) => source.source(),
         }
     }
 }
 impl RetainedCheckpointSource {
+    /// Moves a completed overlay into the same closed source ownership used by
+    /// prepared acquisition. Payload reservations stay with the memory tensors.
+    pub fn from_materialized(source: super::MaterializedCheckpointSource) -> Self {
+        Self(Owner::Materialized(SourceHandle::new(source, None)))
+    }
+    /// Retains the overlay's separately admitted metadata through source clones,
+    /// acquisition routes and opaque identities. Custody alone certifies neither
+    /// the original source nor the output payloads' admission.
+    pub fn from_materialized_with_custody<C: Any + fmt::Debug + Send + Sync>(
+        source: super::MaterializedCheckpointSource,
+        custody: C,
+    ) -> Self {
+        Self(Owner::Materialized(SourceHandle::new(
+            source, Some(SourceControl::new(custody)),
+        )))
+    }
+    /// Source allocation and custody controls, excluding dynamic catalogs and
+    /// tensor payloads, which retain their independent admission requirements.
+    pub fn materialized_storage_request<C>() -> Option<SourceErasureStorageRequest> {
+        request::<super::MaterializedCheckpointSource, C>()
+    }
     /// Ordinary typed SafeTensors ownership, without constructor custody.
     pub fn from_safetensors(source: SafetensorsWeightStore) -> Self {
         Self(Owner::Safetensors(SourceHandle::new(source, None)))
@@ -194,6 +217,7 @@ impl RetainedCheckpointSource {
             Owner::Safetensors(source) => source.origin(),
             Owner::Gguf(source) => source.origin(),
             Owner::Composite(source) => source.origin(),
+            Owner::Materialized(source) => source.origin(),
             Owner::Closed(source) => source.origin(),
         }
     }
@@ -206,6 +230,7 @@ impl RetainedCheckpointSource {
             (Owner::Safetensors(a), Owner::Safetensors(b)) => a.same(b),
             (Owner::Gguf(a), Owner::Gguf(b)) => a.same(b),
             (Owner::Composite(a), Owner::Composite(b)) => a.same(b),
+            (Owner::Materialized(a), Owner::Materialized(b)) => a.same(b),
             (Owner::Closed(a), Owner::Closed(b)) => a.same(b),
             _ => false,
         }
@@ -224,6 +249,7 @@ impl RetainedCheckpointSource {
             Owner::Safetensors(source) => Identity::Closed(source.identity()),
             Owner::Gguf(source) => Identity::Closed(source.identity()),
             Owner::Composite(source) => Identity::Closed(source.identity()),
+            Owner::Materialized(source) => Identity::Closed(source.identity()),
             Owner::Closed(source) => Identity::Closed(source.identity()),
         })
     }
@@ -239,6 +265,9 @@ impl RetainedCheckpointSource {
             Owner::Gguf(source) => Some(PreparedAcquisitionOwner::retained_gguf(source.clone())),
             Owner::Composite(source) => {
                 Some(PreparedAcquisitionOwner::retained_composite(source.clone()))
+            }
+            Owner::Materialized(source) => {
+                Some(PreparedAcquisitionOwner::retained_materialized(source.clone()))
             }
             // Generic closed lifetime ownership supplies no typed acquisition.
             Owner::Closed(_) => None,

@@ -12,6 +12,7 @@ enum Owner {
     RetainedSafetensors(SourceHandle<SafetensorsWeightStore>),
     RetainedGguf(SourceHandle<crate::gguf_store::GgufWeightStore>),
     RetainedComposite(SourceHandle<CompositeCheckpointSource>),
+    RetainedMaterialized(SourceHandle<MaterializedCheckpointSource>),
     Memory(Arc<MemoryWeightStore>),
     Materialized(Arc<MaterializedCheckpointSource>),
     Safetensors(Arc<SafetensorsWeightStore>),
@@ -22,6 +23,11 @@ enum Owner {
     Resolved(Arc<ResolvedCheckpointSource>),
 }
 impl PreparedAcquisitionOwner {
+    pub(in crate::store) fn retained_materialized(
+        owner: SourceHandle<MaterializedCheckpointSource>,
+    ) -> Self {
+        Self(Owner::RetainedMaterialized(owner))
+    }
     pub(in crate::store) fn encoded_contract(&self) -> Option<&str> {
         match self.route() {
             Route::Restricted(owner) => Some(&owner.contract),
@@ -60,6 +66,7 @@ impl PreparedAcquisitionOwner {
             Owner::RetainedSafetensors(owner) => &**owner,
             Owner::RetainedGguf(owner) => &**owner,
             Owner::RetainedComposite(owner) => &**owner,
+            Owner::RetainedMaterialized(owner) => &**owner,
             Owner::Memory(owner) => owner.as_ref(),
             Owner::Materialized(owner) => owner.as_ref(),
             Owner::Safetensors(owner) => owner.as_ref(),
@@ -77,6 +84,7 @@ impl PreparedAcquisitionOwner {
             Owner::RetainedSafetensors(owner) => Route::Safetensors(owner),
             Owner::RetainedGguf(owner) => Route::Gguf(owner),
             Owner::RetainedComposite(owner) => Route::Composite(owner),
+            Owner::RetainedMaterialized(owner) => Route::Materialized(owner),
             Owner::Memory(owner) => Route::Memory(owner),
             Owner::Materialized(owner) => Route::Materialized(owner),
             Owner::Safetensors(owner) => Route::Safetensors(owner),

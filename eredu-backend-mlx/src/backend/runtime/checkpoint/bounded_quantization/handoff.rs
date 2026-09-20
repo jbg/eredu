@@ -22,7 +22,7 @@ impl ConvertedQuantization {
         Self {
             source,
             plan,
-            store: Arc::new(store).into(),
+            store: RetainedCheckpointSource::from_materialized(store),
             report,
         }
     }

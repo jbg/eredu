@@ -1153,6 +1153,13 @@ The MLX `QuantizedCheckpoint` result moves that neutral source and its conversio
 report into loading, without implementing a second checkpoint source. Output
 buffers retain their payload reservations and estimated catalog metadata headroom;
 this source type does not itself grant allocation authority.
+Completed overlays use the retained source owner's typed materialized constructor.
+Separately admitted metadata custody follows source aliases, retained acquisition
+routes and opaque identities until their retirement. A detached encoded memory
+read retains its validated tensor owners and can release the enclosing catalog;
+authorization errors retain the source view needed for their diagnostics. This
+lifetime contract does not certify admission of an overlay's original source,
+catalog or output payloads.
 Prepared encoded reads authenticate each concrete source and inspect the immutable
 leaf before comparing enclosing catalogs from inner to outer. Catalogs over a
 materialized source compare metadata and scalar provenance with the same borrowed
