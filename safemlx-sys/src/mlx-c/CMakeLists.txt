@@ -260,6 +260,7 @@ else()
       mlx-cpu-row-movement-source.patch
       mlx-cpu-routing-selection-source.patch
       mlx-cpu-empty-slice-source.patch
+      mlx-cpu-affine-quantized-source.patch
       mlx-cpu-quantization-unary-source.patch
       mlx-cpu-quantization-integer-source.patch
       mlx-cpu-quantization-half-source.patch

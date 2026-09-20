@@ -87,7 +87,8 @@ mod tests {
             let action = InterventionAction::Scale { dtype:InterventionDtype::Float32, factor:-0.5 };
             let program = PreparedStaticActivation::new(&action, &slice, &shape, InterventionDtype::Float32).unwrap();
             let population = program.population().unwrap();
-            assert_eq!(population.retained_roots,5); assert_eq!(population.completions,0);
+            // Select, scalar, cast, multiply and update each settle their retained prefix.
+            assert_eq!(population.retained_roots,5); assert_eq!(population.completions,5);
             let mut retained = context.metadata_vec(population.retained_roots).unwrap();
             context.begin_state_span([&source]).unwrap();
             let output = program.trace(&source, &context, &mut retained).unwrap();
@@ -102,8 +103,8 @@ mod tests {
             assert_eq!(last.alias_input,Some(1)); assert_eq!(last.population.primitives,0);
             assert_eq!(last.population.births,0); assert_eq!(last.output_bytes,0); assert_eq!(last.scratch_bytes,0);
             assert_eq!(last.parameter_shells,1);
-            let recipe = SpeculativeNumericalRecipe::inspect_cpu_capture(&report, roots.len(), 0, ordinary,cpu,&context).unwrap();
-            assert_eq!(recipe.kernels,0); assert_eq!(recipe.completion.nested_completions,0);
+            let recipe = SpeculativeNumericalRecipe::inspect_cpu_capture(&report, roots.len(), population.completions, ordinary,cpu,&context).unwrap();
+            assert_eq!(recipe.kernels,0); assert_eq!(recipe.completion.nested_completions,5);
             // Closing roots retain the opening source and newly allocated results.
             assert_eq!(report.state.as_ref().unwrap().retained_bytes,
                 report.tensor_buffers.retained_bytes.map(|bytes| bytes + 16384));
@@ -189,8 +190,8 @@ mod tests {
         assert_eq!(update.population.births,1);assert_eq!(update.alias_input,None);
         assert_eq!(report.state.as_ref().unwrap().retained_bytes,
             report.tensor_buffers.retained_bytes.map(|bytes|bytes+input_bytes));
-        let recipe=SpeculativeNumericalRecipe::inspect_cpu_capture(&report,roots.len(),0,ordinary,cpu,&context).unwrap();
-        assert_eq!(recipe.kernels,0);assert_eq!(recipe.completion.nested_completions,0);
+        let recipe=SpeculativeNumericalRecipe::inspect_cpu_capture(&report,roots.len(),population.completions,ordinary,cpu,&context).unwrap();
+        assert_eq!(recipe.kernels,0);assert_eq!(recipe.completion.nested_completions,5);
         }
     }
 

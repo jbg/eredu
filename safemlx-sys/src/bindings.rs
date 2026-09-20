@@ -7446,6 +7446,20 @@ unsafe extern "C" {
     ) -> bool;
 }
 
+unsafe extern "C" {
+    pub fn mlx_operation_event_cpu_affine_quantized_eval_layout(
+        out: *mut mlx_cpu_copy_eval_layout,
+        dtype: mlx_dtype,
+        rank: usize,
+        rows: usize,
+        columns: usize,
+        width: usize,
+        group_size: ::std::os::raw::c_int,
+        bits: ::std::os::raw::c_int,
+        tracer: bool,
+    ) -> bool;
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct mlx_affine_quantize_construction_layout {

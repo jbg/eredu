@@ -734,6 +734,43 @@ impl OperationEvent {
     }
 }
 
+impl OperationEvent {
+    /// Existing transposed CPU affine QMM with four completed row-contiguous
+    /// operands. Native admission independently verifies packing, companions,
+    /// strides, scalar types and output geometry before installing its Eval bank.
+    /// The query describes storage; it grants no source or execution authority.
+    pub fn cpu_affine_quantized_layout(
+        dtype: Dtype,
+        rank: usize,
+        rows: usize,
+        columns: usize,
+        width: usize,
+        group_size: i32,
+        bits: i32,
+        tracer: bool,
+    ) -> Option<CpuCopyEvalLayout> {
+        let mut native = safemlx_sys::mlx_cpu_copy_eval_layout::default();
+        // SAFETY: scalar-only query writes this initialized output on success;
+        // it retains no pointers and has no device, stream or allocation effects.
+        if !unsafe {
+            safemlx_sys::mlx_operation_event_cpu_affine_quantized_eval_layout(
+                &mut native, dtype.into(), rank, rows, columns, width,
+                group_size, bits, tracer,
+            )
+        } {
+            return None;
+        }
+        let frames = [
+            size_of::<(Dtype, usize, usize, usize, usize, i32, i32, bool)>(),
+            size_of_val(&native), size_of::<Option<CpuCopyEvalLayout>>(),
+        ];
+        native.named_control_bytes = native.named_control_bytes.checked_add(
+            frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)?,
+        )?;
+        Some(CpuCopyEvalLayout { native })
+    }
+}
+
 #[cfg(test)]
 mod quantization_integer_tests {
     use super::*;

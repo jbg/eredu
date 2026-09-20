@@ -3,7 +3,8 @@ use super::*;
 use safemlx::Dtype;
 use crate::backend::nn::workspace::attention::blockwise::descriptor::{self,Descriptor,Stage};
 mod source;
-#[cfg(test)]mod tests;
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod tests;
 
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {

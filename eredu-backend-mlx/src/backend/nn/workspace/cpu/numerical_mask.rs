@@ -1,4 +1,4 @@
-//! CPU population of the existing exact expanded-Bool token mask worker.
+//! CPU population of the expanded-Bool token mask and optional input-alias path.
 use super::*;
 use safemlx::Dtype;
 
@@ -27,7 +27,8 @@ pub(in crate::backend::nn::workspace) fn token_filter(rank:usize,elements:usize)
 /// source is the same seven constructors used by the standalone policy quote.
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
-    if !matches!(operation.kind,WorkspaceOperationKindView::Sampling(WorkspaceSamplingOperation::TokenFilter)) {
+    if !matches!(operation.kind,WorkspaceOperationKindView::Sampling(
+        WorkspaceSamplingOperation::TokenFilter | WorkspaceSamplingOperation::OptionalTokenFilter)) {
         return Ok(None);
     }
     let Some([input])=operation.inputs.array() else {return Err(MlxWorkspaceFactError::descriptor("CPU token mask input population differs"));};
@@ -58,4 +59,47 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorks
     let scratch_bytes=facts::add(output_bytes,facts::add(facts::mul(bool_bytes,2)?,facts::mul(scalar_bytes,2)?)?)?;
     Ok(Some(OperationPlan{dtype:WorkspaceFloatingType::Float32,population,alias_input:None,
         output_bytes,scratch_bytes,rank,parameter_shells:0,seeds:2,validations:0}))
+}
+
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_cpu_mask_retains_full_input_alias_and_prices_masked_branch() {
+        let ordinary = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let matmul = MlxCpuMatmulMechanism::select(
+            eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
+        let cpu = MlxCpuWorkspaceMechanisms::new(ordinary.allocation(), matmul);
+        for shape in [&[1, 17][..], &[1, 1, 17][..]] {
+            for optional in [false, true] {
+                let context = WorkspaceContext::new(cpu);
+                let storage = WorkspaceExistingStorage::try_new(Some(4096), &context).unwrap();
+                let layout = context.layout(shape, WorkspaceDtype::Float32).unwrap()
+                    .with_representation(Some(WorkspaceRepresentation::new(
+                        WorkspaceFloatingType::Float32, true)));
+                let input = WorkspaceTensor::existing_with_storage(layout, &storage, &context).unwrap();
+                context.begin_state_span([&input]).unwrap();
+                let kind = if optional { WorkspaceSamplingOperation::OptionalTokenFilter }
+                    else { WorkspaceSamplingOperation::TokenFilter };
+                let output = context.execute(WorkspaceOperationKind::Sampling(kind), &[&input],
+                    vec![input.layout().clone()]).unwrap().remove(0);
+                assert_eq!(output.layout().representation(), input.layout().representation());
+                let report = context.finish_report(&[output]).unwrap();
+                assert!(report.unpriced_operations.is_empty());
+                assert!(report.unpriced_host_operations.is_empty());
+                assert_eq!(report.host_workspace_bytes, Some(34));
+                let output_capacity = ordinary.allocation().fixed_buffer_capacity(17 * 4).unwrap();
+                assert_eq!(report.closing_storage.bytes,
+                    Some(output_capacity + if optional { 4096 } else { 0 }));
+                let plan = cpu.plan(report.operations[0].as_view()).unwrap().unwrap();
+                assert_eq!(plan.seeds, 2);
+                assert_eq!(plan.population.primitives, 7);
+                assert_eq!(plan.population.input_edges, 9);
+                let mut missing = report.operations[0].clone();
+                missing.inputs[0] = missing.inputs[0].clone().with_representation(None);
+                assert!(cpu.plan(missing.as_view()).unwrap().is_none());
+            }
+        }
+    }
 }

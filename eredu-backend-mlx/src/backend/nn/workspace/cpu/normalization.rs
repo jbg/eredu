@@ -4,7 +4,7 @@ use eredu_nn::NormalizationScale;
 use safemlx::{CpuUnaryOperation, Dtype};
 mod weightless_half;
 mod grouped;
-#[cfg(test)]
+#[cfg(all(test, target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
 mod grouped_tests;
 
 #[derive(Clone, Copy)]

@@ -18,3 +18,6 @@ pub(crate) use backend::apply_token_mask;
 
 /// Fixed transports of the unchanged TopK/TopP/MinP equation workers.
 pub(crate) fn sampling_filter_control_bytes() -> Option<usize> { backend::filter_control_bytes() }
+
+/// Fixed transports of the shared repetition/frequency/presence worker.
+pub(crate) fn sampling_penalty_control_bytes() -> Option<usize> { backend::penalty_control_bytes() }

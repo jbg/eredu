@@ -3,6 +3,7 @@ use super::*;
 use safemlx::{CpuBinaryOperation, CpuCopyEvalLayout, OperationEvent};
 use std::mem::{size_of, size_of_val};
 mod dense;
+mod affine;
 mod program;
 mod router;
 pub(super) mod grouped;
@@ -44,6 +45,7 @@ mod numerical_random;
 mod numerical_difference;
 mod numerical_mask;
 mod sampling_filters;
+mod sampling_penalties;
 mod sampling_state;
 pub(super) use numerical_difference::{difference as difference_population,logarithm as logarithm_population};
 pub(super) use numerical_random::{uniform_unit_interval as uniform_population,categorical as categorical_population};
@@ -80,6 +82,9 @@ impl MlxCpuWorkspaceMechanisms {
         if let Some(plan)=pending_input::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=zero_fill::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=byte_frame::inspect(operation,self)? {return Ok(Some(plan));}
+        if let Some(plan) = affine::inspect(operation, self)? {
+            return Ok(Some(plan));
+        }
         if let Some(plan) = dense::inspect(operation, self)? {
             return Ok(Some(plan));
         }
@@ -128,6 +133,7 @@ impl MlxCpuWorkspaceMechanisms {
         if let Some(plan)=causal_mask::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=numerical_mask::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=sampling_filters::inspect(operation,self)? {return Ok(Some(plan));}
+        if let Some(plan)=sampling_penalties::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=sampling_state::inspect(operation,self)? {return Ok(Some(plan));}
         masked_readout::inspect(operation,self)
     }
@@ -158,14 +164,14 @@ impl MlxCpuWorkspaceMechanisms {
             grouped::emit_outputs(operation, self, sink)?;
         } else if matches!(operation.kind, WorkspaceOperationKindView::BlockwiseAttention{..}) {
             blockwise::emit_outputs(operation,self,sink)?;
-        } else if matches!(operation.kind, WorkspaceOperationKindView::Contiguous)
+        } else if matches!(operation.kind, WorkspaceOperationKindView::Contiguous
+            | WorkspaceOperationKindView::Sampling(WorkspaceSamplingOperation::OptionalTokenFilter))
             || (matches!(operation.kind, WorkspaceOperationKindView::View("reshape"))
                 && plan.alias_input.is_none()
                 && operation.outputs.get(0).is_some_and(|v|
                     matches!(v.dtype(),WorkspaceDtype::Int32|WorkspaceDtype::Uint32))) {
-            // Without complete stride evidence, the actual worker may retain
-            // the full input backing or copy its logical extent. Keep both
-            // storage possibilities, including integer reshape aliases.
+            // Optional masks may return the full input. Contiguous/reshape
+            // workers may also alias or copy. Retain both storage possibilities.
             sink.output(facts::Output::AllocateOrAliasInputs {
                 bytes: plan.output_bytes, inputs: facts::Aliases::Slice(&[0]),
             })?;
@@ -202,7 +208,9 @@ impl MlxCpuWorkspaceMechanisms {
         if self.plan(operation)?.is_none() {
             return Ok(None);
         }
-        if matches!(operation.kind,WorkspaceOperationKindView::Sampling(WorkspaceSamplingOperation::TokenFilter)) {
+        if matches!(operation.kind,WorkspaceOperationKindView::Sampling(
+            WorkspaceSamplingOperation::TokenFilter | WorkspaceSamplingOperation::OptionalTokenFilter
+            | WorkspaceSamplingOperation::Penalties { .. })) {
             return sampling::emit_host(operation,sink);
         }
         sink.finish(0, format_args!("CPU equation uses shared native backing; fixed SIMD tiles and alias/worker controls are independently priced by the same CPU source plan"))

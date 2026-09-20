@@ -3,7 +3,7 @@
 use super::*;
 use crate::backend::nn::workspace::{ExistingArrayProjection, ResidentSamplingProgram};
 use crate::backend::runtime::residency::storage::native_storage::{BankOwner, MlxNativeStorage};
-use eredu_nn::workspace::{WorkspaceDtype, HostMetadataFunding};
+use eredu_nn::workspace::HostMetadataFunding;
 use eredu_runtime::working_memory::{
     InferenceTextStep, OriginalNativeStorageMechanism,
     OriginalTextSamplingExtension, SamplingWorkspaceReport, TextHostControlFacts,
@@ -166,7 +166,7 @@ impl TextExecutionQuote {
         let workspace = workspace_mechanisms.context(funding.clone()).map_err(eredu_nn::Error::from)?;
         let input = self.native_recipe.as_ref().and_then(|recipe| recipe.sampling_program().input())
             .ok_or_else(unknown)?;
-        let layout = workspace.layout(input.shape(), WorkspaceDtype::Float32)?;
+        let layout = input.layout(&workspace)?;
         let mut projection = ExistingArrayProjection::with_source_count(&workspace, usize::from(state.prng.is_some()))
             .map_err(|cause| Error::Neural(workspace.metadata_source(cause)))?;
         let random = if change.reseed().is_some() {

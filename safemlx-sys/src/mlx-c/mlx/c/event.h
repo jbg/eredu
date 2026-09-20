@@ -186,6 +186,9 @@ bool mlx_operation_event_cpu_scalar_update_eval_layout(mlx_cpu_copy_eval_layout*
 bool mlx_operation_event_cpu_static_update_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,size_t update_elements,bool tracer);
 bool mlx_operation_event_cpu_argsort_eval_layout(mlx_cpu_copy_eval_layout*,mlx_dtype source,size_t rank,size_t columns,size_t rows,bool tracer);
 bool mlx_operation_event_cpu_gather_axis_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
+bool mlx_operation_event_cpu_affine_quantized_eval_layout(
+    mlx_cpu_copy_eval_layout* out, mlx_dtype dtype, size_t rank, size_t rows,
+    size_t columns, size_t width, int group_size, int bits, bool tracer);
 bool mlx_operation_event_cpu_partition_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_scan_sum_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);
 bool mlx_operation_event_cpu_maximum_row_eval_layout(mlx_cpu_copy_eval_layout*,size_t rank,size_t elements,bool tracer);

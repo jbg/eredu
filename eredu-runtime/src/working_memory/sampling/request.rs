@@ -77,15 +77,23 @@ impl<'a> From<&'a WorkspaceLayout> for WorkspaceSamplingSource<'a> {
 pub struct SamplingWorkspaceInputPlan {
     shape: [i32; 3],
     rank: usize,
+    representation: Option<eredu_nn::workspace::WorkspaceRepresentation>,
     backing_capacity_bytes: Option<u64>,
     maximum_allocations: Option<usize>,
 }
 impl SamplingWorkspaceInputPlan {
     /// Actual source dimensions, without normalizing or guessing its rank.
     pub fn shape(&self) -> &[i32] { &self.shape[..self.rank] }
+    /// Reconstructs the observed geometry and physical evidence under the
+    /// caller's metadata account. Unknown representation stays unknown.
+    pub fn layout(&self, context: &WorkspaceContext) -> Result<WorkspaceLayout, Error> {
+        Ok(context.layout(self.shape(), WorkspaceDtype::Float32)?
+            .with_representation(self.representation))
+    }
     /// Reconstructs the same source descriptor over a separately paid layout.
     pub fn source<'a>(&self, layout: &'a WorkspaceLayout) -> Result<WorkspaceSamplingSource<'a>, Error> {
-        if layout.shape() != self.shape() || layout.dtype() != WorkspaceDtype::Float32 {
+        if layout.shape() != self.shape() || layout.dtype() != WorkspaceDtype::Float32
+            || layout.representation() != self.representation {
             return Err(WorkspaceMetadataError::Unqualified.into());
         }
         Ok(WorkspaceSamplingSource {
@@ -245,6 +253,7 @@ fn quote_with_sampler(
     let input_plan = SamplingWorkspaceInputPlan {
         shape,
         rank: logits.layout.shape().len(),
+        representation: logits.layout.representation(),
         backing_capacity_bytes: logits.backing_capacity_bytes,
         maximum_allocations: source.maximum_allocations,
     };

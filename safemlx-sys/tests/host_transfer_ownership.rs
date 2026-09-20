@@ -12,6 +12,7 @@ fn host_transfer_handles_obey_c_ownership_contract() {
         );
         let mut buffer = safemlx_sys::mlx_host_transfer_buffer {
             ctx: std::ptr::null_mut(),
+            prepared_owner: std::ptr::null_mut(),
         };
         let mut event = safemlx_sys::mlx_event_new();
 

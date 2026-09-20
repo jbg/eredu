@@ -14,7 +14,8 @@ fn transfers(attempts: usize) -> HostTransfers {
 }
 fn prepare(device: DeviceType, attempts: usize) -> PreparedSourceCopies {
     let mut layout = CopyLayout::default();
-    for dtype in [safemlx::Dtype::Float32, safemlx::Dtype::Float16, safemlx::Dtype::Bfloat16] {
+    for dtype in [safemlx::Dtype::Float32, safemlx::Dtype::Float16, safemlx::Dtype::Bfloat16,
+        safemlx::Dtype::Uint32] {
         for rank in 1..=4 { layout.include(rank, dtype, device).unwrap(); }
     }
     PreparedSourceCopies::prepare(layout, transfers(attempts), 0, device).unwrap()
@@ -90,7 +91,7 @@ fn source_copy_frontiers_preserve_cpu_population_and_reject_cross_device_or_unkn
         gpu.copies.traversal.limits(), 4),
         Err(Error::PrefillControl(WorkingMemoryError::IdentityMismatch))));
     for (rank, dtype) in [(0,safemlx::Dtype::Float32),(5,safemlx::Dtype::Float32),
-        (2,safemlx::Dtype::Uint32)] {
+        (2,safemlx::Dtype::Int64)] {
         assert!(CopyLayout::default().include(rank,dtype,DeviceType::Cpu).is_none());
     }
 }

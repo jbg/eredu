@@ -1712,3 +1712,20 @@ extern "C" bool mlx_operation_event_cpu_scatter_eval_layout(mlx_cpu_copy_eval_la
   *out = {native.allocation_extents,native.worker_graph_extents,native.backing_births,native.named_control_bytes+controls,0};
   return true;
 }
+
+#include "mlx/backend/cpu/quantized_storage.h"
+extern "C" bool mlx_operation_event_cpu_affine_quantized_eval_layout(
+    mlx_cpu_copy_eval_layout* out, mlx_dtype dtype, size_t rank, size_t rows,
+    size_t columns, size_t width, int group_size, int bits, bool tracer) {
+  if (!out || dtype < MLX_BOOL || dtype > MLX_COMPLEX64) return false;
+  mlx::core::cpu::CopyEvalStorage native;
+  if (!mlx::core::cpu::affine_quantized_eval_layout(mlx_dtype_to_cpp(dtype),
+      rank, rows, columns, width, group_size, bits, tracer, native)) return false;
+  const size_t controls = sizeof(native) + sizeof(*out) + sizeof(out) + sizeof(dtype) +
+      sizeof(rank) + sizeof(rows) + sizeof(columns) + sizeof(width) +
+      sizeof(group_size) + sizeof(bits) + sizeof(tracer) + sizeof(size_t);
+  if (native.named_control_bytes > SIZE_MAX - controls) return false;
+  *out = {native.allocation_extents, native.worker_graph_extents,
+      native.backing_births, native.named_control_bytes + controls, 0};
+  return true;
+}

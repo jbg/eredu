@@ -437,7 +437,7 @@ pub(super) fn trace(runtime:&ModelRuntime<MlxBackend<'_>>,source:&child::Source<
                     geometry, context, |_| -> Result<WorkspaceTraceReport, Error> { Err(unknown()) })
                     .map_err(|cause| planned_error(cause, planning_metadata))?;
                 let input = source.sampling.arrays.source.sampling_input.ok_or_else(unknown)?;
-                let layout = context.layout(input.shape(), eredu_nn::workspace::WorkspaceDtype::Float32)?;
+                let layout = input.layout(context)?;
                 let quote_sampling = |recorder: &mut dyn eredu_runtime::working_memory::SamplingWorkspaceObserver| {
                     eredu_runtime::working_memory::quote_sampling_workspace_with_observer(
                         binding.sampler(), source.sampling.temperature, inputs.random.as_ref(), input.source(&layout)?,

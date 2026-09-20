@@ -118,9 +118,9 @@ pub(super) fn finish_logits(
     Ok(output)
 }
 
-/// Matches the existing replicated text index_text_output contract, after full
-/// sequence observation: select one position on [batch,sequence,vocabulary].
-/// The metadata index retains whatever complete backing the selected facts say.
+/// Selects the final position after full [batch,sequence,vocabulary] observation.
+/// The interval and axis removal match the native output adapter and retain
+/// whatever complete backing the selected mechanisms report.
 pub(super) fn sampling_row(
     scores: &WorkspaceTensor,
     context: &WorkspaceContext,
@@ -131,15 +131,8 @@ pub(super) fn sampling_row(
             ObservationError::InvalidLogitsGeometry,
         ));
     }
-    let index = eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition.sequence_index();
-    scores.index(
-        &[
-            eredu_nn::Index::Full,
-            eredu_nn::Index::At(index),
-            eredu_nn::Index::Full,
-        ],
-        context,
-    )
+    let end = scores.shape()[1];
+    scores.narrow_axis(1, end - 1, end, context)?.squeeze_axes(&[1], context)
 }
 
 /// Private composition receives only the prepared borrowed-hook mechanism's

@@ -1,0 +1,265 @@
+diff --git a/mlx/backend/cpu/quantized_storage.h b/mlx/backend/cpu/quantized_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/quantized_storage.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++MLX_API bool affine_quantized_eval_layout(Dtype, size_t rank, size_t rows,
++    size_t columns, size_t width, int group_size, int bits, bool tracer,
++    CopyEvalStorage&) noexcept;
++MLX_API bool is_affine_quantized_eval_primitive(const array&) noexcept;
++MLX_API bool affine_quantized_eval_storage(const array&, CopyEvalStorage&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/quantized.cpp b/mlx/backend/cpu/quantized.cpp
+--- a/mlx/backend/cpu/quantized.cpp
++++ b/mlx/backend/cpu/quantized.cpp
+@@ -3,6 +3,11 @@
+ #include "mlx/backend/common/quantized.h"
+ #include "mlx/backend/common/unary.h"
+ #include "mlx/backend/cpu/copy.h"
++#include "mlx/backend/cpu/quantized_storage.h"
++#include "mlx/prepared_input.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/cpu/simd/simd.h"
+ #include "mlx/backend/cpu/unary.h"
+@@ -925,6 +930,161 @@
+ 
+ } // namespace
+ 
++namespace {
++// The ordinary affine callable, named so the same task has a cold storage query.
++struct AffineQuantizedTask {
++  array out, x, w, scales, biases;
++  int group_size, bits;
++  bool transpose;
++  void operator()() {
++    _qmm_dispatch(out, x, w, scales, biases, group_size, bits, transpose);
++  }
++};
++bool affine_product(size_t a, size_t b, size_t& result) noexcept {
++  if (b && a > size_t(INT_MAX) / b) return false;
++  result = a * b; return true;
++}
++bool affine_add(size_t& result, size_t bytes) noexcept {
++  if (bytes > SIZE_MAX - result) return false;
++  result += bytes; return true;
++}
++template <typename T>
++size_t affine_worker_controls() noexcept {
++  constexpr int S = simd::max_size<T>;
++  // Dispatch frames, borrowed elem_to_loc inputs, scalar unpacking (at most
++  // eight values), and the SIMD accumulator/unpack/load expressions. These are
++  // fixed controls; no dequantized matrix or dynamic worker scratch is created.
++  const size_t frames[] = {
++      sizeof(T*) * 5, sizeof(const T*) * 14, sizeof(const uint32_t*) * 6,
++      sizeof(const uint8_t*) * 2, sizeof(const array*) * 15, sizeof(array*),
++      sizeof(const Shape*) * 4, sizeof(const Strides*) * 4,
++      sizeof(int) * 38, sizeof(bool) * 6, sizeof(size_t) * 8,
++      sizeof(uint8_t), sizeof(T) * 8, sizeof(T[8]),
++      sizeof(simd::Simd<float, S>) * 4,
++      sizeof(simd::Simd<T, S>) * 2,
++      sizeof(simd::Simd<uint32_t, S>) * 6,
++      sizeof(std::array<uint32_t, 8>), sizeof(uint32_t), sizeof(float)};
++  size_t result = sizeof(frames) + sizeof(size_t) * 2;
++  for (size_t bytes : frames) result += bytes;
++  if constexpr (S > 1) result += sizeof(simd::Simd<uint32_t, S / 2>) * 2;
++  return result;
++}
++bool affine_row(const array& value) noexcept {
++  if (!value.flags().row_contiguous || value.ndim() < 1 || value.ndim() > 4 ||
++      value.strides().size() != size_t(value.ndim()) ||
++      value.data_size() != value.size()) return false;
++  size_t stride = 1;
++  for (size_t axis = value.ndim(); axis--;) {
++    if (value.shape(axis) <= 0 || value.strides()[axis] < 0 ||
++        (value.shape(axis) > 1 && size_t(value.strides()[axis]) != stride) ||
++        !affine_product(stride, size_t(value.shape(axis)), stride)) return false;
++  }
++  return stride == value.size();
++}
++} // namespace
++namespace cpu {
++bool affine_quantized_eval_layout(Dtype dtype, size_t rank, size_t rows,
++    size_t columns, size_t width, int group_size, int bits, bool tracer,
++    CopyEvalStorage& out) noexcept {
++  if ((dtype != float32 && dtype != float16 && dtype != bfloat16) ||
++      dtype.size() != (dtype == float32 ? sizeof(float) : sizeof(float16_t)) ||
++      rank < 2 || rank > 4 || !rows || !columns || !width ||
++      (group_size != 16 && group_size != 32 && group_size != 64 && group_size != 128) ||
++      (bits != 2 && bits != 3 && bits != 4 && bits != 5 && bits != 6 && bits != 8) ||
++      width % size_t(group_size) != 0) return false;
++  size_t input_elements, output_elements, packed_bits, weight_elements;
++  if (!affine_product(rows, width, input_elements) ||
++      !affine_product(rows, columns, output_elements) ||
++      !affine_product(width, size_t(bits), packed_bits) || packed_bits % 32 ||
++      !affine_product(columns, packed_bits / 32, weight_elements)) return false;
++  // The ordinary kernel selects SIMD only when its packing fits the lane width.
++  // The SIMD unpacker has real specializations for bits 4/8 at eight lanes.
++  const int lanes = dtype == float32 ? simd::max_size<float> :
++      dtype == float16 ? simd::max_size<float16_t> : simd::max_size<bfloat16_t>;
++  if (32 % bits == 0 && lanes % (32 / bits) == 0 &&
++      (lanes != 8 || (bits != 4 && bits != 8))) return false;
++  DispatchLayout task;
++  WeakCopyStorage weak;
++  if (!CommandEncoder::dispatch_layout<AffineQuantizedTask>(task) ||
++      !PreparedInputLeaf::weak_copy_storage(rank, weak)) return false;
++  EvalDispatchStorage dispatch{task.task_bytes, task.task_alignment, 0, 0};
++  const size_t controls[] = {
++      task.controls, weak.controls, weak.controls, weak.controls, weak.controls, weak.controls,
++      sizeof(AffineQuantizedTask) * 2, sizeof(array) * 4, sizeof(const array*) * 4,
++      sizeof(Stream) * 5, sizeof(CommandEncoder*) * 5,
++      sizeof(dtype), sizeof(rank), sizeof(rows), sizeof(columns), sizeof(width),
++      sizeof(group_size), sizeof(bits), sizeof(tracer), sizeof(out),
++      sizeof(input_elements), sizeof(output_elements), sizeof(packed_bits), sizeof(weight_elements),
++      sizeof(lanes), sizeof(task), sizeof(weak), sizeof(dispatch), sizeof(size_t) * 2,
++      dtype == float32 ? affine_worker_controls<float>() : dtype == float16 ?
++          affine_worker_controls<float16_t>() : affine_worker_controls<bfloat16_t>()};
++  dispatch.controls = sizeof(controls);
++  for (size_t bytes : controls) if (!affine_add(dispatch.controls, bytes)) return false;
++  SingleOutputEvalStorage common;
++  if (!single_output_eval_layout(rank, 4, tracer, &dispatch, common)) return false;
++  CopyEvalStorage value;
++  static_cast<SingleOutputEvalStorage&>(value) = common;
++  value.copy = true;
++  const size_t source_controls[] = {
++      sizeof(common), sizeof(value), sizeof(const array*) * 7,
++      sizeof(std::tuple<int, int, QuantizationMode, bool>), sizeof(int) * 6,
++      sizeof(size_t) * 12, sizeof(bool) * 4, sizeof(Dtype),
++      sizeof(submission::FixedEvalPrologueGuard*), sizeof(submission::Record*),
++      sizeof(submission::GraphQuota*), sizeof(submission::GraphConstruction*),
++      sizeof(submission::GraphConstructionContext), sizeof(submission::GraphFailure)};
++  if (!affine_add(value.named_control_bytes, sizeof(source_controls))) return false;
++  for (size_t bytes : source_controls) if (!affine_add(value.named_control_bytes, bytes)) return false;
++  out = value; return true;
++}
++bool is_affine_quantized_eval_primitive(const array& output) noexcept {
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      typeid(output.primitive()) == typeid(QuantizedMatmul);
++}
++bool affine_quantized_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
++  if (!is_affine_quantized_eval_primitive(output) || !output.siblings().empty() ||
++      output.inputs().size() != 4 || output.ndim() < 2 || output.ndim() > 4) return false;
++  const auto [group, bits, mode, transpose] =
++      static_cast<const QuantizedMatmul&>(output.primitive()).state();
++  if (mode != QuantizationMode::Affine || !transpose || group <= 0 || bits <= 0) return false;
++  const auto& x = output.inputs()[0];
++  const auto& w = output.inputs()[1];
++  const auto& scales = output.inputs()[2];
++  const auto& biases = output.inputs()[3];
++  if (x.dtype() != output.dtype() || scales.dtype() != output.dtype() ||
++      biases.dtype() != output.dtype() || w.dtype() != uint32 || w.itemsize() != sizeof(uint32_t) ||
++      x.ndim() != output.ndim() || w.ndim() != 2 || scales.ndim() != 2 || biases.ndim() != 2 ||
++      !affine_row(x) || !affine_row(w) || !affine_row(scales) || !affine_row(biases)) return false;
++  const size_t width = size_t(x.shape(-1));
++  const int columns = output.shape(-1);
++  size_t rows = 1, packed_bits;
++  for (int axis = 0; axis < x.ndim() - 1; ++axis) {
++    if (x.shape(axis) != output.shape(axis) ||
++        !affine_product(rows, size_t(x.shape(axis)), rows)) return false;
++  }
++  if (columns <= 0 || !affine_product(width, size_t(bits), packed_bits) || packed_bits % 32 ||
++      w.shape(0) != columns || size_t(w.shape(1)) != packed_bits / 32 ||
++      scales.shape(0) != columns || size_t(scales.shape(1)) != width / size_t(group) ||
++      biases.shape() != scales.shape() || output.size() != rows * size_t(columns)) return false;
++  return affine_quantized_eval_layout(output.dtype(), output.ndim(), rows,
++      size_t(columns), width, group, bits, output.is_tracer(), out);
++}
++} // namespace cpu
++namespace submission {
++GraphFailure GraphConstruction::create_cpu_affine_quantized_eval(
++    const FixedEvalPrologueGuard& guard, GraphConstruction*& out) noexcept {
++  auto& record = guard.record();
++  auto* graph = record.graph_quota();
++  auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch != &record || current_graph_quota() != graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if (!cpu::affine_quantized_eval_storage(guard.current(), actual))
++    return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++} // namespace submission
++
+ void QuantizedMatmul::eval_cpu(const ArrayVector& inputs, array& out) {
+   auto& x_pre = inputs[0];
+   auto& w_pre = inputs[1];
+@@ -944,16 +1104,10 @@
+   if (mode_ == QuantizationMode::Affine) {
+     auto biases = ensure_row_contiguous(inputs[3], encoder, stream());
+     encoder.set_input_array(biases);
+-    encoder.dispatch([out = array::unsafe_weak_copy(out),
+-                      x = array::unsafe_weak_copy(x),
+-                      w = array::unsafe_weak_copy(w),
+-                      scales = array::unsafe_weak_copy(scales),
+-                      biases = array::unsafe_weak_copy(biases),
+-                      group_size_ = group_size_,
+-                      bits_ = bits_,
+-                      transpose_ = transpose_]() mutable {
+-      _qmm_dispatch(out, x, w, scales, biases, group_size_, bits_, transpose_);
+-    });
++    encoder.dispatch(AffineQuantizedTask{
++        array::unsafe_weak_copy(out), array::unsafe_weak_copy(x),
++        array::unsafe_weak_copy(w), array::unsafe_weak_copy(scales),
++        array::unsafe_weak_copy(biases), group_size_, bits_, transpose_});
+   } else {
+     encoder.dispatch([out = array::unsafe_weak_copy(out),
+                       x = array::unsafe_weak_copy(x),
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -108,7 +108,7 @@
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+-  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2 && inputs != 3 && !(raw_task && (inputs == 0 || inputs == 4))) || (!copy && rank != 0)) return false;
++  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2 && inputs != 3 && inputs != 4 && !(raw_task && inputs == 0)) || (!copy && rank != 0)) return false;
+   SingleOutputEvalStorage value;
+   value.rank = rank; value.inputs = inputs; value.tracer = tracer;
+   submission::CpuEvalCleanupLayout cleanup;
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -189,6 +189,7 @@
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_arange_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_concatenate_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_affine_quantized_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_selection_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reduction_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_flat_scatter_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -1,4 +1,5 @@
+ #include "mlx/backend/cpu/sampling_storage.h"
++#include "mlx/backend/cpu/quantized_storage.h"
+ #include <climits>
+ #include <typeinfo>
+ #include "mlx/backend/cpu/concatenate_storage.h"
+@@ -75,7 +76,8 @@
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_tiled_gather_mm || fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool fixed_affine_quantized = fixed && cpu::is_affine_quantized_eval_primitive(arr);
++  const bool extended = fixed_affine_quantized || fixed_tiled_gather_mm || fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -83,7 +85,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_tiled_gather_mm
++    const auto failure = fixed_affine_quantized
++        ? submission::GraphConstruction::create_cpu_affine_quantized_eval(*extended_prologue, extended_bank.value)
++        : fixed_tiled_gather_mm
+         ? submission::GraphConstruction::create_cpu_tiled_gather_mm_eval(*extended_prologue, extended_bank.value)
+         : fixed_flat_scatter
+         ? submission::GraphConstruction::create_cpu_flat_scatter_eval(*extended_prologue, extended_bank.value)

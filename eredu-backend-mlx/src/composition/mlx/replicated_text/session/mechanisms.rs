@@ -1002,14 +1002,23 @@ where
         sequence_index: i32,
         context: &Stream,
     ) -> Result<MlxTensor, Error> {
-        let indexed = output
-            .as_array()
-            .try_index_device((.., sequence_index, ..), context)?;
-        // The model root is complete, but indexing introduces a new lazy view.
+        use eredu_nn::Tensor;
+        let [_, positions, _] = output.shape() else {
+            return Err(Error::ArchitectureModel("text output must have three axes".into()));
+        };
+        let start = if sequence_index < 0 {
+            positions.checked_add(sequence_index)
+        } else {
+            Some(sequence_index)
+        }.ok_or_else(|| Error::ArchitectureModel("text output index overflow".into()))?;
+        let end = start.checked_add(1)
+            .ok_or_else(|| Error::ArchitectureModel("text output index overflow".into()))?;
+        let indexed = output.narrow_axis(1, start, end, context)?.squeeze_axes(&[1], context)?;
+        // The model root is complete, but selecting the row introduces lazy views.
         // Finish that operation while the enclosing prefill reservation still
         // owns it, before publishing the output and its physical allocation.
-        indexed.evaluated()?;
-        Ok(MlxTensor::from_array(indexed))
+        indexed.as_array().evaluated()?;
+        Ok(indexed)
     }
 
     fn copy_checkpoint_state(

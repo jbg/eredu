@@ -118,6 +118,38 @@ fn layout() -> WorkspaceLayout {
 }
 
 #[test]
+fn sampling_replanning_preserves_physical_evidence_and_rejects_substitution() {
+    let sampler = ConfiguredTextSampler::Standard(GenerationSampler::new());
+    let strided = WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, false)
+        .with_element_strides(&[111, 111, 3]).unwrap();
+    for representation in [None, Some(strided),
+        Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float32, true)),
+        Some(WorkspaceRepresentation::new(WorkspaceFloatingType::Float16, true))] {
+        let (context, _) = setup(false);
+        let original = layout().with_representation(representation);
+        let report = quote_sampling_workspace(&sampler, 0.0, None,
+            WorkspaceSamplingInput { layout: &original, backing_capacity_bytes: Some(4096) }
+                .with_backing_population(2),
+            &TokenFilter::All, 3, &context).unwrap();
+        let plan = report.input_plan();
+        let restored = plan.layout(&context).unwrap();
+        assert_eq!(restored.shape(), &[1, 1, 37]);
+        assert_eq!(restored.dtype(), WorkspaceDtype::Float32);
+        assert_eq!(restored.representation(), representation);
+        let repeated = quote_sampling_workspace(&sampler, 0.0, None,
+            plan.source(&restored).unwrap(), &TokenFilter::All, 3, &context).unwrap();
+        assert_eq!(repeated.input_plan(), plan);
+        assert_eq!(repeated.peak.bytes(), report.peak.bytes());
+        let incompatible = layout().with_representation(if representation.is_some() { None }
+            else { Some(strided) });
+        assert!(plan.source(&incompatible).is_err());
+        let wrong_shape = WorkspaceLayout::new(&[1, 37], WorkspaceDtype::Float32)
+            .unwrap().with_representation(representation);
+        assert!(plan.source(&wrong_shape).is_err());
+    }
+}
+
+#[test]
 fn configured_sampling_quote_runs_all_history_growth_edges_without_advancing_source_state() {
     let (context, calls) = setup(false);
     let sampler =

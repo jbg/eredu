@@ -43,7 +43,7 @@ impl WorkspaceMechanisms for Facts {
 }
 
 #[test]
-fn actual_final_row_index_keeps_full_alias_backing_and_unknown_mechanism_facts() {
+fn final_row_selection_keeps_full_alias_backing_and_unknown_mechanism_facts() {
     for known in [false, true] {
         for alias in [false, true] {
             let context = WorkspaceContext::new(Facts {
@@ -63,11 +63,13 @@ fn actual_final_row_index_keeps_full_alias_backing_and_unknown_mechanism_facts()
             assert_eq!(row.shape(), [1, 17]);
             assert!(row.same_context(&scores));
             let report = context.report(&[row]).unwrap();
-            assert_eq!(report.operations.len(), 1);
-            assert!(matches!(
-                report.operations[0].kind,
-                WorkspaceOperationKind::Index { selected_axes: 1 }
-            ));
+            assert_eq!(report.operations.len(), 2);
+            let WorkspaceOperationKind::StaticSlice { starts, ends, strides } =
+                &report.operations[0].kind else { panic!("missing selected interval") };
+            assert_eq!(starts, &[0, 4, 0]);
+            assert_eq!(ends, &[1, 5, 17]);
+            assert_eq!(strides, &[1, 1, 1]);
+            assert!(matches!(report.operations[1].kind, WorkspaceOperationKind::View("squeeze")));
             assert_eq!(
                 report.state.unwrap().retained_bytes,
                 if !known {
