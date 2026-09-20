@@ -15,6 +15,8 @@ mod selection_ranges;
 mod read_projection;
 mod recipe_compilation;
 mod recipe_read;
+mod recipe_source;
+pub use recipe_source::EncodedRecipeSourceError;
 pub use recipe_read::{CompiledRecipeCustody, EncodedRecipeReadPreparationError};
 pub use recipe_compilation::{AdmittedRecipeConstruction, EncodedRecipeConstructionError};
 

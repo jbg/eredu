@@ -53,12 +53,12 @@ impl TileProducer for Producer {
     type Error = Error;
     fn submit(
         &mut self,
-        source: &dyn CheckpointSource,
+        source: &eredu_checkpoint::store::RetainedCheckpointSource,
         recipe: &DerivedWeightRecipe,
         target: &BoundedQuantizationTarget,
         quantization: WeightQuantization,
         slot: usize,
-    ) -> Result<WeightMaterialization, Error> {
+    ) -> Result<(WeightMaterialization, u64), Error> {
         self.producing.store(true, Ordering::SeqCst);
         let result = self
             .inner

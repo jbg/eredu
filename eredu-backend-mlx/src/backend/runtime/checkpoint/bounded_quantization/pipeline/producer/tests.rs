@@ -18,6 +18,10 @@ impl Drop for Invocation {
 
 #[derive(Debug, thiserror::Error)]
 enum ProducerFailure {
+    #[error("tile source read: {0}")]
+    Read(#[from] eredu_runtime::working_memory::EncodedRecipeSourceError),
+    #[error("tile source requires numerical or unsupported read construction")]
+    ReadUnavailable,
     #[error("tile pipeline: {0}")]
     Backend(#[from] Error),
     #[error("tile output metadata: {0}")]
@@ -45,9 +49,9 @@ impl From<eredu_checkpoint::recipe::RecipeError> for ProducerFailure {
     }
 }
 
-// Runtime/stream/read-range metadata and final output are explicit fixture
-// prerequisites. The pool funds output metadata, each native submission, input,
-// fixed materialization slot and admitted queue; this is not full producer admission.
+// Runtime/stream/source birth, recipe declarations and final output are fixture
+// prerequisites. The pool funds metadata, keys, compiled reads, native work,
+// input, completion slots and queue; this is not full producer admission.
 struct FundedProducer<'a> {
     pool: WorkingMemoryPool,
     runtime: &'a PreparedInputRuntime,
@@ -66,12 +70,12 @@ impl TileProducer for FundedProducer<'_> {
 
     fn submit(
         &mut self,
-        source: &dyn CheckpointSource,
+        source: &eredu_checkpoint::store::RetainedCheckpointSource,
         recipe: &DerivedWeightRecipe,
         target: &BoundedQuantizationTarget,
         quantization: WeightQuantization,
         slot: usize,
-    ) -> Result<Self::Completion, ProducerFailure> {
+    ) -> Result<(Self::Completion, u64), ProducerFailure> {
         self.slots.push(slot);
         if self.fail_at == Some(self.slots.len() - 1) {
             return Err(Error::PrefillControl(WorkingMemoryError::UnknownBound).into());
@@ -79,7 +83,7 @@ impl TileProducer for FundedProducer<'_> {
         let WeightQuantization::Affine(quantization) = quantization else {
             panic!("affine fixture");
         };
-        let metadata = metadata::MetadataPlan::new(recipe, source)
+        let metadata = metadata::MetadataPlan::new(recipe, source.as_ref())
             .map_err(Error::PrefillControl)?
             .prepare(&self.pool)
             .map_err(|error| {
@@ -90,10 +94,13 @@ impl TileProducer for FundedProducer<'_> {
         metadata
             .validate_pool(&self.pool)
             .map_err(Error::PrefillControl)?;
-        let read = recipe
-            .prepare_encoded_read_uncached(source)
-            .unwrap()
-            .unwrap();
+        let before_read = self.pool.used_bytes().unwrap();
+        let read = self
+            .pool
+            .prepare_encoded_recipe(source, recipe)?
+            .ok_or(ProducerFailure::ReadUnavailable)?;
+        let read_bytes = self.pool.used_bytes().unwrap() - before_read;
+        let source_bytes = read.output().byte_len();
         assert_eq!(read.output().shape(), metadata.output().inferred().shape());
         assert_eq!(
             read.output().byte_len(),
@@ -156,7 +163,11 @@ impl TileProducer for FundedProducer<'_> {
             layout,
         );
         self.largest_tile = self.largest_tile.max(
-            plan.required_bytes().unwrap() + input_bytes + slot_bytes + metadata.original_bytes(),
+            plan.required_bytes().unwrap()
+                + input_bytes
+                + slot_bytes
+                + metadata.original_bytes()
+                + read_bytes,
         );
         let submitted = plan.submit(pool).map_err(|failure| {
             let (uncalled, failure) = failure.into_parts();
@@ -164,7 +175,10 @@ impl TileProducer for FundedProducer<'_> {
             ProducerFailure::Admission(failure)
         })?;
         peak_used.set(peak_used.get().max(pool.used_bytes().unwrap()));
-        submitted.into_result().map_err(ProducerFailure::Invocation)
+        submitted
+            .into_result()
+            .map(|completion| (completion, source_bytes))
+            .map_err(ProducerFailure::Invocation)
     }
 }
 
@@ -482,7 +496,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     );
     let plan = BoundedQuantizationPlan::new(
         AffineQuantization::new(32, 4).unwrap(),
-        640,
+        100_000,
         [
             BoundedQuantizationTarget::direct("weight", "scales", Some("biases"))
                 .unwrap()
@@ -539,18 +553,84 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
-    let ProducerFailure::Admission(failure) = error else {
-        panic!("role admission must refuse before callback")
-    };
-    let Some(WorkingMemoryError::BudgetExceeded {
-        required_bytes,
-        available_bytes: 0,
-    }) = failure.accounting_failure()
+    let ProducerFailure::Read(eredu_runtime::working_memory::EncodedRecipeSourceError::Keys(
+        failure,
+    )) = error
     else {
-        panic!("exact role comparison")
+        panic!("key admission must refuse after the funded metadata");
     };
-    let role_bytes = *required_bytes;
-    assert!(failure.constructor_failure().is_none());
+    assert!(matches!(
+        failure.accounting_failure(),
+        Some(WorkingMemoryError::BudgetExceeded {
+            available_bytes: 0,
+            ..
+        })
+    ));
+    drop(failure);
+    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+
+    // Construct the actual host prerequisites in a separate sizing run. The
+    // retained quote excludes scratch that has already retired after compilation.
+    let sizing = WorkingMemoryPool::new(1 << 20, 0).unwrap();
+    let target = &plan.targets[0];
+    let root: eredu_checkpoint::store::RetainedCheckpointSource = source.clone().into();
+    let metadata = metadata::MetadataPlan::new(&target.source, root.as_ref())
+        .unwrap()
+        .prepare(&sizing)
+        .unwrap();
+    let read = sizing
+        .prepare_encoded_recipe(&root, &target.source)
+        .unwrap()
+        .unwrap();
+    let prerequisites = sizing.used_bytes().unwrap();
+    let construction_peak = sizing.peak_bytes().unwrap();
+    let WeightQuantization::Affine(quantization) = plan.quantization else {
+        unreachable!()
+    };
+    let layout = OperationEvent::cpu_affine_quantize_submission_layout(
+        Dtype::Float32,
+        Dtype::Float16,
+        2,
+        8,
+        64,
+        quantization.group_size,
+        quantization.bits,
+    )
+    .unwrap();
+    let capacity = NativeRoleCapacity {
+        graph: layout.graph_capacity(),
+        records: layout.record_capacity(),
+        backing: layout.physical_capacity(&runtime).unwrap(),
+    };
+    let input =
+        PreparedEncodedInputPlan::new(&read, &runtime, metadata.output().shape(), Dtype::Float32)
+            .unwrap();
+    let role = encoded_affine::plan(
+        &sizing,
+        &runtime,
+        capacity,
+        Invocation(Rc::new(Cell::new(1))),
+        input,
+        quantization,
+        target,
+        &streams[0],
+        layout,
+    );
+    let role_bytes = role.required_bytes().unwrap();
+    drop(role);
+    drop((read, metadata));
+    assert_eq!(sizing.used_bytes().unwrap(), 0);
+    assert!(prerequisites + role_bytes - 1 >= construction_peak);
+    producer.pool = WorkingMemoryPool::new(prerequisites + role_bytes - 1, 0).unwrap();
+    let error = prepare()
+        .materialize_with_producer(DeviceType::Cpu, &mut producer)
+        .unwrap_err();
+    let ProducerFailure::Admission(failure) = error else {
+        panic!("role comparison must precede native callback")
+    };
+    assert!(
+        matches!(failure.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes }) if *required_bytes == role_bytes && *available_bytes == role_bytes - 1)
+    );
     assert_eq!(producer.live.get(), 0);
     assert_eq!(producer.pool.used_bytes().unwrap(), 0);
     drop(failure);
@@ -560,8 +640,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         pending_sources: 0,
     })
     .unwrap();
-    producer.pool =
-        WorkingMemoryPool::new(metadata_bytes + role_bytes + slot_bytes - 1, 0).unwrap();
+    producer.pool = WorkingMemoryPool::new(prerequisites + role_bytes + slot_bytes - 1, 0).unwrap();
     producer.slots.clear();
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
@@ -658,8 +737,8 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
             .unwrap();
         let with_outputs = pool.used_bytes().unwrap();
         assert!(with_outputs > persistent);
-        // Source/read, recipe and overlay metadata remain fixture prerequisites.
-        // Runtime, workers, native tiles, queue/cleanup controls and final
+        // Source birth, recipe and overlay metadata remain fixture prerequisites.
+        // Runtime, workers, compiled reads, native tiles, queue/cleanup and final
         // memory-tensor buffers use their admitted constructors here.
         let mut producer = FundedProducer {
             pool: pool.clone(),

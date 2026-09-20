@@ -1,7 +1,7 @@
 use super::*;
 use eredu_checkpoint::store::{CheckpointSource, WeightStore};
 use eredu_checkpoint::store::{
-    RetainedCheckpointSource, SafetensorsEncodedReadPlanError, SafetensorsWeightStore,
+    RetainedCheckpointSource, SafetensorsEncodedReadPlanErrorKind, SafetensorsWeightStore,
 };
 use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 
@@ -130,11 +130,8 @@ fn file_route_checks_visibility_and_releases_views_after_admitted_construction()
     .into();
     let denied = ["second".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::from_source(&root, &denied),
-        Err(SafetensorsEncodedReadPlanError::UnauthorizedTensor {
-            index: 0,
-            contract: "first only"
-        })
+        SafetensorsEncodedReadPlan::from_source(&root, &denied).map_err(|error| error.kind()),
+        Err(SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { index: 0 })
     ));
     let keys = ["first".into(), "first".into()];
     let plan = SafetensorsEncodedReadPlan::from_source(&root, &keys)

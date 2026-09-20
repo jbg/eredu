@@ -41,8 +41,8 @@ fn file_plan_refuses_unprepared_headers_without_opening_or_touching_them() {
     let (_directory, store) = fixture();
     let keys = ["c".into(), "a".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::new(&store, &keys),
-        Err(SafetensorsEncodedReadPlanError::HeaderUnavailable { index: 0 })
+        SafetensorsEncodedReadPlan::new(&store, &keys).map_err(|error| error.kind()),
+        Err(SafetensorsEncodedReadPlanErrorKind::HeaderUnavailable { index: 0 })
     ));
     for path in store.shards.payload_paths() {
         assert_eq!(
@@ -61,8 +61,8 @@ fn file_plan_refuses_unprepared_headers_without_opening_or_touching_them() {
     warm(&store);
     let keys = ["a".into(), "missing".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::new(&store, &keys),
-        Err(SafetensorsEncodedReadPlanError::UnknownTensor { index: 1 })
+        SafetensorsEncodedReadPlan::new(&store, &keys).map_err(|error| error.kind()),
+        Err(SafetensorsEncodedReadPlanErrorKind::UnknownTensor { index: 1 })
     ));
 }
 
@@ -194,8 +194,8 @@ fn failed_header_inspection_lends_the_original_error_without_retrying() {
         panic!("expected the retained header failure")
     };
     assert!(matches!(
-        error,
-        SafetensorsEncodedReadPlanError::Header { index: 0, .. }
+        error.kind(),
+        SafetensorsEncodedReadPlanErrorKind::Header { index: 0, .. }
     ));
     let cause = std::error::Error::source(&error)
         .unwrap()

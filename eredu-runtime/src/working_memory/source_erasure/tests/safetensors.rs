@@ -7,7 +7,8 @@ use eredu_checkpoint::{
         SafetensorsSourceAdmission,
     },
     store::{
-        CheckpointSource, SafetensorsEncodedReadPlanError, SourceMetadataBorrowError, WeightStore,
+        CheckpointSource, SafetensorsEncodedReadPlanErrorKind, SourceMetadataBorrowError,
+        WeightStore,
     },
 };
 use std::{error::Error, path::Path, sync::Arc};
@@ -184,8 +185,11 @@ fn funded_borrowed_headers_and_closed_source_feed_the_existing_prepared_read() {
     let source = funded(&pool, dir.path());
     let keys = ["weight".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::new(&source, &keys),
-        Err(SafetensorsEncodedReadPlanError::HeaderUnavailable { .. })
+        SafetensorsEncodedReadPlan::new(&source, &keys)
+            .err()
+            .unwrap()
+            .kind(),
+        SafetensorsEncodedReadPlanErrorKind::HeaderUnavailable { .. }
     ));
     let before = pool.used_bytes().unwrap();
     let metadata = source.prepare_metadata("weight").unwrap();
@@ -211,13 +215,15 @@ fn funded_borrowed_headers_and_closed_source_feed_the_existing_prepared_read() {
     )
     .unwrap();
     let restricted = RetainedCheckpointSource::from(Arc::new(restricted));
-    assert!(matches!(
-        SafetensorsEncodedReadPlan::from_source(&restricted, &keys),
-        Err(SafetensorsEncodedReadPlanError::UnauthorizedTensor {
-            index: 0,
-            contract: "deny-weight"
-        })
-    ));
+    let error = SafetensorsEncodedReadPlan::from_source(&restricted, &keys)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.kind(),
+        SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { index: 0 }
+    );
+    assert_eq!(error.contract(), Some("deny-weight"));
+    drop(error);
     drop(restricted);
     let read = pool
         .initialize_shared_native(

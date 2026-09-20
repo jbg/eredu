@@ -2,71 +2,150 @@
 use super::*;
 use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
 
-/// Inspection refuses without initializing headers, cloning errors or reading payloads.
-#[derive(Debug)]
-pub enum SafetensorsEncodedReadPlanError<'a> {
+/// Fixed category and source occurrence of an encoded file inspection refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetensorsEncodedReadPlanErrorKind {
     /// This source does not contain the requested occurrence.
     UnknownTensor { index: usize },
-    /// An enclosing concrete view excludes this requested occurrence.
-    UnauthorizedTensor { index: usize, contract: &'a str },
-    /// Header construction belongs to the source's separate retained admission.
+    /// An enclosing concrete view excludes this occurrence.
+    UnauthorizedTensor { index: usize },
+    /// The source has not prepared this header.
     HeaderUnavailable { index: usize },
-    /// The original source still owns this header failure.
-    Header {
-        index: usize,
-        source: &'a StoreError,
-    },
-    /// Checked original destination or metadata geometry cannot be represented.
+    /// The source retains a failed header construction.
+    Header { index: usize },
+    /// Checked geometry cannot be represented.
     Overflow(&'static str),
 }
-impl fmt::Display for SafetensorsEncodedReadPlanError<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnknownTensor { index } => {
-                write!(f, "encoded file source occurrence {index} is absent")
+
+enum InspectionCause {
+    Fixed(SafetensorsEncodedReadPlanErrorKind),
+    Unauthorized {
+        index: usize,
+        owner: acquisition::PreparedAcquisitionOwner,
+    },
+    Header {
+        index: usize,
+        owner: Arc<AdmittedShard>,
+    },
+}
+
+/// Inspection refusal owning the actual failed header or authorization owner.
+/// Retaining existing handles allocates no diagnostic strings and cannot retry
+/// header construction. The source's original error/custody remains unchanged.
+pub struct SafetensorsEncodedReadPlanError(InspectionCause);
+impl SafetensorsEncodedReadPlanError {
+    pub(in crate::store) fn unknown(index: usize) -> Self {
+        Self(InspectionCause::Fixed(
+            SafetensorsEncodedReadPlanErrorKind::UnknownTensor { index },
+        ))
+    }
+    fn unavailable(index: usize) -> Self {
+        Self(InspectionCause::Fixed(
+            SafetensorsEncodedReadPlanErrorKind::HeaderUnavailable { index },
+        ))
+    }
+    fn overflow(context: &'static str) -> Self {
+        Self(InspectionCause::Fixed(
+            SafetensorsEncodedReadPlanErrorKind::Overflow(context),
+        ))
+    }
+    pub(in crate::store) fn unauthorized(
+        index: usize,
+        owner: acquisition::PreparedAcquisitionOwner,
+    ) -> Self {
+        Self(InspectionCause::Unauthorized { index, owner })
+    }
+    /// Allocation-free category, retaining the original ordered occurrence.
+    pub fn kind(&self) -> SafetensorsEncodedReadPlanErrorKind {
+        match &self.0 {
+            InspectionCause::Fixed(kind) => *kind,
+            InspectionCause::Unauthorized { index, .. } => {
+                SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { index: *index }
             }
-            Self::UnauthorizedTensor { index, contract } => write!(
-                f,
-                "encoded file source occurrence {index} is not authorized by {contract:?}"
-            ),
-            Self::HeaderUnavailable { index } => write!(
-                f,
-                "encoded file source occurrence {index} has no prepared header"
-            ),
-            Self::Header { index, source } => write!(
-                f,
-                "encoded file source occurrence {index} has a retained header failure: {source}"
-            ),
-            Self::Overflow(context) => write!(f, "encoded file read overflow: {context}"),
+            InspectionCause::Header { index, .. } => {
+                SafetensorsEncodedReadPlanErrorKind::Header { index: *index }
+            }
         }
     }
-}
-impl std::error::Error for SafetensorsEncodedReadPlanError<'_> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Header { source, .. } => Some(*source),
+    /// Exact retained contract name, without a clone or new routing callback.
+    pub fn contract(&self) -> Option<&str> {
+        match &self.0 {
+            InspectionCause::Unauthorized { owner, .. } => owner.encoded_contract(),
             _ => None,
         }
     }
-}
-impl SafetensorsEncodedReadPlanError<'_> {
+    fn header_error(&self) -> Option<&StoreError> {
+        match &self.0 {
+            InspectionCause::Header { owner, .. } => {
+                owner.header.get().and_then(|result| result.as_ref().err())
+            }
+            _ => None,
+        }
+    }
     pub(super) fn into_ordinary(self, keys: &[String]) -> StoreError {
-        match self {
-            Self::UnknownTensor { index } => StoreError::UnknownTensor {
+        use SafetensorsEncodedReadPlanErrorKind as K;
+        match self.kind() {
+            K::UnknownTensor { index } => StoreError::UnknownTensor {
                 key: keys[index].clone(),
             },
-            Self::UnauthorizedTensor { index, contract } => StoreError::UnauthorizedTensor {
+            K::UnauthorizedTensor { index } => StoreError::UnauthorizedTensor {
                 key: keys[index].clone(),
-                contract: contract.into(),
+                contract: self
+                    .contract()
+                    .expect("retained authorization owner")
+                    .into(),
             },
-            Self::Header { source, .. } => source.clone(),
-            Self::HeaderUnavailable { .. } => {
+            K::Header { .. } => self
+                .header_error()
+                .expect("retained header failure")
+                .clone(),
+            K::HeaderUnavailable { .. } => {
                 StoreError::Internal("encoded source header is not prepared".into())
             }
-            Self::Overflow(context) => StoreError::Overflow {
+            K::Overflow(context) => StoreError::Overflow {
                 context: context.into(),
             },
         }
+    }
+}
+impl fmt::Debug for SafetensorsEncodedReadPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SafetensorsEncodedReadPlanError")
+            .field("kind", &self.kind())
+            .field("contract", &self.contract())
+            .field("source", &self.header_error())
+            .finish()
+    }
+}
+impl fmt::Display for SafetensorsEncodedReadPlanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use SafetensorsEncodedReadPlanErrorKind as K;
+        match self.kind() {
+            K::UnknownTensor { index } => {
+                write!(f, "encoded file source occurrence {index} is absent")
+            }
+            K::UnauthorizedTensor { index } => write!(
+                f,
+                "encoded file source occurrence {index} is not authorized by {:?}",
+                self.contract().expect("retained authorization owner")
+            ),
+            K::HeaderUnavailable { index } => write!(
+                f,
+                "encoded file source occurrence {index} has no prepared header"
+            ),
+            K::Header { index } => write!(
+                f,
+                "encoded file source occurrence {index} has a retained header failure: {}",
+                self.header_error().expect("retained header failure")
+            ),
+            K::Overflow(context) => write!(f, "encoded file read overflow: {context}"),
+        }
+    }
+}
+impl std::error::Error for SafetensorsEncodedReadPlanError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.header_error()
+            .map(|cause| cause as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -92,7 +171,7 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     /// views, preserving their ordered batch authorization. The root and keys
     /// stay borrowed through inspection/construction; completed batches own their
     /// file identities. Unsupported or forwarded routes return no plan and never
-    /// invoke ordinary read preparation. Header failures remain source-owned loans.
+    /// invoke ordinary read preparation. Header failures retain their actual source-owned diagnostics.
     ///
     /// ```compile_fail
     /// use eredu_checkpoint::store::{RetainedCheckpointSource, SafetensorsEncodedReadPlan};
@@ -105,7 +184,7 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     pub fn from_source(
         source: &'a RetainedCheckpointSource,
         keys: &'a [String],
-    ) -> Result<Option<Self>, SafetensorsEncodedReadPlanError<'a>> {
+    ) -> Result<Option<Self>, SafetensorsEncodedReadPlanError> {
         let Some(store) = acquisition::retained_route::encoded_file_source(source, keys)? else {
             return Ok(None);
         };
@@ -117,8 +196,8 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     pub fn new(
         store: &'a SafetensorsWeightStore,
         keys: &'a [String],
-    ) -> Result<Self, SafetensorsEncodedReadPlanError<'a>> {
-        use SafetensorsEncodedReadPlanError::Overflow;
+    ) -> Result<Self, SafetensorsEncodedReadPlanError> {
+        let overflow = SafetensorsEncodedReadPlanError::overflow;
         let max_groups = keys.len().min(store.shards.payload_paths().len());
         let mut plan = Self {
             store,
@@ -137,35 +216,35 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
                 .checked_add(
                     MetadataCloneLayout::of(metadata)
                         .and_then(|layout| layout.payload_bytes())
-                        .ok_or(Overflow("bulk metadata layout"))?,
+                        .ok_or(overflow("bulk metadata layout"))?,
                 )
-                .ok_or(Overflow("bulk metadata storage"))?;
+                .ok_or(overflow("bulk metadata storage"))?;
         }
         // Group capacity is bounded by both occurrences and admitted shards.
         // One maximum selected path per possible group is conservative; no
         // payload-length multiplier or postconstruction clone quote is used.
         let paths = max_groups
             .checked_mul(path_max)
-            .ok_or(Overflow("bulk path storage"))?;
+            .ok_or(overflow("bulk path storage"))?;
         plan.backing_bytes = [
             Layout::array::<TensorMetadata>(keys.len())
-                .map_err(|_| Overflow("bulk tensor metadata"))?
+                .map_err(|_| overflow("bulk tensor metadata"))?
                 .size(),
             Layout::array::<Entry<'_>>(keys.len())
-                .map_err(|_| Overflow("bulk source ordering"))?
+                .map_err(|_| overflow("bulk source ordering"))?
                 .size(),
             Layout::array::<(PathBuf, ReadShard)>(max_groups)
-                .map_err(|_| Overflow("bulk shard metadata"))?
+                .map_err(|_| overflow("bulk shard metadata"))?
                 .size(),
             Layout::array::<ReadSpan>(keys.len())
-                .map_err(|_| Overflow("bulk span metadata"))?
+                .map_err(|_| overflow("bulk span metadata"))?
                 .size(),
             metadata_bytes,
             paths,
         ]
         .into_iter()
         .try_fold(0usize, usize::checked_add)
-        .ok_or(Overflow("bulk constructor storage"))?;
+        .ok_or(overflow("bulk constructor storage"))?;
         Ok(plan)
     }
 
@@ -173,39 +252,37 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
         &self,
         index: usize,
         destination: usize,
-    ) -> Result<(&'a TensorMetadata, Entry<'a>), SafetensorsEncodedReadPlanError<'a>> {
+    ) -> Result<(&'a TensorMetadata, Entry<'a>), SafetensorsEncodedReadPlanError> {
         use SafetensorsEncodedReadPlanError as E;
         let key = &self.keys[index];
-        let entry = self
-            .store
-            .catalog
-            .get(key)
-            .ok_or(E::UnknownTensor { index })?;
+        let entry = self.store.catalog.get(key).ok_or(E::unknown(index))?;
         let admission = self.store.shards.admission(&entry.shard);
         let header = admission
             .header
             .get()
-            .ok_or(E::HeaderUnavailable { index })?
+            .ok_or(E::unavailable(index))?
             .as_ref()
-            .map_err(|source| E::Header { index, source })?;
-        let info = header
-            .metadata
-            .info(key)
-            .ok_or(E::UnknownTensor { index })?;
-        let metadata = header.tensors.get(key).ok_or(E::UnknownTensor { index })?;
+            .map_err(|_| {
+                E(InspectionCause::Header {
+                    index,
+                    owner: Arc::clone(admission),
+                })
+            })?;
+        let info = header.metadata.info(key).ok_or(E::unknown(index))?;
+        let metadata = header.tensors.get(key).ok_or(E::unknown(index))?;
         let start = header
             .payload_offset
             .checked_add(info.data_offsets.0)
-            .ok_or(E::Overflow("bulk tensor offset"))?;
+            .ok_or(E::overflow("bulk tensor offset"))?;
         let length = usize::try_from(metadata.encoded_byte_len)
-            .map_err(|_| E::Overflow("bulk tensor length"))?;
+            .map_err(|_| E::overflow("bulk tensor length"))?;
         let end = destination
             .checked_add(length)
-            .ok_or(E::Overflow("bulk output length"))?;
-        let file_start = u64::try_from(start).map_err(|_| E::Overflow("bulk file offset"))?;
+            .ok_or(E::overflow("bulk output length"))?;
+        let file_start = u64::try_from(start).map_err(|_| E::overflow("bulk file offset"))?;
         let file_end = file_start
             .checked_add(metadata.encoded_byte_len)
-            .ok_or(E::Overflow("bulk file end"))?;
+            .ok_or(E::overflow("bulk file end"))?;
         Ok((
             metadata,
             Entry {
@@ -221,13 +298,22 @@ impl<'a> SafetensorsEncodedReadPlan<'a> {
     /// storage uses a conservative selected-path maximum; allocator-private and
     /// OS storage, existing headers/diagnostics and later read scratch are excluded.
     pub fn required_bytes<C>(&self) -> Option<usize> {
-        [size_of::<Self>(), size_of::<PreparedEncodedRead<C>>(),
+        [
+            size_of::<Self>(),
+            size_of::<PreparedEncodedRead<C>>(),
             size_of::<SafetensorsEncodedReadBuildError<C>>(),
             size_of::<Result<PreparedEncodedRead<C>, SafetensorsEncodedReadBuildError<C>>>(),
-            size_of::<Vec<Entry<'_>>>(), size_of::<Entry<'_>>(), size_of::<TensorMetadata>(),
-            size_of::<ReadShard>(), size_of::<ReadSpan>(), size_of::<Vec<ReadSpan>>(),
-            size_of::<MutexGuard<'_, CacheState>>(), size_of::<Result<(), SafetensorsEncodedReadBuildCause>>()]
-            .into_iter().try_fold(self.backing_bytes, usize::checked_add)
+            size_of::<Vec<Entry<'_>>>(),
+            size_of::<Entry<'_>>(),
+            size_of::<TensorMetadata>(),
+            size_of::<ReadShard>(),
+            size_of::<ReadSpan>(),
+            size_of::<Vec<ReadSpan>>(),
+            size_of::<MutexGuard<'_, CacheState>>(),
+            size_of::<Result<(), SafetensorsEncodedReadBuildCause>>(),
+        ]
+        .into_iter()
+        .try_fold(self.backing_bytes, usize::checked_add)
     }
 
     /// Construct after admission, retaining the actual prefix on reserve or

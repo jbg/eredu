@@ -90,16 +90,13 @@ fn file_view_authorization_precedes_header_access_and_keeps_batch_error_order() 
     let selected = restricted(leaf.clone().into(), &["a", "c"]);
     let allowed = ["a".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::from_source(&selected, &allowed),
-        Err(SafetensorsEncodedReadPlanError::HeaderUnavailable { index: 0 })
+        SafetensorsEncodedReadPlan::from_source(&selected, &allowed).map_err(|error| error.kind()),
+        Err(SafetensorsEncodedReadPlanErrorKind::HeaderUnavailable { index: 0 })
     ));
     let denied = ["b".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::from_source(&selected, &denied),
-        Err(SafetensorsEncodedReadPlanError::UnauthorizedTensor {
-            index: 0,
-            contract: "selected view"
-        })
+        SafetensorsEncodedReadPlan::from_source(&selected, &denied).map_err(|error| error.kind()),
+        Err(SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { index: 0 })
     ));
     for path in leaf.shards.payload_paths() {
         assert_eq!(
@@ -124,8 +121,8 @@ fn file_view_authorization_precedes_header_access_and_keeps_batch_error_order() 
                 Err(StoreError::UnauthorizedTensor { .. })
             ));
             assert!(matches!(
-                SafetensorsEncodedReadPlan::from_source(&root, &keys),
-                Err(SafetensorsEncodedReadPlanError::UnauthorizedTensor { index: 1, .. })
+                SafetensorsEncodedReadPlan::from_source(&root, &keys).map_err(|error| error.kind()),
+                Err(SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { index: 1, .. })
             ));
         }
     }
@@ -147,8 +144,8 @@ fn file_view_authorization_precedes_header_access_and_keeps_batch_error_order() 
         matches!(root.prepare_encoded_read(&keys), Err(StoreError::UnknownTensor { key }) if key == "missing")
     );
     assert!(matches!(
-        SafetensorsEncodedReadPlan::from_source(&root, &keys),
-        Err(SafetensorsEncodedReadPlanError::UnknownTensor { index: 1 })
+        SafetensorsEncodedReadPlan::from_source(&root, &keys).map_err(|error| error.kind()),
+        Err(SafetensorsEncodedReadPlanErrorKind::UnknownTensor { index: 1 })
     ));
 }
 
@@ -231,6 +228,7 @@ fn routed_failed_header_is_the_original_source_owned_error() {
     let Err(error) = SafetensorsEncodedReadPlan::from_source(&root, &keys) else {
         panic!("expected retained header error")
     };
+    let retained = Arc::downgrade(leaf.shards.admission(&path));
     let original = leaf
         .shards
         .admission(&path)
@@ -244,6 +242,7 @@ fn routed_failed_header_is_the_original_source_owned_error() {
         .downcast_ref::<StoreError>()
         .unwrap();
     assert!(std::ptr::eq(cause, original));
+    let original = std::ptr::from_ref(original);
     assert_eq!(
         leaf.shards
             .admission(&path)
@@ -251,4 +250,45 @@ fn routed_failed_header_is_the_original_source_owned_error() {
             .load(Ordering::Relaxed),
         1
     );
+    drop((root, leaf, keys));
+    assert!(retained.upgrade().is_some());
+    let cause = std::error::Error::source(&error)
+        .unwrap()
+        .downcast_ref::<StoreError>()
+        .unwrap();
+    assert_eq!(std::ptr::from_ref(cause), original);
+    drop(error);
+    assert!(retained.upgrade().is_none());
+}
+
+#[test]
+fn authorization_error_keeps_exact_contract_after_source_and_keys_retire() {
+    let (_directory, leaf) = fixture();
+    let view = Arc::new(
+        RestrictedCheckpointSource::including(
+            Arc::new(leaf),
+            "selected 雪",
+            BTreeSet::from(["a".into()]),
+        )
+        .unwrap(),
+    );
+    let alive = Arc::downgrade(&view);
+    let root: RetainedCheckpointSource = view.clone().into();
+    let keys = ["b".into()];
+    let Err(error) = SafetensorsEncodedReadPlan::from_source(&root, &keys) else {
+        panic!("denied view")
+    };
+    drop((root, view, keys));
+    assert!(alive.upgrade().is_some());
+    assert_eq!(
+        error.kind(),
+        SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { index: 0 }
+    );
+    assert_eq!(error.contract(), Some("selected 雪"));
+    assert_eq!(
+        error.to_string(),
+        "encoded file source occurrence 0 is not authorized by \"selected 雪\""
+    );
+    drop(error);
+    assert!(alive.upgrade().is_none());
 }

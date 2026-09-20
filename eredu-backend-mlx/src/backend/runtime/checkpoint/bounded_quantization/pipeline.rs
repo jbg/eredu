@@ -177,7 +177,7 @@ impl super::preparation::PreparedQuantization {
 
         for (index, target) in plan.targets.iter().enumerate() {
             transform_target(
-                source.as_ref(),
+                &source,
                 target,
                 &plan,
                 index,
@@ -403,7 +403,7 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
 }
 
 fn transform_target<P: TileProducer>(
-    source: &dyn eredu_checkpoint::store::CheckpointSource,
+    source: &eredu_checkpoint::store::RetainedCheckpointSource,
     target: &BoundedQuantizationTarget,
     plan: &BoundedQuantizationPlan,
     output_shard: usize,
@@ -413,7 +413,7 @@ fn transform_target<P: TileProducer>(
     allocator_cache: &mut BoundedAllocatorCache,
     report: &mut WeightMaterializationReport,
 ) -> Result<(), P::Error> {
-    let catalog = eredu_checkpoint::recipe::UncachedRecipeCatalog::new(source);
+    let catalog = eredu_checkpoint::recipe::UncachedRecipeCatalog::new(source.as_ref());
     let super::preparation::ConversionGeometry {
         leading,
         rows,
@@ -643,7 +643,7 @@ fn transform_target<P: TileProducer>(
 
 #[allow(clippy::too_many_arguments)]
 fn submit_quantization_tile<P: TileProducer>(
-    source: &dyn CheckpointSource,
+    source: &eredu_checkpoint::store::RetainedCheckpointSource,
     recipe: &DerivedWeightRecipe,
     target: &BoundedQuantizationTarget,
     quantization: WeightQuantization,
@@ -663,12 +663,7 @@ fn submit_quantization_tile<P: TileProducer>(
         queued_working_set_bytes(pending_tiles)?,
         planned_working_set_bytes,
     )?;
-    // Verification acquires real payload leases. Only the selected tile may
-    // read them, after its peak fits alongside the still-pending submissions.
-    recipe.preflight_bounded(source)?;
-    let catalog = eredu_checkpoint::recipe::UncachedRecipeCatalog::new(source);
-    let metadata = recipe.infer(&catalog)?;
-    let completion = producer.submit(
+    let (completion, source_bytes) = producer.submit(
         source, recipe, target, quantization, report.source_tiles % tile_buffers,
     )?;
     output_shards[output_shard].tile_submitted();
@@ -683,12 +678,12 @@ fn submit_quantization_tile<P: TileProducer>(
     report.source_tiles = report.source_tiles.saturating_add(1);
     report.source_bytes_read = report
         .source_bytes_read
-        .checked_add(metadata.byte_len())
+        .checked_add(source_bytes)
         .ok_or_else(|| quantization_error("source-read telemetry overflow"))?;
     report.peak_planned_working_set_bytes = report
         .peak_planned_working_set_bytes
         .max(queued_working_set_bytes(pending_tiles)?);
-    report.largest_source_tile_bytes = report.largest_source_tile_bytes.max(metadata.byte_len());
+    report.largest_source_tile_bytes = report.largest_source_tile_bytes.max(source_bytes);
     report.largest_output_tile_bytes = report.largest_output_tile_bytes.max(output_bytes);
     if pending_tiles.len() == tile_buffers {
         write_oldest_tile(pending_tiles, output_shards, allocator_cache)?;

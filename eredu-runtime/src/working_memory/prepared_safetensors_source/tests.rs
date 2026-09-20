@@ -178,8 +178,11 @@ fn prepared_views_keep_typed_file_route_and_resolution_after_inspection_retires(
     ));
     let forbidden = vec!["beta".into()];
     assert!(matches!(
-        SafetensorsEncodedReadPlan::from_source(&source, &forbidden),
-        Err(eredu_checkpoint::store::SafetensorsEncodedReadPlanError::UnauthorizedTensor { .. })
+        SafetensorsEncodedReadPlan::from_source(&source, &forbidden)
+            .err()
+            .unwrap()
+            .kind(),
+        eredu_checkpoint::store::SafetensorsEncodedReadPlanErrorKind::UnauthorizedTensor { .. }
     ));
     let view_bytes =
         WorkingMemoryPool::prepared_safetensors_view_bytes(inspection.tensors(), &contract, POLICY)

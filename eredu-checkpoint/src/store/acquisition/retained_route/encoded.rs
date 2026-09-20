@@ -1,12 +1,12 @@
 //! Shared batch authorization for retained memory and borrowed file constructors.
 use super::*;
 
-enum Refusal<'a> {
+enum Refusal {
     Unknown { index: usize },
-    Unauthorized { index: usize, contract: &'a str },
+    Unauthorized { index: usize },
 }
-impl From<Refusal<'_>> for MemoryEncodedReadRouteError {
-    fn from(value: Refusal<'_>) -> Self {
+impl From<Refusal> for MemoryEncodedReadRouteError {
+    fn from(value: Refusal) -> Self {
         match value {
             Refusal::Unknown { index } => {
                 MemoryEncodedReadPlanError::UnknownTensor { index }.into()
@@ -15,23 +15,12 @@ impl From<Refusal<'_>> for MemoryEncodedReadRouteError {
         }
     }
 }
-impl<'a> From<Refusal<'a>> for SafetensorsEncodedReadPlanError<'a> {
-    fn from(value: Refusal<'a>) -> Self {
-        match value {
-            Refusal::Unknown { index } => Self::UnknownTensor { index },
-            Refusal::Unauthorized { index, contract } => {
-                Self::UnauthorizedTensor { index, contract }
-            }
-        }
-    }
-}
-
 // A leaf or an unqualified dependency has no child. Callers select their concrete
 // leaf before this shared wrapper transition, preserving format-specific APIs.
 fn child<'a>(
     route: Route<'a>,
     keys: &[String],
-) -> Result<Option<&'a RetainedCheckpointSource>, Refusal<'a>> {
+) -> Result<Option<&'a RetainedCheckpointSource>, Refusal> {
     Ok(match route {
         Route::Unavailable | Route::Memory(_) | Route::Safetensors(_) | Route::Gguf(_) => None,
         Route::Prepared(owner) => {
@@ -46,10 +35,7 @@ fn child<'a>(
         Route::Restricted(owner) => {
             for (index, key) in keys.iter().enumerate() {
                 if !owner.is_authorized(key) {
-                    return Err(Refusal::Unauthorized {
-                        index,
-                        contract: &owner.contract,
-                    });
+                    return Err(Refusal::Unauthorized { index });
                 }
             }
             Some(&owner.source)
@@ -63,10 +49,7 @@ fn child<'a>(
                     return Ok(None);
                 };
                 if !materialized && !owner.contract.source_keys().contains(key) {
-                    return Err(Refusal::Unauthorized {
-                        index,
-                        contract: owner.contract.identity(),
-                    });
+                    return Err(Refusal::Unauthorized { index });
                 }
             }
             Some(&owner.source)
@@ -116,13 +99,13 @@ fn borrowed_route<'a>(
     same.then_some(loan)
 }
 
-/// File plans borrow their source so a retained header error remains an exact
-/// loan. The original root keeps every selected wrapper/leaf alive during this
-/// cold selection, inspection and construction, with no allocated route rows.
+/// File plans borrow their source during inspection/construction. Refusals retain
+/// the actual authorization or header owner independently of that loan. Routing
+/// creates no allocated rows and invokes no ordinary read preparation.
 pub(in crate::store) fn encoded_file_source<'a>(
     source: &'a RetainedCheckpointSource,
     keys: &[String],
-) -> Result<Option<&'a SafetensorsWeightStore>, SafetensorsEncodedReadPlanError<'a>> {
+) -> Result<Option<&'a SafetensorsWeightStore>, SafetensorsEncodedReadPlanError> {
     let mut current = source;
     loop {
         let Some(owner) = current.acquisition_owner() else {
@@ -134,7 +117,16 @@ pub(in crate::store) fn encoded_file_source<'a>(
         if let Route::Safetensors(store) = route {
             return Ok(Some(store));
         }
-        let Some(next) = child(route, keys).map_err(SafetensorsEncodedReadPlanError::from)? else {
+        let next = match child(route, keys) {
+            Ok(next) => next,
+            Err(Refusal::Unknown { index }) => {
+                return Err(SafetensorsEncodedReadPlanError::unknown(index));
+            }
+            Err(Refusal::Unauthorized { index, .. }) => {
+                return Err(SafetensorsEncodedReadPlanError::unauthorized(index, owner));
+            }
+        };
+        let Some(next) = next else {
             return Ok(None);
         };
         current = next;

@@ -674,7 +674,7 @@ pub use bulk::{
     EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout,
     EncodedProjectionError, EncodedProjectionBuildError, EncodedReadProjectionPlan,
     MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError, MemoryEncodedReadRouteError,
-    PreparedEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
+    PreparedEncodedRead, SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError, SafetensorsEncodedReadPlanErrorKind,
     SafetensorsEncodedReadBuildCause, SafetensorsEncodedReadBuildError,
 };
 

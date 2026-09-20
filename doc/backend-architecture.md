@@ -1103,10 +1103,11 @@ disposal neither establishes completion nor refunds surviving registrations.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that
-same constructor. The admitted entry refuses missing headers and lends retained
-header errors without cloning or retrying them. Tensor metadata and source-order
-scratch are sized by occurrence count; shard slots are bounded by both occurrence
-and admitted-shard counts, with a conservative maximum selected-path allowance.
+same constructor. The admitted entry refuses missing headers and retains actual
+header-error owners without cloning diagnostics or retrying them. Tensor metadata
+and source-order scratch are sized by occurrence count; shard slots are bounded
+by both occurrence and admitted-shard counts, with a conservative maximum
+selected-path allowance.
 Sorted source spans coalesce in place. Runtime compares before construction and
 retains the completed batch or failed prefix through its original account.
 Touched-metadata and payload diagnostics share fixed flags over one source-owned
@@ -1122,6 +1123,22 @@ allocating route records or invoking ordinary read preparation. Completed file
 batches own their file identities and metadata, so the views may then retire.
 Memory selection retains its selected store independently of the enclosing views.
 Both paths preserve prepared-catalog qualification and composite batch ordering.
+File inspection errors own the existing header or authorization handle and expose
+a fixed kind plus borrowed diagnostic access. Header causes retain the original
+StoreError identity after the root and keys retire. Authorization failures keep
+the exact view and its source alive until error retirement, preserving the
+contract name without allocating a copy or invoking a new source callback.
+
+Runtime composes key admission, closed memory/file routing, read construction and
+recursive compilation through the same pool. Unsupported routes return no read;
+inspection and admission failures propagate with owned diagnostics and prefixes.
+No ordinary read or lease callback serves as a fallback. The tile driver retains
+the original source handle through submission. Each producer returns its validated
+logical input byte count with its completion for shared telemetry. Ordinary
+producers own ordinary lease preflight and metadata inference after the tile fits;
+admitted encoded producers validate/read through their funded source records.
+Source/header birth, candidate recipe and overlay storage, numerical producers
+and complete prepared-manager handoff retain separate responsibilities.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

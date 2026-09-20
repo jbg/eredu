@@ -13,7 +13,7 @@ mod detached;
 mod memory;
 mod file;
 pub use file::{
-    SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError,
+    SafetensorsEncodedReadPlan, SafetensorsEncodedReadPlanError, SafetensorsEncodedReadPlanErrorKind,
     SafetensorsEncodedReadBuildCause, SafetensorsEncodedReadBuildError,
 };
 pub use memory::{

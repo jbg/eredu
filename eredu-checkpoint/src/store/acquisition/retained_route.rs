@@ -21,6 +21,14 @@ enum Owner {
     Resolved(Arc<ResolvedCheckpointSource>),
 }
 impl PreparedAcquisitionOwner {
+    pub(in crate::store) fn encoded_contract(&self) -> Option<&str> {
+        match self.route() {
+            Route::Restricted(owner) => Some(&owner.contract),
+            Route::Resolved(owner) => Some(owner.contract.identity()),
+            _ => None,
+        }
+    }
+
     pub(in crate::store) fn retained_prepared(owner: SourceHandle<PreparedCheckpointSource>) -> Self {
         Self(Owner::RetainedPrepared(owner))
     }
