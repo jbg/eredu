@@ -3,8 +3,14 @@ use super::*;
 use eredu_nn::AttentionArithmetic;
 use safemlx::Dtype;
 mod explicit;
+mod sliding;
+pub(in super::super) fn output_storage(operation:WorkspaceOperationView<'_>)->crate::backend::nn::tensor::GroupedOutputStorage {
+    sliding::output_storage(operation)
+}
 #[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
 mod tests;
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
+mod sliding_tests;
 fn cast(p:&mut CpuPopulation,source:Dtype,destination:Dtype,rank:usize,count:usize)->Option<()> {
     p.copy(OperationEvent::cpu_cast_layout(source,destination,rank,count,false)?,1)
 }
@@ -35,6 +41,7 @@ fn native_dtype(dtype:WorkspaceFloatingType)->Dtype {
 }
 pub(super) fn inspect(operation:WorkspaceOperationView<'_>,mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
+    if let Some(plan)=sliding::inspect(operation,mechanism)? {return Ok(Some(plan));}
     if let Some(plan)=explicit::inspect(operation,mechanism)? {return Ok(Some(plan));}
     if !matches!(operation.kind,WorkspaceOperationKindView::Attention {causal:false,window:None,sinks:false,
         softcap:false,arithmetic:AttentionArithmetic::Fused}) {return Ok(None);}

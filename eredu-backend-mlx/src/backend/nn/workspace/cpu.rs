@@ -37,7 +37,7 @@ mod static_update;
 mod indexed_elements;
 mod gelu;
 mod rope;
-mod attention;
+pub(super) mod attention;
 pub(super) mod blockwise;
 mod causal_mask;
 mod masked_readout;

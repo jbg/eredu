@@ -217,6 +217,10 @@ impl ResidentRecipeRecorder {
                 grouped_outputs = grouped_outputs.merge(super::super::cpu::grouped::output_storage(operation.as_view())
                     .map_err(|cause| self.metadata_source(cause))?).ok_or_else(overflow)?;
             }
+            if matches!(operation.kind, WorkspaceOperationKind::Attention { .. }) {
+                grouped_outputs = grouped_outputs.merge(super::super::cpu::attention::output_storage(operation.as_view()))
+                    .ok_or_else(overflow)?;
+            }
             if matches!(operation.kind,WorkspaceOperationKind::HostStoreFloating(..)) {
                 transient_roots=transient_roots.checked_add(1).ok_or_else(overflow)?;
                 nested_completions=nested_completions.checked_add(1).ok_or_else(overflow)?;

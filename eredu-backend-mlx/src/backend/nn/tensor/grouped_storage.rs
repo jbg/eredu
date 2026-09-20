@@ -179,3 +179,7 @@ impl GroupedChunkOutputs {
         &self.values
     }
 }
+
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
+#[path="sliding_attention_tests.rs"]
+mod sliding_attention_tests;

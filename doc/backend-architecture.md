@@ -759,6 +759,12 @@ query/value-precision product. It uses retained scalar and stride facts for
 reshape and matrix-copy admission. Its source population is distinct from the
 native fused SDPA fallback and from bounded query/key recurrence.
 
+Sliding-window CPU planning composes each actual query tile from three source
+views, the shared causal-mask recipe, and its selected attention recipe. The
+completion retains the exact chunk-table capacity and joins the final transpose
+and reshape, including any physical copy required by the head/token layout.
+Cache offsets and retained source strides determine each tile's key geometry.
+
 The neutral `zeros_like` trace delegates to the existing typed zero constructor,
 using the prototype's authenticated scalar precision and shape without claiming
 its values as graph inputs. Generic host initialization remains a separate
