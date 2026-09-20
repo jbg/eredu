@@ -822,6 +822,14 @@ slot within the role and returns their original failures. Earlier queued tiles
 retire independently when a later constructor fails, without publishing a partial
 converted store. Runtime, stream and retained read metadata funding remains a
 separate prerequisite of this constructor.
+A CPU tile resource owner composes the admitted process allocator and scheduler
+with two distinct registered source streams and their admitted workers. Fixed
+composition controls have their own source account; each native child keeps its
+existing constructor account. The owner exposes borrowed runtime and stream
+access, validates the original pool and retains successful prefixes on later
+construction failure. Foreign domains and active unquoted work refuse before
+runtime construction. Native registrations and worker threads retain their
+accounts for their actual process lifetime after wrapper retirement.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

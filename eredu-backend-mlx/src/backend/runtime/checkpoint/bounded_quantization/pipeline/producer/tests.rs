@@ -43,7 +43,7 @@ impl From<eredu_checkpoint::recipe::RecipeError> for ProducerFailure {
 struct FundedProducer<'a> {
     pool: WorkingMemoryPool,
     runtime: &'a PreparedInputRuntime,
-    streams: &'a [Stream; 2],
+    streams: [&'a Stream; 2],
     slots: Vec<usize>,
     live: Rc<Cell<usize>>,
     peak_live: usize,
@@ -111,7 +111,7 @@ impl TileProducer for FundedProducer<'_> {
         self.peak_live = self.peak_live.max(self.live.get());
         let pool = &self.pool;
         let peak_used = &self.peak_used;
-        let stream = &self.streams[slot];
+        let stream = self.streams[slot];
         if let Some((index, path)) = &self.truncate_at {
             if *index == self.slots.len() - 1 {
                 std::fs::OpenOptions::new()
@@ -217,7 +217,7 @@ fn exercise(
     let mut producer = FundedProducer {
         pool: WorkingMemoryPool::new(1 << 20, 0).unwrap(),
         runtime: &runtime,
-        streams: &streams,
+        streams: streams.each_ref(),
         slots: Vec::new(),
         live: Rc::new(Cell::new(0)),
         peak_live: 0,
@@ -315,7 +315,7 @@ fn producer_failure_retires_the_already_queued_cold_submission() {
     let mut producer = FundedProducer {
         pool: WorkingMemoryPool::new(1 << 20, 0).unwrap(),
         runtime: &runtime,
-        streams: &streams,
+        streams: streams.each_ref(),
         slots: Vec::new(),
         live: Rc::new(Cell::new(0)),
         peak_live: 0,
@@ -382,7 +382,7 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
     let mut producer = FundedProducer {
         pool: WorkingMemoryPool::new(1 << 20, 0).unwrap(),
         runtime: &runtime,
-        streams: &streams,
+        streams: streams.each_ref(),
         slots: Vec::new(),
         live: Rc::new(Cell::new(0)),
         peak_live: 0,
@@ -467,7 +467,7 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let mut producer = FundedProducer {
         pool: WorkingMemoryPool::new(0, 0).unwrap(),
         runtime: &runtime,
-        streams: &streams,
+        streams: streams.each_ref(),
         slots: Vec::new(),
         live: Rc::new(Cell::new(0)),
         peak_live: 0,
@@ -522,4 +522,202 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     assert_eq!(producer.pool.used_bytes().unwrap(), role_bytes);
     drop(error);
     drain(&producer);
+}
+
+#[test]
+fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
+    const CHILD: &str = "EREDU_ADMITTED_CPU_TILE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(
+                "backend::runtime::checkpoint::bounded_quantization::pipeline::producer::tests::",
+                "admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup"
+            ),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ADMITTED_CPU_TILES_OK"));
+        return;
+    }
+    let pool = crate::backend::managed_memory::domain();
+    let baseline = pool.used_bytes().unwrap();
+    let resources = cpu_resources::CpuTileResources::prepare(&pool).unwrap();
+    resources.validate_pool(&pool).unwrap();
+    let controls = resources.original_control_bytes();
+    let persistent = pool.used_bytes().unwrap();
+    assert!(persistent > baseline + controls);
+    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    assert!(resources.validate_pool(&foreign).is_err());
+    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.used_bytes().unwrap(), persistent);
+    assert_ne!(
+        resources.streams()[0].get_index().unwrap(),
+        resources.streams()[1].get_index().unwrap()
+    );
+    for (budget, expected_slots) in [(320, 1), (640, 2)] {
+        let source = Arc::new(
+            MemoryWeightStore::from_safetensors([(
+                "weight".into(),
+                SafeDtype::F32,
+                vec![8, 64],
+                (0..512)
+                    .flat_map(|n| ((n % 16) as f32).to_le_bytes())
+                    .collect(),
+            )])
+            .unwrap(),
+        );
+        let plan = BoundedQuantizationPlan::new(
+            AffineQuantization::new(32, 4).unwrap(),
+            budget,
+            [
+                BoundedQuantizationTarget::direct("weight", "scales", Some("biases"))
+                    .unwrap()
+                    .with_affine_companion_dtype(RecipeDtype::F16)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let prepared = ColdQuantization::prepare(source.into(), plan)
+            .unwrap()
+            .allocate_original(
+                &pool,
+                eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+                resources.streams()[0],
+            )
+            .unwrap();
+        let with_outputs = pool.used_bytes().unwrap();
+        assert!(with_outputs > persistent);
+        // Source/read, recipe, overlay and queue metadata remain separate
+        // fixture prerequisites. Runtime, workers, native tiles and actual
+        // final memory-tensor buffers use their admitted constructors here.
+        let mut producer = FundedProducer {
+            pool: pool.clone(),
+            runtime: resources.runtime(),
+            streams: resources.streams(),
+            slots: Vec::new(),
+            live: Rc::new(Cell::new(0)),
+            peak_live: 0,
+            peak_used: Cell::new(0),
+            largest_tile: 0,
+            fail_at: None,
+            truncate_at: None,
+        };
+        let (result, _) = prepared
+            .materialize_with_producer(DeviceType::Cpu, &mut producer)
+            .unwrap();
+        assert_eq!(result.report().source_tiles, 8);
+        assert_eq!(result.report().peak_in_flight_tiles, expected_slots);
+        assert_eq!(producer.peak_live, expected_slots);
+        assert_eq!(
+            producer.slots,
+            (0..8).map(|i| i % expected_slots).collect::<Vec<_>>()
+        );
+        let expected_words = (0..64)
+            .flat_map(|n| {
+                (if n % 2 == 0 {
+                    0x89abcdef_u32
+                } else {
+                    0x01234567_u32
+                })
+                .to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(bytes(&result, "weight"), expected_words);
+        assert_eq!(
+            bytes(&result, "scales"),
+            (0..16)
+                .flat_map(|_| half::f16::from_f32(-1.0).to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bytes(&result, "biases"),
+            (0..16)
+                .flat_map(|_| half::f16::from_f32(15.0).to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            safemlx::reclaim_allocation_owners();
+            pool.used_bytes() == Ok(with_outputs)
+        });
+        assert_eq!(producer.live.get(), 0);
+        assert_eq!(pool.used_bytes().unwrap(), with_outputs);
+        drop(result);
+        safemlx::reclaim_allocation_owners();
+        assert_eq!(pool.used_bytes().unwrap(), persistent);
+    }
+    drop(resources);
+    safemlx::reclaim_allocation_owners();
+    // The native scheduler, allocator, stream registrations and worker threads
+    // really survive these wrappers. Only the composing controls retire here.
+    assert_eq!(pool.used_bytes().unwrap(), persistent - controls);
+    assert!(pool.used_bytes().unwrap() > baseline);
+    println!("ADMITTED_CPU_TILES_OK");
+}
+
+#[test]
+fn cpu_resource_admission_rejects_foreign_and_unquoted_domains_before_runtime_birth() {
+    const CHILD: &str = "EREDU_CPU_TILE_RESOURCE_REFUSAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                concat!(
+                "backend::runtime::checkpoint::bounded_quantization::pipeline::producer::tests::",
+                "cpu_resource_admission_rejects_foreign_and_unquoted_domains_before_runtime_birth"
+            ),
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("CPU_TILE_RESOURCE_REFUSALS_OK"));
+        return;
+    }
+    fn policy(error: &cpu_resources::ResourceError) -> &WorkingMemoryError {
+        let mut cause: &(dyn std::error::Error + 'static) = error;
+        loop {
+            if let Some(policy) = cause.downcast_ref::<WorkingMemoryError>() {
+                return policy;
+            }
+            cause = cause.source().expect("original policy cause");
+        }
+    }
+    let pool = crate::backend::managed_memory::domain();
+    let before = pool.used_bytes().unwrap();
+    let foreign = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let error = cpu_resources::CpuTileResources::prepare(&foreign).unwrap_err();
+    assert!(matches!(
+        policy(&error),
+        WorkingMemoryError::IdentityMismatch
+    ));
+    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert!(crate::backend::managed_memory::input_allocator::admitted_initializer(&pool).is_err());
+    drop(error);
+    let ordinary = pool.acquire_unquoted().unwrap();
+    let error = cpu_resources::CpuTileResources::prepare(&pool).unwrap_err();
+    assert!(matches!(policy(&error), WorkingMemoryError::UnknownBound));
+    assert_eq!(pool.used_bytes().unwrap(), before);
+    assert!(crate::backend::managed_memory::input_allocator::admitted_initializer(&pool).is_err());
+    drop(error);
+    drop(ordinary);
+    let resources = cpu_resources::CpuTileResources::prepare(&pool).unwrap();
+    resources.validate_pool(&pool).unwrap();
+    println!("CPU_TILE_RESOURCE_REFUSALS_OK");
 }
