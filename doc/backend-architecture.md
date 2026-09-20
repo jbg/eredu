@@ -1290,6 +1290,9 @@ Shared sampling-constructor controls take the selected device explicitly. CPU
 workers retain their operation-specific layout accounting; GPU sampling also
 requires Metal random-worker controls. Eager random-key preparation uses the
 host constructor and issues no device evaluation.
+A recipe with a certified zero GPU-kernel population creates no pipeline cache.
+Unknown populations remain unqualified, and positive populations require the
+existing native cache layout and admitted construction.
 
 Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
 selected checkpoint contract. Ordinary and admitted preparation share the same
