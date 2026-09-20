@@ -310,7 +310,7 @@ use leases::WeightLeaseSource;
 mod tests;
 
 pub(crate) use materialization::{
-    ColdMaterializationSlot, PreparedMaterializationObservation, PreparedPendingWeight,
+    ColdMaterializationSlot, ColdMaterializationSlotError, PreparedMaterializationObservation, PreparedPendingWeight,
     PreparedWeightMaterialization,
 };
 
@@ -322,7 +322,7 @@ pub(crate) use acquisition::PreparedSourceAcquisitions;
 
 mod prepared_streams;
 mod encoded_input;
-pub(crate) use encoded_input::PreparedEncodedInputPlan;
+pub(crate) use encoded_input::{EncodedInputConstructionError, PreparedEncodedInputPlan};
 mod source_stream;
 pub use prepared_streams::PreparedMaterializationStreamError;
 pub(crate) use prepared_streams::{

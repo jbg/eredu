@@ -814,6 +814,14 @@ cold submission after successful writeback. A later submission or writeback
 failure drops the same queued owners through their existing recovery paths.
 The common driver takes the selected device fact without constructing device or
 stream wrappers; producer resources and pipeline metadata need separate admission.
+The queue propagates the producer's concrete failure type, including thread-local
+construction owners. A cold callback failure retains its typed cause and pending
+native role together; separating success from failure neither waits nor releases
+that role. Encoded affine construction admits its input and fixed materialization
+slot within the role and returns their original failures. Earlier queued tiles
+retire independently when a later constructor fails, without publishing a partial
+converted store. Runtime, stream and retained read metadata funding remains a
+separate prerequisite of this constructor.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

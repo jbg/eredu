@@ -1110,7 +1110,7 @@ mod recovery_tests {
 
 mod operation_slots;
 mod cold_slot;
-pub(crate) use cold_slot::ColdMaterializationSlot;
+pub(crate) use cold_slot::{ColdMaterializationSlot, ColdMaterializationSlotError};
 pub(crate) use operation_slots::{
     PreparedMaterializationObservation, PreparedPendingWeight, PreparedWeightMaterialization,
 };

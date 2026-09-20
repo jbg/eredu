@@ -114,13 +114,13 @@ impl super::preparation::PreparedQuantization {
         self,
         device_type: safemlx::DeviceType,
         producer: &mut P,
-    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), Error> {
+    ) -> Result<(BoundedQuantizedWeightStore, BoundedQuantizationPlan), P::Error> {
         if self.workspace
             != super::workspace::QuantizerWorkspace::selected(self.plan.quantization, device_type)
         {
             return Err(quantization_error(
                 "quantization destinations require preparation for the selected stream",
-            ));
+            ).into());
         }
         let Self {
             workspace: _,
@@ -377,7 +377,7 @@ fn transform_target<P: TileProducer>(
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile<P::Completion>>,
     allocator_cache: &mut BoundedAllocatorCache,
     report: &mut WeightMaterializationReport,
-) -> Result<(), Error> {
+) -> Result<(), P::Error> {
     let super::preparation::ConversionGeometry {
         leading,
         rows,
@@ -483,7 +483,7 @@ fn transform_target<P: TileProducer>(
                 return Err(quantization_error(format!(
                     "bounded quantization target {:?} cannot admit one leading matrix within the {}-byte tile slot",
                     target.weight_name, tile_budget
-                )));
+                )).into());
             }
             submit_quantization_tile(
                 source,
@@ -560,7 +560,7 @@ fn transform_target<P: TileProducer>(
                     return Err(quantization_error(format!(
                         "bounded quantization planner admitted {} rows for {:?}, but their {}-byte working set exceeds the {}-byte tile slot",
                         tile_rows, target.weight_name, tile_peak, tile_budget
-                    )));
+                    )).into());
                 }
                 let output_start = matrix
                     .checked_mul(rows)
@@ -622,7 +622,7 @@ fn submit_quantization_tile<P: TileProducer>(
     pending_tiles: &mut VecDeque<SubmittedQuantizationTile<P::Completion>>,
     allocator_cache: &mut BoundedAllocatorCache,
     report: &mut WeightMaterializationReport,
-) -> Result<(), Error> {
+) -> Result<(), P::Error> {
     allocator_cache.prepare_submission(
         queued_working_set_bytes(pending_tiles)?,
         planned_working_set_bytes,

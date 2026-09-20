@@ -6,7 +6,7 @@ use eredu_runtime::working_memory::{
     WorkingMemoryError, WorkingMemoryPool,
 };
 use safemlx::{PreparedInputRuntime, PreparedOriginalBufferBudget};
-use std::cell::RefCell;
+use std::{cell::RefCell, convert::Infallible};
 
 type Custody = HostPreparationAuthority;
 
@@ -43,12 +43,55 @@ impl<I: 'static, T, E> Submission<I, T, E> {
     pub(crate) fn result(&self) -> &Result<T, E> {
         &self.result
     }
+    /// Separate a successful result from a failed invocation without waiting or
+    /// releasing its pending native owner. The failed branch retains both the
+    /// concrete cause/prefix and the same completion/recovery state.
+    pub(crate) fn into_result(
+        self,
+    ) -> Result<Submission<I, T, Infallible>, FailedSubmission<I, E>> {
+        let Self { result, pending } = self;
+        match result {
+            Ok(value) => Ok(Submission {
+                result: Ok(value),
+                pending,
+            }),
+            Err(cause) => Err(FailedSubmission {
+                cause,
+                _pending: pending,
+            }),
+        }
+    }
     pub(crate) fn finish(self) -> Result<Result<T, E>, eredu_core::BackendFailure> {
         let Self { result, pending } = self;
         if result.is_ok() {
             pending.finish()?;
         }
         Ok(result)
+    }
+}
+
+/// A failed callback together with its independently scoped native invocation.
+/// Thread-local completion resources remain owned here until ordinary recovery
+/// on Drop. Exposing the typed cause grants no completion or transfer authority.
+pub(crate) struct FailedSubmission<I: 'static, E> {
+    cause: E,
+    _pending: PendingRole<I, Custody>,
+}
+impl<I: 'static, E: std::fmt::Debug> std::fmt::Debug for FailedSubmission<I, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FailedColdSubmission")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+impl<I: 'static, E: std::fmt::Display> std::fmt::Display for FailedSubmission<I, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl<I: 'static, E: std::error::Error + 'static> std::error::Error for FailedSubmission<I, E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 
@@ -140,6 +183,7 @@ where
             size_of::<(&WorkingMemoryPool, &PreparedInputRuntime)>(),
             size_of::<Self::Output>(),
             size_of::<Option<Submission<I, T, E>>>(),
+            size_of::<Result<Submission<I, T, Infallible>, FailedSubmission<I, E>>>(),
             size_of::<std::cell::RefMut<'_, Option<Submission<I, T, E>>>>(),
         ];
         controls

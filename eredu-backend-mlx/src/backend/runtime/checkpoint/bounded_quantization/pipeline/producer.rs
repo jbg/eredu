@@ -43,6 +43,7 @@ impl<I: 'static> TileCompletion for cold::Submission<I, WeightMaterialization, I
 
 pub(in super::super) trait TileProducer {
     type Completion: TileCompletion;
+    type Error: From<Error> + From<eredu_checkpoint::recipe::RecipeError>;
 
     fn submit(
         &mut self,
@@ -51,7 +52,7 @@ pub(in super::super) trait TileProducer {
         target: &BoundedQuantizationTarget,
         quantization: WeightQuantization,
         slot: usize,
-    ) -> Result<Self::Completion, Error>;
+    ) -> Result<Self::Completion, Self::Error>;
 }
 
 pub(super) struct OrdinaryTileProducer(
@@ -60,6 +61,7 @@ pub(super) struct OrdinaryTileProducer(
 
 impl TileProducer for OrdinaryTileProducer {
     type Completion = WeightMaterialization;
+    type Error = Error;
 
     fn submit(
         &mut self,
@@ -77,6 +79,8 @@ impl TileProducer for OrdinaryTileProducer {
         Ok(prepared.submit_prepared_outputs()?)
     }
 }
+
+mod encoded_affine;
 
 #[cfg(test)]
 mod tests;
