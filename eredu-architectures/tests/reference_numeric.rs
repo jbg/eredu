@@ -10957,7 +10957,7 @@ where
             fn visit_slot(
                 &mut self,
                 metadata: eredu_nn::ParameterMetadataView<'_>,
-                value: &mut NumericTensor,
+                value: &NumericTensor,
             ) {
                 assert!(self
                     .0
