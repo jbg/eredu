@@ -7,6 +7,8 @@ use std::alloc::Layout;
 /// return its own built-in owner. Forwarding another owner's loan is rejected.
 pub struct PreparedAcquisitionOwner(Owner);
 enum Owner {
+    RetainedPrepared(SourceHandle<PreparedCheckpointSource>),
+    RetainedResolved(SourceHandle<ResolvedCheckpointSource>),
     RetainedSafetensors(SourceHandle<SafetensorsWeightStore>),
     RetainedGguf(SourceHandle<crate::gguf_store::GgufWeightStore>),
     RetainedComposite(SourceHandle<CompositeCheckpointSource>),
@@ -19,6 +21,13 @@ enum Owner {
     Resolved(Arc<ResolvedCheckpointSource>),
 }
 impl PreparedAcquisitionOwner {
+    pub(in crate::store) fn retained_prepared(owner: SourceHandle<PreparedCheckpointSource>) -> Self {
+        Self(Owner::RetainedPrepared(owner))
+    }
+    pub(in crate::store) fn retained_resolved(owner: SourceHandle<ResolvedCheckpointSource>) -> Self {
+        Self(Owner::RetainedResolved(owner))
+    }
+
     pub(in crate::store) fn retained_safetensors(
         owner: SourceHandle<SafetensorsWeightStore>,
     ) -> Self {
@@ -45,6 +54,8 @@ impl PreparedAcquisitionOwner {
             Owner::Memory(owner) => owner.as_ref(),
             Owner::Safetensors(owner) => owner.as_ref(),
             Owner::Gguf(owner) => owner.as_ref(),
+            Owner::RetainedPrepared(owner) => &**owner,
+            Owner::RetainedResolved(owner) => &**owner,
             Owner::Prepared(owner) => owner.as_ref(),
             Owner::Restricted(owner) => owner.as_ref(),
             Owner::Composite(owner) => owner.as_ref(),
@@ -59,6 +70,8 @@ impl PreparedAcquisitionOwner {
             Owner::Memory(owner) => Route::Memory(owner),
             Owner::Safetensors(owner) => Route::Safetensors(owner),
             Owner::Gguf(owner) => Route::Gguf(owner),
+            Owner::RetainedPrepared(owner) => Route::Prepared(owner),
+            Owner::RetainedResolved(owner) => Route::Resolved(owner),
             Owner::Prepared(owner) => Route::Prepared(owner),
             Owner::Restricted(owner) => Route::Restricted(owner),
             Owner::Composite(owner) => Route::Composite(owner),

@@ -220,9 +220,9 @@ impl WorkingMemoryPool {
         &self,
         source: &RetainedCheckpointSource,
     ) -> Result<(), WorkingMemoryError> {
-        let custody = source
-            .constructor_control_owner::<ErasureCustody>()
-            .ok_or(WorkingMemoryError::UnknownBound)?;
+        let Some(custody) = source.constructor_control_owner::<ErasureCustody>() else {
+            return self.validate_prepared_safetensors_controls(source);
+        };
         if custody.0.matches_pool(self) {
             Ok(())
         } else {

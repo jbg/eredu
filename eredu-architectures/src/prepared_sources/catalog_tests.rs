@@ -10,7 +10,15 @@ fn selected(
     ModelPreparationPlan<ArtifactArchitecturePlan>,
     SelectedPreparation,
 ) {
-    let inspection = crate::configuration::inspect_artifact(path).unwrap();
+    selected_inspection(crate::configuration::inspect_artifact(path).unwrap())
+}
+
+fn selected_inspection(
+    inspection: eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+) -> (
+    ModelPreparationPlan<ArtifactArchitecturePlan>,
+    SelectedPreparation,
+) {
     let selected = crate::select_preparation(
         &inspection,
         &eredu_runtime::NormalizedLoadRequest::default(),
@@ -188,5 +196,89 @@ fn retained_catalog_sources_reach_both_artifact_routes_and_last_opaque_identity(
     drop(union_identity);
     assert_eq!(pool.used_bytes().unwrap(), 0);
     drop(ordinary);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
+fn admitted_safetensors_inspection_reaches_selected_source_graph_without_rediscovery() {
+    use eredu_checkpoint::store::EncodedTensorLease;
+    use eredu_runtime::working_memory::DependencyMemoryPolicy;
+    let qualification = WorkingMemoryPool::safetensors_source_erasure_required_bytes();
+    if std::env::var_os("EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE").is_some() {
+        assert!(qualification.is_ok(), "{qualification:?}");
+    }
+    if matches!(qualification, Err(WorkingMemoryError::UnknownBound)) {
+        return;
+    }
+    qualification.unwrap();
+    let (directory, original) = crate::preparation_selection::tests::inspected_llama();
+    drop(original);
+    let path = directory.path().join("model.safetensors");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let header = usize::try_from(u64::from_le_bytes(bytes[..8].try_into().unwrap())).unwrap();
+    for value in bytes[8 + header..].chunks_exact_mut(4) {
+        value.copy_from_slice(&0.25f32.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).unwrap();
+    // This integration uses default metadata headroom for both inspection and
+    // pinned views. Exact/one-byte-short view budgets are covered in runtime.
+    let pool = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let (ordinary_plan, ordinary_selection) = selected(directory.path());
+    let error = prepare_model_sources_with_catalog_pool(ordinary_plan, ordinary_selection, &pool)
+        .err()
+        .expect("ordinary shards have no source origin");
+    assert!(matches!(
+        error,
+        PreparedModelSourcesError::SafetensorsConstructor(_)
+    ));
+    drop(error);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    let inspection = pool
+        .inspect_artifact_with_safetensors_pool(
+            directory.path(),
+            &crate::configuration::MODEL_CONFIGURATIONS,
+            eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
+            DependencyMemoryPolicy::default(),
+        )
+        .unwrap();
+    let (ordinary_plan, ordinary_selection) = selected_inspection(inspection.clone());
+    let ordinary = prepare_model_sources(ordinary_plan, ordinary_selection).unwrap();
+    let (plan, selection) = selected_inspection(inspection);
+    std::fs::remove_file(directory.path().join("config.json")).unwrap();
+    let sources = prepare_model_sources_with_catalog_pool(plan, selection, &pool).unwrap();
+    pool.validate_retained_source_controls(sources.primary())
+        .unwrap();
+    pool.validate_retained_source_controls(sources.complete())
+        .unwrap();
+    assert!(matches!(
+        pool.validate_retained_source_controls(ordinary.primary()),
+        Err(WorkingMemoryError::UnknownBound)
+    ));
+    assert_eq!(sources.source_metadata(), ordinary.source_metadata());
+    assert_eq!(sources.resolutions(), ordinary.resolutions());
+    assert_eq!(
+        sources
+            .primary()
+            .source_diagnostics()
+            .unwrap()
+            .physical_reads,
+        0
+    );
+    let key = sources.primary().source_keys().into_iter().next().unwrap();
+    let lease = sources
+        .primary()
+        .acquire_lease(TensorReadRequest {
+            key,
+            selection: TensorSelection::Full,
+            policy: ReadPolicy::RequireBounded,
+        })
+        .unwrap();
+    assert_eq!(&lease.encoded_bytes().unwrap()[..4], &0.25f32.to_le_bytes());
+    drop(lease);
+    let identity = sources.primary().identity();
+    drop(sources);
+    drop(ordinary);
+    assert!(pool.used_bytes().unwrap() > 0);
+    drop(identity);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }

@@ -976,6 +976,24 @@ These explicit inspection and store entries do not establish admission for the
 ordinary production inspection/preparation entry points. Subsequent prepared
 views, provenance maps, payloads and recipe storage require separate admission.
 
+Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
+selected checkpoint contract. Ordinary and admitted preparation share the same
+descriptor conversion, metadata comparison and provenance construction. Runtime
+reserves configurable metadata/provenance/contract-map estimates and the fixed
+outer wrapper requests before making their copies. The resulting typed prepared
+and resolved owners preserve the existing authenticated file-read route and
+contract checks. Strong aliases and opaque weak identities retain the wrapper
+custody without keeping the pool alive; failure retains the original leaf and
+accepted contribution. Metadata estimates do not cover future recipe entries or
+payload buffers.
+
+Architecture source preparation with an explicit catalog pool uses this pinned
+SafeTensors path and requires shards inspected under that same pool. It also
+retains the existing GGUF catalog construction path. Ordinary source preparation
+continues through its shared constructors without claiming pool admission.
+Architecture graph snapshots, projected views, manager storage and native
+materialization have independent ownership and admission responsibilities.
+
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that
 same constructor. The admitted entry refuses missing headers and lends retained

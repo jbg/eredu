@@ -30,6 +30,8 @@ use std::{
 pub struct RetainedCheckpointSource(Owner);
 #[derive(Clone)]
 enum Owner {
+    Prepared(SourceHandle<super::PreparedCheckpointSource>),
+    Resolved(SourceHandle<super::ResolvedCheckpointSource>),
     Safetensors(SourceHandle<SafetensorsWeightStore>),
     Ordinary(SharedCheckpointSource),
     Gguf(SourceHandle<GgufWeightStore>),
@@ -55,6 +57,8 @@ impl std::ops::Deref for RetainedCheckpointSource {
 impl AsRef<dyn CheckpointSource> for RetainedCheckpointSource {
     fn as_ref(&self) -> &(dyn CheckpointSource + 'static) {
         match &self.0 {
+            Owner::Prepared(source) => &**source,
+            Owner::Resolved(source) => &**source,
             Owner::Safetensors(source) => &**source,
             Owner::Ordinary(source) => source.as_ref(),
             Owner::Gguf(source) => &**source,
@@ -64,6 +68,35 @@ impl AsRef<dyn CheckpointSource> for RetainedCheckpointSource {
     }
 }
 impl RetainedCheckpointSource {
+    /// Ordinary typed SafeTensors ownership, without constructor custody.
+    pub fn from_safetensors(source: SafetensorsWeightStore) -> Self {
+        Self(Owner::Safetensors(SourceHandle::new(source, None)))
+    }
+    pub(super) fn safetensors(&self) -> Option<&SafetensorsWeightStore> {
+        match &self.0 { Owner::Safetensors(source) => Some(source), _ => None }
+    }
+    /// Retains an exact prepared catalog and its separately admitted custody.
+    /// This preserves the built-in acquisition route, not a runtime origin claim.
+    pub fn from_prepared_with_custody<C: Any + fmt::Debug + Send + Sync>(
+        source: super::PreparedCheckpointSource, custody: C,
+    ) -> Self {
+        Self(Owner::Prepared(SourceHandle::new(source, Some(SourceControl::new(custody)))))
+    }
+    /// Retains the selected contract view and its separately admitted custody.
+    pub fn from_resolved_with_custody<C: Any + fmt::Debug + Send + Sync>(
+        source: super::ResolvedCheckpointSource, custody: C,
+    ) -> Self {
+        Self(Owner::Resolved(SourceHandle::new(source, Some(SourceControl::new(custody)))))
+    }
+    /// Actual prepared wrapper allocation and opaque custody controls.
+    pub fn prepared_storage_request<C>() -> Option<SourceErasureStorageRequest> {
+        request::<super::PreparedCheckpointSource, C>()
+    }
+    /// Actual selected-contract wrapper allocation and opaque custody controls.
+    pub fn resolved_storage_request<C>() -> Option<SourceErasureStorageRequest> {
+        request::<super::ResolvedCheckpointSource, C>()
+    }
+
     /// Move the concrete SafeTensors source into closed lifetime ownership.
     /// The typed source supplies the existing file acquisition route; arbitrary
     /// caller custody does not certify runtime admission of source or outer data.
@@ -156,6 +189,8 @@ impl RetainedCheckpointSource {
     pub fn constructor_control_owner<C: Any>(&self) -> Option<&C> {
         match &self.0 {
             Owner::Ordinary(_) => None,
+            Owner::Prepared(source) => source.origin(),
+            Owner::Resolved(source) => source.origin(),
             Owner::Safetensors(source) => source.origin(),
             Owner::Gguf(source) => source.origin(),
             Owner::Composite(source) => source.origin(),
@@ -166,6 +201,8 @@ impl RetainedCheckpointSource {
     pub fn same_source(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (Owner::Ordinary(a), Owner::Ordinary(b)) => Arc::ptr_eq(a, b),
+            (Owner::Prepared(a), Owner::Prepared(b)) => a.same(b),
+            (Owner::Resolved(a), Owner::Resolved(b)) => a.same(b),
             (Owner::Safetensors(a), Owner::Safetensors(b)) => a.same(b),
             (Owner::Gguf(a), Owner::Gguf(b)) => a.same(b),
             (Owner::Composite(a), Owner::Composite(b)) => a.same(b),
@@ -182,6 +219,8 @@ impl RetainedCheckpointSource {
     pub fn identity(&self) -> CheckpointSourceIdentity {
         CheckpointSourceIdentity(match &self.0 {
             Owner::Ordinary(source) => Identity::Ordinary(Arc::downgrade(source)),
+            Owner::Prepared(source) => Identity::Closed(source.identity()),
+            Owner::Resolved(source) => Identity::Closed(source.identity()),
             Owner::Safetensors(source) => Identity::Closed(source.identity()),
             Owner::Gguf(source) => Identity::Closed(source.identity()),
             Owner::Composite(source) => Identity::Closed(source.identity()),
@@ -194,6 +233,8 @@ impl RetainedCheckpointSource {
                 let owner = Arc::clone(source).prepared_acquisition_owner()?;
                 std::ptr::addr_eq(owner.source(), source.as_ref()).then_some(owner)
             }
+            Owner::Prepared(source) => Some(PreparedAcquisitionOwner::retained_prepared(source.clone())),
+            Owner::Resolved(source) => Some(PreparedAcquisitionOwner::retained_resolved(source.clone())),
             Owner::Safetensors(source) => Some(PreparedAcquisitionOwner::retained_safetensors(source.clone())),
             Owner::Gguf(source) => Some(PreparedAcquisitionOwner::retained_gguf(source.clone())),
             Owner::Composite(source) => {

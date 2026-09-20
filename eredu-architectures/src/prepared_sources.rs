@@ -995,6 +995,9 @@ pub enum PreparedModelSourcesError {
     /// Exact original root allocation refused before source publication.
     #[error(transparent)]
     SourceErasure(#[from] eredu_runtime::working_memory::OriginalRetainedSourceError),
+    /// SafeTensors source and pinned-view construction refused with retained custody.
+    #[error(transparent)]
+    SafetensorsConstructor(#[from] eredu_runtime::working_memory::OriginalPreparedSafetensorsError),
     /// Typed retained union input did not contain the required built-in sources.
     #[error(transparent)]
     CompositeInput(#[from] eredu_checkpoint::store::GgufCompositeInputError),
@@ -1012,11 +1015,12 @@ pub fn prepare_model_sources(
     prepare_model_sources_impl(plan, selected, None)
 }
 
-/// Same selected cold driver with an explicitly supplied pool for immutable GGUF
-/// catalog, reader/materializer and built-in union construction. Outer erasure
-/// shells, future recipe entries, graph/manager storage and other constructors
+/// Same selected cold driver with an explicitly supplied pool for source catalogs,
+/// readers and built-in views. SafeTensors shards must come from inspection using
+/// this pool's source policy. GGUF catalogs use their original prepared headers.
+/// Future recipe entries, graph snapshots, manager storage and other constructors
 /// remain separate prerequisites. This is not complete model admission and never
-/// promotes an ordinary source or catalog.
+/// promotes ordinary SafeTensors discovery into admitted ownership.
 pub fn prepare_model_sources_with_catalog_pool(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: SelectedPreparation,
@@ -1134,6 +1138,7 @@ fn prepare_model_sources_impl(
             tensors,
             shards,
             max_cached_sources,
+            catalog_pool,
         ),
         ModelArtifact::Gguf { validated, .. } => {
             if prediction_extension.is_some() {
@@ -1224,6 +1229,7 @@ fn prepare_safetensors_sources(
     tensors: eredu_core::checkpoint::TensorCatalog,
     shards: eredu_checkpoint::safetensors::SafetensorsShards,
     max_cached_shards: usize,
+    catalog_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     let target_architecture = architecture.safetensors_architecture().ok_or_else(|| {
         PreparedModelSourcesError::InvalidSelection(
@@ -1249,14 +1255,15 @@ fn prepare_safetensors_sources(
             )
         })?
         .clone();
-    let primary: RetainedCheckpointSource =
-        eredu_core::artifact::open_prepared_safetensors_artifact(
-            &tensors,
-            shards,
-            source_resolution.clone(),
-            max_cached_shards,
-        )?
-        .into();
+    let primary = match catalog_pool {
+        Some(pool) => pool.prepare_safetensors_artifact(
+            &tensors, shards, &source_resolution, max_cached_shards,
+            eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+        )?,
+        None => eredu_core::artifact::open_prepared_safetensors_artifact(
+            &tensors, shards, source_resolution.clone(), max_cached_shards,
+        )?.into(),
+    };
     let complete = primary.clone();
     let (target, extension) = match prediction_extension.as_ref() {
         Some(extension) => {

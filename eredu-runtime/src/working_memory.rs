@@ -63,6 +63,8 @@ mod safetensors_header_source;
 pub use safetensors_header_source::{SafetensorsHeaderPolicyError, SafetensorsHeaderQuote};
 mod safetensors_source;
 pub use safetensors_source::{OriginalArtifactInspectionError, OriginalSafetensorsSourceError};
+mod prepared_safetensors_source;
+pub use prepared_safetensors_source::OriginalPreparedSafetensorsError;
 pub use gguf_catalog::{OriginalGgufCatalog, OriginalGgufCatalogError};
 pub use gguf_source::{GgufSourceStorageKey, OriginalGgufSourceError};
 

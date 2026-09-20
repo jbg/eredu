@@ -763,17 +763,30 @@ impl PreparedCheckpointSource {
         catalog: BTreeMap<String, TensorMetadata>,
         max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
-        let source = Arc::new(SafetensorsWeightStore::open_admitted(
-            shards,
-            max_cached_shards,
-        )?);
-        if source.catalog.len() != catalog.len() {
+        let source = RetainedCheckpointSource::from_safetensors(
+            SafetensorsWeightStore::open_admitted(shards, max_cached_shards)?,
+        );
+        Self::pin_safetensors(source, catalog)
+    }
+
+    /// Pins the exact typed SafeTensors source to inspected metadata. This shares
+    /// ordinary preparation's comparison and provenance construction, without
+    /// reopening a source or acquiring payloads. The caller retains input and
+    /// admission custody separately if it needs them preserved on failure.
+    pub fn pin_safetensors(
+        source: RetainedCheckpointSource,
+        catalog: BTreeMap<String, TensorMetadata>,
+    ) -> Result<Self, StoreError> {
+        let store = source.safetensors().ok_or_else(|| StoreError::PreparedCatalogMismatch {
+            key: "<source>".into(),
+        })?;
+        if store.catalog.len() != catalog.len() {
             return Err(StoreError::PreparedCatalogMismatch {
                 key: "<catalog>".into(),
             });
         }
         for (key, metadata) in &catalog {
-            if source.cached_metadata(key)? != *metadata {
+            if store.prepare_metadata(key)? != metadata {
                 return Err(StoreError::PreparedCatalogMismatch { key: key.clone() });
             }
         }
