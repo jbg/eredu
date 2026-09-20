@@ -25,6 +25,11 @@ impl RecipeInferenceLayout {
     pub const fn required_bytes(self) -> usize {
         self.bytes
     }
+    /// Maximum dimensions in a worker shape allocation, including its output.
+    /// This is a checked capacity bound derived from all recipe nodes.
+    pub const fn shape_capacity(self) -> usize {
+        self.rank
+    }
     /// Inspect only borrowed metadata. Missing borrowed catalog support stays unknown.
     pub fn inspect<C: RecipeCatalog + ?Sized>(
         input: RecipeInferenceInput<'_>,
@@ -67,6 +72,8 @@ impl RecipeInferenceLayout {
             size_of::<Option<Action<'static>>>(),
             size_of::<Result<(), TryReserveError>>(),
             size_of::<RecipeInferenceInput<'static>>(),
+            size_of::<RecipeInferencePlan<'static, dyn RecipeCatalog>>(),
+            size_of::<Result<RecipeMetadata, RecipeInferenceError>>(),
         ] {
             bytes = bytes.checked_add(n)?;
         }
@@ -332,14 +339,58 @@ impl Worker<'_> {
         self.append(metadata)
     }
 }
-/// Executes the actual uncached inference once, without constructing a recipe or
-/// consulting/inserting an inference cache. All temporary owners retire before return.
+/// Inspected inference bound to its original borrowed recipe and catalog.
+///
+/// Construction inspects retained metadata without allocating. Inference uses
+/// that same finite layout, returns the actual output metadata without cloning,
+/// and retires all other scratch before return. The catalog's borrowed metadata
+/// must remain immutable for the plan's lifetime. This plan grants no funding.
+pub struct RecipeInferencePlan<'a, C: ?Sized> {
+    input: RecipeInferenceInput<'a>,
+    catalog: &'a C,
+    layout: RecipeInferenceLayout,
+}
+impl<'a, C: RecipeCatalog + ?Sized> RecipeInferencePlan<'a, C> {
+    /// Inspect the source and recipe without reading payloads or consulting caches.
+    pub fn new(input: RecipeInferenceInput<'a>, catalog: &'a C) -> Option<Self> {
+        Some(Self {
+            input,
+            catalog,
+            layout: RecipeInferenceLayout::inspect(input, catalog)?,
+        })
+    }
+
+    /// Requested inference storage, including the returned metadata allocation.
+    pub const fn layout(&self) -> RecipeInferenceLayout {
+        self.layout
+    }
+
+    /// Execute the finite worker once. The caller retains admission for the
+    /// returned metadata until its destruction, including any owned error.
+    pub fn infer(self) -> Result<RecipeMetadata, RecipeInferenceError> {
+        infer(self)
+    }
+}
+
+/// Executes the same finite worker and retires every metadata allocation before return.
 pub fn infer_recipe_bytes<C: RecipeCatalog + ?Sized>(
     input: RecipeInferenceInput<'_>,
     catalog: &C,
 ) -> Result<u64, RecipeInferenceError> {
-    let layout =
-        RecipeInferenceLayout::inspect(input, catalog).ok_or(RecipeInferenceError::Unavailable)?;
+    RecipeInferencePlan::new(input, catalog)
+        .ok_or(RecipeInferenceError::Unavailable)?
+        .infer()
+        .map(|metadata| metadata.byte_len())
+}
+
+fn infer<C: RecipeCatalog + ?Sized>(
+    plan: RecipeInferencePlan<'_, C>,
+) -> Result<RecipeMetadata, RecipeInferenceError> {
+    let RecipeInferencePlan {
+        input,
+        catalog,
+        layout,
+    } = plan;
     let mut worker = Worker {
         actions: Vec::new(),
         values: Vec::new(),
@@ -401,7 +452,11 @@ pub fn infer_recipe_bytes<C: RecipeCatalog + ?Sized>(
     if worker.roots.len() != 1 {
         return Err(RecipeInferenceError::Unavailable);
     }
-    Ok(worker.values[worker.roots[0]].byte_len)
+    let root = worker.roots[0];
+    if root >= worker.values.len() {
+        return Err(RecipeInferenceError::Unavailable);
+    }
+    Ok(worker.values.swap_remove(root))
 }
 
 #[cfg(test)]
@@ -477,5 +532,145 @@ mod tests {
             .unwrap(),
             16
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    struct Catalog(TensorMetadata);
+    impl RecipeCatalog for Catalog {
+        fn tensor_metadata(&self, _: &str) -> Result<TensorMetadata, StoreError> {
+            panic!("finite plans borrow metadata")
+        }
+        fn tensor_metadata_borrowed(&self, _: &str) -> Option<&TensorMetadata> {
+            Some(&self.0)
+        }
+        fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+            panic!("finite plans do not consult caches")
+        }
+    }
+    #[test]
+    fn inspected_plan_returns_owned_output_for_every_recipe_operation() {
+        let outputs = {
+            let catalog = Catalog(TensorMetadata {
+                name: "w".into(),
+                logical_shape: vec![2, 3],
+                physical_shape: vec![2, 3],
+                stored_dtype: StoredDtype::F32,
+                encoded_byte_len: 24,
+                backing_shard: None,
+            });
+            let source = || DerivedWeightRecipe::source("w", TensorSelection::Full);
+            let cases = [
+                (source(), vec![2, 3], RecipeDtype::F32, 24),
+                (
+                    DerivedWeightRecipe::Select {
+                        input: Box::new(source()),
+                        selection: TensorSelection::Indices {
+                            axis: 1,
+                            indices: vec![2, 0],
+                        },
+                    },
+                    vec![2, 2],
+                    RecipeDtype::F32,
+                    16,
+                ),
+                (
+                    DerivedWeightRecipe::Concatenate {
+                        axis: 1,
+                        inputs: vec![source(), source()],
+                    },
+                    vec![2, 6],
+                    RecipeDtype::F32,
+                    48,
+                ),
+                (
+                    DerivedWeightRecipe::Stack {
+                        axis: 1,
+                        inputs: vec![source(), source()],
+                    },
+                    vec![2, 2, 3],
+                    RecipeDtype::F32,
+                    48,
+                ),
+                (
+                    DerivedWeightRecipe::Reshape {
+                        input: Box::new(source()),
+                        shape: vec![6],
+                    },
+                    vec![6],
+                    RecipeDtype::F32,
+                    24,
+                ),
+                (
+                    DerivedWeightRecipe::Transpose {
+                        input: Box::new(source()),
+                        axes: vec![1, 0],
+                    },
+                    vec![3, 2],
+                    RecipeDtype::F32,
+                    24,
+                ),
+                (
+                    DerivedWeightRecipe::Cast {
+                        input: Box::new(source()),
+                        dtype: RecipeDtype::F16,
+                    },
+                    vec![2, 3],
+                    RecipeDtype::F16,
+                    12,
+                ),
+                (
+                    DerivedWeightRecipe::View {
+                        input: Box::new(source()),
+                        dtype: RecipeDtype::U8,
+                        shape: vec![24],
+                    },
+                    vec![24],
+                    RecipeDtype::U8,
+                    24,
+                ),
+                (
+                    DerivedWeightRecipe::NegLog {
+                        input: Box::new(source()),
+                    },
+                    vec![2, 3],
+                    RecipeDtype::F32,
+                    24,
+                ),
+                (
+                    DerivedWeightRecipe::SubtractOne {
+                        input: Box::new(source()),
+                    },
+                    vec![2, 3],
+                    RecipeDtype::F32,
+                    24,
+                ),
+            ];
+            cases
+                .into_iter()
+                .map(|(recipe, shape, dtype, bytes)| {
+                    let plan =
+                        RecipeInferencePlan::new(RecipeInferenceInput::Derived(&recipe), &catalog)
+                            .unwrap();
+                    assert!(plan.layout().shape_capacity() >= shape.len());
+                    assert!(
+                        plan.layout().required_bytes()
+                            >= plan.layout().shape_capacity() * size_of::<usize>()
+                    );
+                    let output = plan.infer().unwrap();
+                    assert_eq!(output.shape(), shape);
+                    assert_eq!(output.dtype(), &dtype);
+                    assert_eq!(output.byte_len(), bytes);
+                    output
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            outputs.iter().map(RecipeMetadata::byte_len).sum::<u64>(),
+            268
+        );
+        assert_eq!(outputs[7].shape(), &[24]);
     }
 }

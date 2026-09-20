@@ -834,6 +834,13 @@ the caller, without retaining them in the source's persistent inference cache.
 Repeated inspections recompute metadata. Physical bounded-read checks and each
 producer's materialization ownership remain separate; the view itself supplies
 no reservation for temporary construction or retained read metadata.
+Finite recipe inference can retain its inspected recipe/catalog plan and move
+its actual output metadata to the caller without cloning. The tile metadata
+constructor admits that worker's storage and native dimension array before
+inference, retains the original account with the completed metadata, and keeps
+inferred metadata and any converted shape prefix with typed construction errors.
+Its bound covers recipe output metadata and native dimensions; source/header
+admission, encoded-read range construction and native payloads remain separate.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

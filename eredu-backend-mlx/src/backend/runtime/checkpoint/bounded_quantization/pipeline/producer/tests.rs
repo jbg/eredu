@@ -3,7 +3,7 @@ use crate::backend::runtime::checkpoint::store::{
     ColdMaterializationSlot, MaterializationPayloadShape, PreparedEncodedInputPlan,
 };
 use crate::backend::submission_recovery::native_role::NativeRoleCapacity;
-use eredu_checkpoint::{recipe::EncodedRecipeRead, AffineQuantization};
+use eredu_checkpoint::{AffineQuantization, recipe::EncodedRecipeRead};
 use eredu_runtime::working_memory::{WorkingMemoryError, WorkingMemoryPool};
 use safemlx::{Device, DeviceType, OperationEvent, PrefillRootsRuntime, PreparedInputRuntime};
 use std::{cell::Cell, rc::Rc};
@@ -20,6 +20,14 @@ impl Drop for Invocation {
 enum ProducerFailure {
     #[error("tile pipeline: {0}")]
     Backend(#[from] Error),
+    #[error("tile output metadata: {0}")]
+    Metadata(
+        #[source]
+        eredu_runtime::working_memory::SharedNativeInitializationFailure<
+            metadata::Metadata,
+            metadata::ConstructionError,
+        >,
+    ),
     #[error("cold tile admission: {0}")]
     Admission(
         #[source]
@@ -37,9 +45,9 @@ impl From<eredu_checkpoint::recipe::RecipeError> for ProducerFailure {
     }
 }
 
-// Runtime/stream/read metadata, final output and pipeline metadata are explicit
-// fixture prerequisites. The pool funds each actual native submission, input
-// and fixed materialization slot; this is not whole-producer admission.
+// Runtime/stream/read-range metadata and final output are explicit fixture
+// prerequisites. The pool funds output metadata, each native submission, input,
+// fixed materialization slot and admitted queue; this is not full producer admission.
 struct FundedProducer<'a> {
     pool: WorkingMemoryPool,
     runtime: &'a PreparedInputRuntime,
@@ -71,13 +79,27 @@ impl TileProducer for FundedProducer<'_> {
         let WeightQuantization::Affine(quantization) = quantization else {
             panic!("affine fixture");
         };
-        let read = recipe.prepare_encoded_read(source).unwrap().unwrap();
-        let shape = read
-            .output()
-            .shape()
-            .iter()
-            .map(|&n| i32::try_from(n).unwrap())
-            .collect::<Vec<_>>();
+        let metadata = metadata::MetadataPlan::new(recipe, source)
+            .map_err(Error::PrefillControl)?
+            .prepare(&self.pool)
+            .map_err(|error| {
+                let (uncalled, failure) = error.into_parts();
+                drop(uncalled);
+                ProducerFailure::Metadata(failure)
+            })?;
+        metadata
+            .validate_pool(&self.pool)
+            .map_err(Error::PrefillControl)?;
+        let read = recipe
+            .prepare_encoded_read_uncached(source)
+            .unwrap()
+            .unwrap();
+        assert_eq!(read.output().shape(), metadata.output().inferred().shape());
+        assert_eq!(
+            read.output().byte_len(),
+            metadata.output().inferred().byte_len()
+        );
+        let shape = metadata.output().shape();
         let columns = *shape.last().unwrap() as usize;
         let rows = shape[..shape.len() - 1]
             .iter()
@@ -104,7 +126,7 @@ impl TileProducer for FundedProducer<'_> {
             pending_sources: 0,
         };
         let input =
-            PreparedEncodedInputPlan::new(&read, self.runtime, &shape, Dtype::Float32).unwrap();
+            PreparedEncodedInputPlan::new(&read, self.runtime, shape, Dtype::Float32).unwrap();
         let input_bytes = input.required_bytes().unwrap();
         let slot_bytes = ColdMaterializationSlot::required_bytes(payload).unwrap();
         self.live.set(self.live.get() + 1);
@@ -133,9 +155,9 @@ impl TileProducer for FundedProducer<'_> {
             stream,
             layout,
         );
-        self.largest_tile = self
-            .largest_tile
-            .max(plan.required_bytes().unwrap() + input_bytes + slot_bytes);
+        self.largest_tile = self.largest_tile.max(
+            plan.required_bytes().unwrap() + input_bytes + slot_bytes + metadata.original_bytes(),
+        );
         let submitted = plan.submit(pool).map_err(|failure| {
             let (uncalled, failure) = failure.into_parts();
             drop(uncalled);
@@ -349,7 +371,7 @@ fn failed_encoded_read_keeps_typed_cause_and_native_role_after_queue_unwinds() {
     use eredu_checkpoint::store::{
         EncodedReadFailure, EncodedReadFailureCause, SafetensorsWeightStore,
     };
-    use safetensors::tensor::{serialize_to_file, TensorView};
+    use safetensors::tensor::{TensorView, serialize_to_file};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.safetensors");
     let values = (0..512)
@@ -498,6 +520,25 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)
         .unwrap_err();
+    let ProducerFailure::Metadata(failure) = error else {
+        panic!("metadata admission must refuse before inference")
+    };
+    let Some(WorkingMemoryError::BudgetExceeded {
+        required_bytes,
+        available_bytes: 0,
+    }) = failure.accounting_failure()
+    else {
+        panic!("exact metadata comparison")
+    };
+    let metadata_bytes = *required_bytes;
+    assert!(failure.constructor_failure().is_none());
+    assert_eq!(producer.live.get(), 0);
+    assert_eq!(producer.pool.used_bytes().unwrap(), 0);
+    drop(failure);
+    producer.pool = WorkingMemoryPool::new(metadata_bytes, 0).unwrap();
+    let error = prepare()
+        .materialize_with_producer(DeviceType::Cpu, &mut producer)
+        .unwrap_err();
     let ProducerFailure::Admission(failure) = error else {
         panic!("role admission must refuse before callback")
     };
@@ -519,7 +560,8 @@ fn cold_slot_admission_refusal_retains_invocation_until_error_retirement() {
         pending_sources: 0,
     })
     .unwrap();
-    producer.pool = WorkingMemoryPool::new(role_bytes + slot_bytes - 1, 0).unwrap();
+    producer.pool =
+        WorkingMemoryPool::new(metadata_bytes + role_bytes + slot_bytes - 1, 0).unwrap();
     producer.slots.clear();
     let error = prepare()
         .materialize_with_producer(DeviceType::Cpu, &mut producer)

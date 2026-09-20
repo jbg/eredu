@@ -15,6 +15,7 @@ mod uncached_catalog;
 pub use uncached_catalog::UncachedRecipeCatalog;
 pub use finite_inference::{
     infer_recipe_bytes, RecipeInferenceError, RecipeInferenceInput, RecipeInferenceLayout,
+    RecipeInferencePlan,
 };
 
 /// Metadata-only catalog used to validate a derived-weight recipe.
