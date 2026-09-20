@@ -794,6 +794,13 @@ uncalled invocation; escaped native outputs retain their original accounts.
 Runtime initialization, streams, retained read metadata and dynamic result
 storage remain separately funded prerequisites. A cold root rejects an existing
 original scope; nested work requires the explicit parent relation.
+Submission seals an invocation's scope and retains its native owners without
+waiting. Its result may be borrowed for independently qualified readback;
+explicit finish establishes completion, while dropping an unfinished invocation
+transfers its owners to the same recovery queue. Queued conversion tiles need
+independent scopes because a materialization owner observes its entire scope.
+Synchronous native roles submit and finish through this same implementation,
+preserving their deadline across the callback and final completion observation.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

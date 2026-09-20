@@ -53,7 +53,7 @@ fn admission_rejects_before_invocation_and_preserves_the_plan() {
     );
     let bytes = plan.required_bytes().unwrap();
     let pool = WorkingMemoryPool::new(bytes - 1, 0).unwrap();
-    let error = plan.execute(&pool).unwrap_err();
+    let error = plan.submit(&pool).unwrap_err();
     assert!(matches!(error.accounting_failure(),
         Some(WorkingMemoryError::BudgetExceeded { required_bytes, available_bytes })
         if *required_bytes == bytes && *available_bytes == bytes - 1));
@@ -88,7 +88,7 @@ fn exact_admission_runs_once_and_retires_invocation() {
         },
     );
     let pool = WorkingMemoryPool::new(plan.required_bytes().unwrap(), 0).unwrap();
-    assert_eq!(plan.execute(&pool).unwrap().unwrap(), 42);
+    assert_eq!(plan.submit(&pool).unwrap().finish().unwrap().unwrap(), 42);
     assert_eq!(called.get(), 1);
     wait_for_source_retirement(&pool);
     assert!(dropped.get());
@@ -110,7 +110,7 @@ fn callback_failure_retains_source_account_until_error_and_recovery_retire() {
     );
     let bytes = plan.required_bytes().unwrap();
     let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
-    let error = plan.execute(&pool).unwrap_err();
+    let error = plan.submit(&pool).unwrap_err();
     assert!(error.rejected_plan().is_none());
     assert!(error.accounting_failure().is_none());
     assert!(error.constructor_failure().is_some());
@@ -136,7 +136,7 @@ fn cold_root_refuses_an_active_original_parent_before_callback() {
     let outer_bytes = Cell::new(0);
     let outer = Plan::new(&runtime, capacity(&runtime), None, (), |_, context| {
         let pool = pool_cell.get().unwrap();
-        let error = inner.execute(pool).unwrap_err();
+        let error = inner.submit(pool).unwrap_err();
         assert!(!called.get());
         assert!(error.accounting_failure().is_none());
         assert!(error.constructor_failure().is_some());
@@ -153,7 +153,53 @@ fn cold_root_refuses_an_active_original_parent_before_callback() {
         .set(WorkingMemoryPool::new(outer_bytes.get() + inner_bytes, 0).unwrap())
         .unwrap();
     let pool = pool_cell.get().unwrap();
-    outer.execute(pool).unwrap().unwrap();
+    outer.submit(pool).unwrap().finish().unwrap().unwrap();
     wait_for_source_retirement(pool);
     assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
+fn submitted_invocations_keep_independent_scopes_and_retirement() {
+    let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let _roots = PrefillRootsRuntime::prepare_for_stream(&stream, &stream).unwrap();
+    let runtime = PreparedInputRuntime::prepare().unwrap();
+    let first_dropped = Rc::new(Cell::new(false));
+    let second_dropped = Rc::new(Cell::new(false));
+    let make = |dropped| {
+        Plan::new(
+            &runtime,
+            capacity(&runtime),
+            None,
+            DropProbe(dropped),
+            |_, context| Ok(Ok::<_, ()>(context.observer().clone())),
+        )
+    };
+    let first = make(first_dropped.clone());
+    let second = make(second_dropped.clone());
+    let first_bytes = first.required_bytes().unwrap();
+    let second_bytes = second.required_bytes().unwrap();
+    let pool = WorkingMemoryPool::new(first_bytes + second_bytes, 0).unwrap();
+    let first = first.submit(&pool).unwrap();
+    assert!(OriginalScopeObserver::try_current().unwrap().is_none());
+    let second = second.submit(&pool).unwrap();
+    assert!(OriginalScopeObserver::try_current().unwrap().is_none());
+    assert!(!first
+        .result()
+        .as_ref()
+        .unwrap()
+        .same_scope(second.result().as_ref().unwrap()));
+    assert!(!first_dropped.get() && !second_dropped.get());
+    assert_eq!(pool.used_bytes().unwrap(), first_bytes + second_bytes);
+    drop(first.finish().unwrap().unwrap());
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::reclaim_allocation_owners();
+        pool.used_bytes() == Ok(second_bytes)
+    });
+    assert!(first_dropped.get());
+    assert!(!second_dropped.get());
+    // Abandoning a submitted invocation uses deferred recovery, even when the
+    // caller never asks it for a result or explicit completion.
+    drop(second);
+    wait_for_source_retirement(&pool);
+    assert!(second_dropped.get());
 }

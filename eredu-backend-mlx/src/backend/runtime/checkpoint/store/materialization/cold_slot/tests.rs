@@ -210,29 +210,6 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
             layout,
         )
         .unwrap();
-        owner.wait().unwrap();
-        let mut outputs = owner.completed_outputs();
-        let weights = outputs.next().unwrap().unwrap();
-        assert_eq!(weights.as_slice::<u32>().len(), 16);
-        for (index, &word) in weights.as_slice::<u32>().iter().enumerate() {
-            assert_eq!(
-                word,
-                if index % 2 == 0 {
-                    0x89abcdef
-                } else {
-                    0x01234567
-                }
-            );
-        }
-        for expected in [-1.0, 15.0] {
-            let view = outputs.next().unwrap().unwrap();
-            assert_eq!(
-                view.as_slice::<half::f16>(),
-                &[half::f16::from_f32(expected); 4]
-            );
-        }
-        assert!(outputs.next().is_none());
-        drop((outputs, weights));
         Ok(Ok::<_, Error>(owner))
     });
     role_bytes.set(plan.required_bytes().unwrap());
@@ -240,7 +217,32 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
         .set(WorkingMemoryPool::new(role_bytes.get() + input_bytes + slot_bytes, 0).unwrap())
         .unwrap();
     let pool = pool_cell.get().unwrap();
-    let owner = plan.execute(pool).unwrap().unwrap();
+    let submission = plan.submit(pool).unwrap();
+    let owner = submission.result().as_ref().unwrap();
+    owner.wait().unwrap();
+    let mut outputs = owner.completed_outputs();
+    let weights = outputs.next().unwrap().unwrap();
+    assert_eq!(weights.as_slice::<u32>().len(), 16);
+    for (index, &word) in weights.as_slice::<u32>().iter().enumerate() {
+        assert_eq!(
+            word,
+            if index % 2 == 0 {
+                0x89abcdef
+            } else {
+                0x01234567
+            }
+        );
+    }
+    for expected in [-1.0, 15.0] {
+        let view = outputs.next().unwrap().unwrap();
+        assert_eq!(
+            view.as_slice::<half::f16>(),
+            &[half::f16::from_f32(expected); 4]
+        );
+    }
+    assert!(outputs.next().is_none());
+    drop((outputs, weights));
+    let owner = submission.finish().unwrap().unwrap();
     // Completed outputs escape the role constructor. Their native owners and
     // input aliases still retain both source accounts and the physical budget.
     assert_eq!(

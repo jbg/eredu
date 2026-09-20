@@ -25,7 +25,32 @@ pub(crate) struct Plan<'a, I, F> {
 
 /// The shared initializer publishes by borrowing. The private cell transfers
 /// its one result without copying outputs or issuing another native invocation.
-pub(crate) struct Output<T, E>(RefCell<Option<Result<T, E>>>);
+pub(crate) struct Output<I: 'static, T, E>(RefCell<Option<Submission<I, T, E>>>);
+
+/// Submitted work with independent native completion and original source custody.
+/// Borrowing its result grants no completion evidence. Dropping an unfinished
+/// submission uses the same recovery queue as synchronous execution.
+pub(crate) struct Submission<I: 'static, T, E> {
+    result: Result<T, E>,
+    pending: PendingRole<I, Custody>,
+}
+impl<I: 'static, T, E> std::fmt::Debug for Submission<I, T, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColdSubmission").finish_non_exhaustive()
+    }
+}
+impl<I: 'static, T, E> Submission<I, T, E> {
+    pub(crate) fn result(&self) -> &Result<T, E> {
+        &self.result
+    }
+    pub(crate) fn finish(self) -> Result<Result<T, E>, eredu_core::BackendFailure> {
+        let Self { result, pending } = self;
+        if result.is_ok() {
+            pending.finish()?;
+        }
+        Ok(result)
+    }
+}
 
 impl<'a, I, F, T, E> Plan<'a, I, F>
 where
@@ -54,11 +79,12 @@ where
 
     /// Compares once before constructing any native owner. Rejection retains
     /// the uncalled plan; native errors retain their actual recovery/account
-    /// custody. Success moves the one result out of the constructor wrapper.
-    pub(crate) fn execute(
+    /// custody. Success seals this invocation and moves its pending owner out of
+    /// the constructor wrapper without waiting for completion.
+    pub(crate) fn submit(
         self,
         pool: &WorkingMemoryPool,
-    ) -> Result<Result<T, E>, SharedNativeInitializationError<Self>> {
+    ) -> Result<Submission<I, T, E>, SharedNativeInitializationError<Self>> {
         let initialized = pool.initialize_shared_native(self)?;
         let result = initialized
             .output()
@@ -100,7 +126,7 @@ where
     I: 'static,
     F: FnOnce(&I, &NativeRoleContext<'_>) -> Result<Result<T, E>, Error>,
 {
-    type Output = Output<T, E>;
+    type Output = Output<I, T, E>;
     type Error = eredu_core::BackendFailure;
 
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError> {
@@ -113,8 +139,8 @@ where
             size_of::<Result<Option<OriginalScopeObserver>, safemlx::error::Exception>>(),
             size_of::<(&WorkingMemoryPool, &PreparedInputRuntime)>(),
             size_of::<Self::Output>(),
-            size_of::<Option<Result<T, E>>>(),
-            size_of::<std::cell::RefMut<'_, Option<Result<T, E>>>>(),
+            size_of::<Option<Submission<I, T, E>>>(),
+            size_of::<std::cell::RefMut<'_, Option<Submission<I, T, E>>>>(),
         ];
         controls
             .into_iter()
@@ -167,7 +193,7 @@ where
             drop(prepared.into_owner());
             failure
         })?;
-        super::run_with_budget_source(
+        super::start_with_budget_source(
             self.invocation,
             self.capacity,
             self.pipeline,
@@ -177,7 +203,7 @@ where
             None,
             self.operation,
         )
-        .map(|result| Output(RefCell::new(Some(result))))
+        .map(|(result, pending)| Output(RefCell::new(Some(Submission { result, pending }))))
     }
 }
 

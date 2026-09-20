@@ -1,7 +1,7 @@
 //! Shared native scope, quotas and recovery for source-qualified operations.
 //! Callers retain their exact source and selected capacity; this worker neither
 //! selects equations nor supplies a missing workspace bound.
-use super::{PreparedRecovery, Retention, Status};
+use super::{PreparedRecovery, Recovery, Retention, Status};
 use crate::backend::{error::Error, runtime::residency::storage::native_storage::BankOwner};
 use eredu_nn::workspace::{HostMetadataFunding, HostMetadataFundingError};
 use eredu_runtime::working_memory::OriginalTextControlGuard;
@@ -176,6 +176,8 @@ impl RoleBudget<'_> {
 fn fixed_control_bytes<I:'static,C:Clone+std::fmt::Debug+Send+Sync+'static>()->Option<usize> {
     sum_controls(&[error_bytes::<C>()?,
         size_of::<NativeRoleContext<'_>>(),size_of::<Retained<I,C>>(),
+        size_of::<PendingRole<I,C>>(),size_of::<PendingRole<I,C>>(),
+        size_of::<Result<PendingRole<I,C>,eredu_core::BackendFailure>>(),
         size_of::<C>(),size_of::<Option<std::time::Duration>>(),size_of::<&HostMetadataFunding>(),
         size_of::<(RoleBudget<'_>,&C,&Stream)>(),
         size_of::<(&RoleBudget<'_>,Result<OriginalBufferBudget,Error>)>(),
@@ -287,6 +289,30 @@ fn run_with_budget_source<I, T, E, F, C>(
     timeout: Option<std::time::Duration>,
     run: F,
 ) -> Result<Result<T, E>, eredu_core::BackendFailure>
+where
+    I: 'static,
+    C: Clone + std::fmt::Debug + Send + Sync + 'static,
+    F: FnOnce(&I, &NativeRoleContext<'_>) -> Result<Result<T, E>, Error>,
+{
+    let (result, pending) = start_with_budget_source(
+        invocation, capacity, pipeline, budget_source, custody, funding, timeout, run,
+    )?;
+    if result.is_ok() {
+        pending.finish()?;
+    }
+    Ok(result)
+}
+
+fn start_with_budget_source<I, T, E, F, C>(
+    invocation: I,
+    capacity: NativeRoleCapacity,
+    pipeline: Option<safemlx::PreparedPipelineCachePlan>,
+    budget_source:RoleBudget<'_>,
+    custody: &C,
+    funding: &HostMetadataFunding,
+    timeout: Option<std::time::Duration>,
+    run: F,
+) -> Result<(Result<T, E>, PendingRole<I, C>), eredu_core::BackendFailure>
 where
     I: 'static,
     C: Clone + std::fmt::Debug + Send + Sync + 'static,
@@ -433,63 +459,76 @@ where
     });
     recovery.seal();
     let result = result?;
-    if result.is_err() {
-        return Ok(result);
-    }
-    // The caller waited and resolved its exact output roots. A callback
-    // which did not do so cannot turn a polling error into completion evidence.
-    loop {
-        let active = observer.as_ref().expect("successful scope binding");
-        let (outcome, native) = active
-            .progress()
+    Ok((result, PendingRole { recovery, observer, custody: custody.clone(), deadline }))
+}
+
+/// One sealed invocation. Dropping it transfers unresolved resources to the
+/// existing recovery queue; only finish establishes successful completion.
+struct PendingRole<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static> {
+    recovery: Recovery<Retained<I, C>>,
+    observer: Option<OriginalScopeObserver>,
+    custody: C,
+    deadline: Option<std::time::Instant>,
+}
+impl<I: 'static, C: Clone + std::fmt::Debug + Send + Sync + 'static> PendingRole<I, C> {
+    fn finish(self) -> Result<(), eredu_core::BackendFailure> {
+        let Self { recovery, observer, custody, deadline } = self;
+        let fail = |cause| role_failure(cause, &custody);
+        // Only this invocation's observer establishes native completion. A polling
+        // refusal cannot release its resources or settle another queued invocation.
+        loop {
+            let active = observer.as_ref().expect("successful scope binding");
+            let (outcome, native) = active
+                .progress()
+                .map_err(|cause| fail(RoleCause::Native(cause)))?;
+            let status = Status {
+                settled: native.is_settled(),
+                failed: native.failed(),
+                blocked: native.blocked(),
+            };
+            if status.failed || status.blocked {
+                if let Some(cause) = active.retained_failure() {
+                    return Err(fail(RoleCause::Native(cause)));
+                }
+                return Err(fail(RoleCause::Incomplete {
+                    phase: "native role terminal observation",
+                    status,
+                }));
+            }
+            match outcome {
+                safemlx::ScopedSubmissionProgress::Observed if status.settled => break,
+                safemlx::ScopedSubmissionProgress::Observed
+                | safemlx::ScopedSubmissionProgress::Busy => {}
+                other => return Err(fail(RoleCause::Observation(other))),
+            }
+            if deadline.is_some_and(|deadline|std::time::Instant::now() >= deadline) {
+                // Recovery still owns every native resource and its neutral lease.
+                return Err(fail(RoleCause::Incomplete {
+                    phase: "selected native role deadline",
+                    status,
+                }));
+            }
+            std::thread::yield_now();
+        }
+        observer
+            .as_ref()
+            .expect("successful scope binding")
+            .retire_completed_records()
             .map_err(|cause| fail(RoleCause::Native(cause)))?;
-        let status = Status {
-            settled: native.is_settled(),
-            failed: native.failed(),
-            blocked: native.blocked(),
-        };
-        if status.failed || status.blocked {
-            if let Some(cause) = active.retained_failure() {
+        let status = recovery.finish().map_err(|cause| fail(RoleCause::Backend(cause.into_error())))?;
+        if !status.settled || status.failed || status.blocked {
+            if let Some(cause) = observer
+                .as_ref()
+                .expect("successful scope binding")
+                .retained_failure()
+            {
                 return Err(fail(RoleCause::Native(cause)));
             }
             return Err(fail(RoleCause::Incomplete {
-                phase: "native role terminal observation",
+                phase: "after recovery finish",
                 status,
             }));
         }
-        match outcome {
-            safemlx::ScopedSubmissionProgress::Observed if status.settled => break,
-            safemlx::ScopedSubmissionProgress::Observed
-            | safemlx::ScopedSubmissionProgress::Busy => {}
-            other => return Err(fail(RoleCause::Observation(other))),
-        }
-        if deadline.is_some_and(|deadline|std::time::Instant::now() >= deadline) {
-            // Recovery still owns every native resource and its neutral lease.
-            return Err(fail(RoleCause::Incomplete {
-                phase: "selected native role deadline",
-                status,
-            }));
-        }
-        std::thread::yield_now();
+        Ok(())
     }
-    observer
-        .as_ref()
-        .expect("successful scope binding")
-        .retire_completed_records()
-        .map_err(|cause| fail(RoleCause::Native(cause)))?;
-    let status = recovery.finish().map_err(|cause| fail(RoleCause::Backend(cause.into_error())))?;
-    if !status.settled || status.failed || status.blocked {
-        if let Some(cause) = observer
-            .as_ref()
-            .expect("successful scope binding")
-            .retained_failure()
-        {
-            return Err(fail(RoleCause::Native(cause)));
-        }
-        return Err(fail(RoleCause::Incomplete {
-            phase: "after recovery finish",
-            status,
-        }));
-    }
-    Ok(result)
 }
