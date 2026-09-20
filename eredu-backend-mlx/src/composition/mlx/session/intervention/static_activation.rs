@@ -15,6 +15,8 @@ use std::{
 
 mod native;
 mod trace;
+#[cfg(all(test, target_vendor = "apple", not(feature = "cuda")))]
+mod zero_tests;
 mod sparse;
 pub(crate) use sparse::{PreparedSparseActivation, SparseActivationFailure, SparseScalarEnvelope};
 use native::Native;

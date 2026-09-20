@@ -1,5 +1,6 @@
 use super::*;
 use eredu_nn::Tensor;
+use eredu_nn::workspace::{WorkspaceLayoutView, WorkspaceRepresentation};
 
 pub(super) fn floating(dtype: InterventionDtype) -> F {
     match dtype {
@@ -128,6 +129,8 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<Result<TracedValue, Failure>>(),
         size_of::<Result<TracedValue, CaptureExecutionError<Failure>>>(),
         size_of::<F>(),
+        size_of::<WorkspaceLayoutView<'static>>(),
+        size_of::<WorkspaceRepresentation>(),
         size_of::<Option<InterventionDtype>>(),
         size_of::<Result<InterventionDtype, Failure>>(),
     ];
@@ -184,9 +187,10 @@ impl Kernel for Trace<'_> {
                 source.dtype,
             ),
             Op::Zero(shape, dtype) => (
-                WorkspaceTensor::initialized_floating(
+                WorkspaceTensor::zeros_from_prototype(
                     Shape::new(shape)?.slice(),
-                    floating(dtype),
+                    WorkspaceLayoutView::new(&[], D::Float32).map_err(eredu_nn::Error::from)?
+                        .with_representation(Some(WorkspaceRepresentation::new(floating(dtype), true))),
                     self.context,
                 )?,
                 Some(dtype),
