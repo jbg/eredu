@@ -124,22 +124,9 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
                 identity
                     .write_into(&mut run_id)
                     .expect("funded String writer");
-                let artifact = B::prepared_artifact_identity(&self.runtime);
-                let artifact_identity = artifact
-                    .map(|artifact| {
-                        // ArtifactIdentity's canonical Display is sha256: plus 2 digits
-                        // for each byte of the retained digest. No hashing/read occurs.
-                        let mut text = construction::string_capacity(
-                            "sha256:".len() + artifact.digest().len() * 2,
-                            &funding,
-                        )?;
-                        write!(&mut text, "{artifact}").expect("funded String writer");
-                        Ok::<_, RecordConstructionCause>(text)
-                    })
-                    .transpose()?;
                 let template = RecordContext {
                     run_id,
-                    artifact_identity,
+                    artifact_identity: None,
                     parameter_overlay_id: B::active_parameter_overlay(&self.runtime)
                         .map(|text| construction::string(text, &funding))
                         .transpose()?,
@@ -153,21 +140,6 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
                 ))
             })()
             .map_err(|cause| RecordConstructionError::retain(cause, &funding))?;
-            if prepare.0.artifact_identity.is_none()
-                && request
-                    .options
-                    .as_ref()
-                    .and_then(|options| options.capture.as_ref())
-                    .is_some_and(|capture| !capture.admission().plan().selections.is_empty())
-                || prepare.0.artifact_identity.is_none()
-                    && request
-                        .capture
-                        .is_some_and(|capture| !capture.selections.is_empty())
-            {
-                return Err(ControlledGenerationError::Rejected(
-                    "capture source has no retained artifact identity",
-                ));
-            }
             let failure = ControlledSessionFailure::prepare(&funding)?;
             Ok(Some((prepare, failure)))
         })();
@@ -192,6 +164,29 @@ impl<B: OriginalChatBackend> LoadedModel<B> {
         // Raw declarations become original sources inside the canonical prompt
         // worker. Record only the exact admitted aliases returned by that worker.
         let record_sources = (|| -> Result<_, ControlledGenerationError> {
+            prepare.0.artifact_identity = session
+                .prepared_artifact_identity()
+                .map(|artifact| {
+                    // Borrow the identity resolved by source preparation; recording
+                    // performs no artifact I/O or content hashing.
+                    let mut text = construction::string_capacity(
+                        "sha256:".len() + artifact.digest().len() * 2,
+                        &funding,
+                    )?;
+                    write!(&mut text, "{artifact}").expect("funded String writer");
+                    Ok::<_, RecordConstructionCause>(text)
+                })
+                .transpose()
+                .map_err(|cause| RecordConstructionError::retain(cause, &funding))?;
+            if prepare.0.artifact_identity.is_none()
+                && session.capture_source().is_some_and(|capture| {
+                    !capture.admission().plan().selections.is_empty()
+                })
+            {
+                return Err(ControlledGenerationError::Rejected(
+                    "capture source has no retained artifact identity",
+                ));
+            }
             prepare.0.capture_plan_id = session
                 .capture_source()
                 .map(|source| construction::string(source.admission().identity(), &funding))

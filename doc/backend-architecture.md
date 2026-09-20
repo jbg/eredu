@@ -866,6 +866,12 @@ pool/execution metadata account. Borrowed declaration comparison uses fixed
 errors; owned rejections and existing-storage pin inventories are funded before
 construction. Native prepared-path validation receives the same metadata policy.
 
+Capture preparation resolves content identity under its source metadata account
+for both raw and precompiled declarations, sharing the architecture's identity
+worker with partition construction. The facade reads that retained identity from
+the prepared chat session. Controlled capture validates it before
+emitting `Started`; record construction does not resolve or reopen artifacts.
+
 Checkpoint owns the stable-file fingerprint worker; core owns the versioned
 identity reduction and shared resolution cache. Fresh Unix identity construction
 funds read buffers, members, paths and errors before their producers, without an

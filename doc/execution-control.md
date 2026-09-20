@@ -36,6 +36,11 @@ actual prompt geometry is known and cannot overlap already admitted declarations
 of the same kind. Source, tokenizer, template, execution and logical session
 identity are validated before affected work.
 
+Controlled records read artifact identity after the shared request worker has
+prepared its capture sources, and before emitting `Started`. This read borrows
+the resolved identity without opening or hashing artifacts. Nonempty capture
+requires that identity; recording without capture may leave it absent.
+
 ## Completed boundaries and commands
 
 Prediction zero is prompt prefill; later predictions consume cached state. A

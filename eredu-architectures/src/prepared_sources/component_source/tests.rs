@@ -232,3 +232,25 @@ fn fresh_partition_source_constructs_identity_without_ordinary_discovery_warmup(
     drop(published);
     assert!(retired.load(Ordering::SeqCst));
 }
+
+#[test]
+fn capture_identity_refusal_preserves_retry_and_resolved_identity_survives_source_removal() {
+    let (root, discovery) = fixture();
+    let (refused, _, retired) = account(1);
+    let error = discovery.prepare_capture_identity(&refused).unwrap_err();
+    assert_eq!(error.funding_error(), Some(HostMetadataFundingError::Unavailable));
+    assert!(discovery.resolved_artifact_identity().is_none());
+    drop(refused);
+    assert!(!retired.load(Ordering::SeqCst));
+    drop(error);
+    assert!(retired.load(Ordering::SeqCst));
+
+    let (funding, _, retired) = account(usize::MAX);
+    let identity = discovery.prepare_capture_identity(&funding).unwrap();
+    assert_eq!(discovery.resolved_artifact_identity(), Some(identity));
+    drop(root);
+    assert_eq!(discovery.prepare_capture_identity(&funding).unwrap(), identity);
+    assert_eq!(discovery.capture().unwrap().artifact_identity, identity.to_string());
+    drop(funding);
+    assert!(retired.load(Ordering::SeqCst), "cached digest owns no source account");
+}

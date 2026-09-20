@@ -174,6 +174,14 @@ impl PreparedModelDiscovery {
     pub fn resolved_artifact_identity(&self) -> Option<eredu_core::artifact::ArtifactIdentity> {
         self.identity.resolved_identity()
     }
+    /// Resolves capture provenance under its source account, sharing the same
+    /// fixed identity cache with ordinary discovery and partition construction.
+    pub fn prepare_capture_identity(
+        &self,
+        funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<ArtifactIdentity, eredu_core::artifact::ArtifactIdentityPreparationError> {
+        self.identity.resolve_with_metadata(funding)
+    }
     /// Retains hook facts projected from the actual constructed executor and
     /// architecture. Backend collectors cannot infer these from parameter shapes.
     pub fn bind_partition_observation_hooks(
@@ -429,7 +437,7 @@ impl PreparedModelDiscovery {
             .checked_add(std::mem::size_of_val(&partition))
             .ok_or(eredu_core::capture::CaptureError::Overflow)?)?;
         let identity = match construction.funding() {
-            Some(funding) => self.identity.resolve_with_metadata(funding)?,
+            Some(funding) => self.prepare_capture_identity(funding)?,
             None => self.identity.resolve().map_err(|error|
                 eredu_core::capture::CaptureError::Invalid(error.to_string()))?,
         };

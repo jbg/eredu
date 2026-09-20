@@ -71,6 +71,91 @@ fn limits() -> TraceLimits {
 }
 
 #[test]
+fn records_use_artifact_identity_resolved_by_capture_preparation() {
+    let (_, _, settings, first) = setup();
+    for (capture_requested, precompiled, identity_available) in [
+        (false, false, false), (true, false, true), (true, false, false),
+        (true, true, true), (true, true, false),
+    ] {
+        let mut runtime = ModelRuntime::prepare(MockBackend, ()).unwrap();
+        runtime.session().artifact_identity.set(None);
+        runtime.session_mut().capture_artifact_identity = identity_available
+            .then(observed_mock::artifact_identity);
+        assert!(MockBackend::prepared_artifact_identity(&runtime).is_none());
+        let tokenizer = ChatTokenizer::from_tokenizer(unicode_tokenizer(Some(first), 64));
+        let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
+        let mut model = original_sources::Fixture::from_runtime(
+            runtime,
+            tokenizer,
+            LoadedTextModelConfig {
+                model_family: ModelKind::Qwen2,
+                effective_model_type: "qwen2".into(),
+                model_id: "deferred-capture-identity".into(),
+                chat_template: Some(ModelChatTemplate::Single(QWEN_TEMPLATE.into())),
+                eos_token_ids: vec![eos],
+                checkpoint_generation_config: None,
+            },
+        ).unwrap();
+        let cancellation = eredu_core::GenerationCancellationToken::new();
+        let source = model.chat_source(false, &cancellation).unwrap().unwrap();
+        let chat = model.prepare_chat(
+            &source,
+            &ChatTemplateRequest {
+                messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
+                add_generation_prompt: true,
+                ..Default::default()
+            },
+            original_sources::CAPACITY,
+            &cancellation,
+        ).unwrap().unwrap();
+        let capture = observed_mock::plan();
+        let mut request = eredu::api::PreparedChatRequest::new(
+            &chat, original_sources::settings(settings),
+        );
+        if precompiled {
+            let discovery = observed_mock::discovery();
+            let admitted = capture.admit_with_text_origin(
+                &discovery.catalog, &discovery.support, &discovery.support.capture,
+                eredu_core::capture::CaptureRequestShape {
+                    batch: 1, prompt_tokens: u64::from(first), max_predictions: 8,
+                },
+                Default::default(),
+            ).unwrap();
+            request.options = Some(eredu_core::TextPreparationOptions {
+                capture: Some(eredu_core::capture::SharedCapturePlan::new(admitted)),
+                ..Default::default()
+            });
+        } else {
+            request.capture = capture_requested.then_some(&capture);
+        }
+        let mut records = Vec::new();
+        let result = (|| -> Result<_, ControlledGenerationError> {
+            let mut emit = |record| {
+                records.push(record);
+                ControlFlow::Continue(())
+            };
+            let mut session = model.start_controlled_chat(
+                request, limits(), Default::default(), &mut emit,
+            )?.unwrap();
+            assert!(session.token_ids().is_empty(), "Started precedes prediction");
+            session.run(&mut emit)?;
+            Ok(session.token_ids().to_vec())
+        })();
+        if capture_requested && !identity_available {
+            assert!(matches!(result, Err(ControlledGenerationError::Rejected(
+                "capture source has no retained artifact identity"
+            ))));
+            assert!(records.is_empty(), "invalid provenance cannot emit Started");
+        } else {
+            assert_eq!(result.unwrap(), [first, first + 1, first + 2]);
+            let expected = identity_available.then(|| observed_mock::artifact_identity().to_string());
+            assert!(!records.is_empty());
+            assert!(records.iter().all(|record| record.artifact_identity == expected));
+        }
+    }
+}
+
+#[test]
 fn completed_prefix_cancellation_has_ordinary_controlled_parity_without_token_commit() {
     for fail in [false, true] {
         for controlled in [false, true] {

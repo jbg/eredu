@@ -161,7 +161,8 @@ struct MockSession {
     intervention_identity: String,
     capture_discovery: eredu_core::capture::CaptureDiscovery,
     intervention_discovery: eredu_core::intervention::InterventionDiscovery,
-    artifact_identity: eredu_core::artifact::ArtifactIdentity,
+    artifact_identity: std::cell::Cell<Option<eredu_core::artifact::ArtifactIdentity>>,
+    capture_artifact_identity: Option<eredu_core::artifact::ArtifactIdentity>,
     distributed: MockDistributedSession,
 }
 struct Done;
@@ -312,7 +313,8 @@ impl BackendProvider for MockBackend {
         let intervention_discovery = observed_mock::intervention_discovery(&intervention_identity);
         Ok(MockSession {
             capture_discovery, intervention_discovery,
-            artifact_identity: observed_mock::artifact_identity(),
+            artifact_identity: std::cell::Cell::new(Some(observed_mock::artifact_identity())),
+            capture_artifact_identity: Some(observed_mock::artifact_identity()),
             original: Environment::new(host_authority::source_pool()),
             authority: eredu_core::SessionAuthority::new(),
             intervention_identity,
@@ -574,6 +576,11 @@ impl TextGenerationBackend for MockBackend {
         options: Option<&eredu_core::TextPreparationOptions>,
         claim: &eredu_core::GenerationSequencePreparation<'_, '_>,
     ) -> Result<Self::TextPreparation, eredu_core::BackendFailure> {
+        if options.and_then(|options| options.capture.as_ref())
+            .is_some_and(|source| !source.admission().plan().selections.is_empty())
+        {
+            runtime.session().artifact_identity.set(runtime.session().capture_artifact_identity);
+        }
         let capture = observed_mock::funded_plan(runtime, options, config)?;
         let probe = preparation::admit(input, config)?;
         admitted_text::Preparation::admit(
@@ -744,7 +751,7 @@ impl TextGenerationBackend for MockBackend {
     }
 
     fn prepared_artifact_identity(runtime: &ModelRuntime<Self>) -> Option<eredu_core::artifact::ArtifactIdentity> {
-        Some(runtime.session().artifact_identity)
+        runtime.session().artifact_identity.get()
     }
     fn text_sampling_control_support(
         _: &ModelRuntime<Self>,
@@ -798,8 +805,9 @@ impl TextGenerationBackend for MockBackend {
     }
 
     fn capture_discovery(
-        _: &ModelRuntime<Self>,
+        runtime: &ModelRuntime<Self>,
     ) -> Result<eredu_core::capture::CaptureDiscovery, eredu_core::capture::CaptureError> {
+        runtime.session().artifact_identity.set(runtime.session().capture_artifact_identity);
         Ok(observed_mock::discovery())
     }
     fn validate_text_capture(

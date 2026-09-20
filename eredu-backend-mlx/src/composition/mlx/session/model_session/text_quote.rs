@@ -1261,7 +1261,16 @@ fn admit_inner<C: TokenFilterController>(
                 model.erased().inference_execution_identity(), capacity,
             ).map_err(Error::WorkspacePlanning)?;
             capture_metadata = Some(funding);
-            session.original_partition_capture(capture_metadata.as_ref().expect("created account"))?;
+            let funding = capture_metadata.as_ref().expect("created account");
+            if capture_source.is_some_and(|source| !source.admission().plan().selections.is_empty()) {
+                session.capture_discovery.as_ref().ok_or_else(unknown)?
+                    .prepare_capture_identity(funding)
+                    .map_err(|error| match error.funding_error() {
+                        Some(cause) => Error::WorkspacePlanning(cause),
+                        None => crate::composition::mlx::model::retain_planning_error(error, funding.clone()),
+                    })?;
+            }
+            session.original_partition_capture(funding)?;
         }
         let capture_destination = capture_metadata.as_ref().map_or(
             eredu_runtime::working_memory::WorkspaceReportMetadata::ordinary(),

@@ -479,6 +479,9 @@ impl<B: TextGenerationBackend> PreparedChatSession<'_, B> {
     pub(crate) fn sampling_control_support(&self) -> eredu_core::execution_control::ControlSupport<&'static str> {
         B::text_sampling_control_support(self.source.generator.runtime())
     }
+    pub(crate) fn prepared_artifact_identity(&self) -> Option<eredu_core::artifact::ArtifactIdentity> {
+        B::prepared_artifact_identity(self.source.generator.runtime())
+    }
     pub(crate) fn metadata_funding(&self) -> &HostMetadataFunding {
         self.preparation.metadata_funding()
     }
