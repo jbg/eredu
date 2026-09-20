@@ -637,7 +637,7 @@ pub use read_bytes::{
 };
 
 mod read_plan;
-pub(crate) use read_plan::encoded_selection_ranges;
+pub(crate) use read_plan::encoded_selection_plan;
 pub use read_plan::{
     SafetensorsReadDestinationPlan, SafetensorsReadError, SafetensorsReadRanges,
     SafetensorsReadSource,

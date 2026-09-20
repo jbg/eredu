@@ -1,9 +1,9 @@
 use super::*;
 use crate::store::{
-    checked_elements, invalid_selection, CheckpointSource, LeaseControlBorrowError,
-    SafetensorsReadPlan, SafetensorsWeightStore, SourceMetadataBorrowError,
+    CheckpointSource, LeaseControlBorrowError, SafetensorsReadPlan, SafetensorsWeightStore,
+    SourceMetadataBorrowError, checked_elements, invalid_selection,
 };
-use safetensors::tensor::{serialize_to_file, TensorView};
+use safetensors::tensor::{TensorView, serialize_to_file};
 
 fn push_coalesced_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
     if let Some(previous) = ranges.last_mut() {
@@ -410,11 +410,13 @@ fn fixed_read_source_refuses_unprepared_header_and_follows_prepared_owner() {
     let memory =
         MemoryWeightStore::from_safetensors([("weight".into(), Dtype::U8, vec![2], vec![7, 9])])
             .unwrap();
-    assert!(memory
-        .source_lease_controls("weight")
-        .unwrap()
-        .safetensors_reads()
-        .is_none());
+    assert!(
+        memory
+            .source_lease_controls("weight")
+            .unwrap()
+            .safetensors_reads()
+            .is_none()
+    );
     assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
 }
 
@@ -596,17 +598,19 @@ fn shared_read_driver_preserves_index_range_error_and_retirement_order() {
         start: 0,
         end: 2,
     };
-    assert!(run(
-        "tensor",
-        Dtype::F4.bitsize(),
-        &[2, 3],
-        3,
-        &selection,
-        &[2, 2],
-        ReadPolicy::RequireBounded,
-        Trace(log.clone())
-    )
-    .is_err());
+    assert!(
+        run(
+            "tensor",
+            Dtype::F4.bitsize(),
+            &[2, 3],
+            3,
+            &selection,
+            &[2, 2],
+            ReadPolicy::RequireBounded,
+            Trace(log.clone())
+        )
+        .is_err()
+    );
     assert_eq!(
         &*log.borrow(),
         &[
@@ -617,17 +621,19 @@ fn shared_read_driver_preserves_index_range_error_and_retirement_order() {
         ]
     );
     log.borrow_mut().clear();
-    assert!(run(
-        "tensor",
-        Dtype::U8.bitsize(),
-        &[0, 4],
-        0,
-        &selection,
-        &[0, 2],
-        ReadPolicy::RequireBounded,
-        Trace(log.clone())
-    )
-    .is_err());
+    assert!(
+        run(
+            "tensor",
+            Dtype::U8.bitsize(),
+            &[0, 4],
+            0,
+            &selection,
+            &[0, 2],
+            ReadPolicy::RequireBounded,
+            Trace(log.clone())
+        )
+        .is_err()
+    );
     assert_eq!(
         &*log.borrow(),
         &[
@@ -663,4 +669,160 @@ fn shared_read_driver_preserves_index_range_error_and_retirement_order() {
     );
     drop(result);
     assert_eq!(log.borrow().last(), Some(&"ranges retired"));
+}
+
+#[test]
+fn encoded_projection_counts_exact_ranges_and_refuses_wrong_destinations() {
+    let cases = [
+        (8, vec![2, 4], 8, TensorSelection::Full, vec![0..8]),
+        (
+            8,
+            vec![2, 4],
+            8,
+            TensorSelection::Range {
+                axis: 1,
+                start: 1,
+                end: 3,
+            },
+            vec![1..3, 5..7],
+        ),
+        (
+            8,
+            vec![2, 4],
+            8,
+            TensorSelection::Indices {
+                axis: 1,
+                indices: vec![3, 0, 0, 1],
+            },
+            vec![3..4, 0..1, 0..2, 7..8, 4..5, 4..6],
+        ),
+        (
+            8,
+            vec![2, 4],
+            8,
+            TensorSelection::Indices {
+                axis: 0,
+                indices: vec![1, 0, 1],
+            },
+            vec![4..8, 0..8],
+        ),
+        (
+            4,
+            vec![2, 4],
+            4,
+            TensorSelection::Indices {
+                axis: 0,
+                indices: vec![1, 0, 1],
+            },
+            vec![2..4, 0..4],
+        ),
+        (
+            32,
+            vec![2, 3],
+            24,
+            TensorSelection::Indices {
+                axis: 1,
+                indices: vec![2, 0],
+            },
+            vec![8..12, 0..4, 20..24, 12..16],
+        ),
+        (
+            8,
+            vec![2, 4],
+            8,
+            TensorSelection::Contiguous {
+                offset_elements: 2,
+                shape: vec![3],
+            },
+            vec![2..5],
+        ),
+        (8, vec![0, 4], 0, TensorSelection::Full, vec![0..0]),
+        (
+            8,
+            vec![1_000_000_000, 4],
+            4_000_000_000,
+            TensorSelection::Range {
+                axis: 0,
+                start: 500_000_000,
+                end: 500_000_001,
+            },
+            vec![2_000_000_000..2_000_000_004],
+        ),
+    ];
+    for (bits, shape, payload_len, selection, expected) in cases {
+        let output = crate::store::validate_selection("tensor", &shape, &selection).unwrap();
+        let plan = encoded_selection_plan("tensor", bits, &shape, payload_len, &selection, &output)
+            .unwrap();
+        assert_eq!(plan.range_count(), expected.len());
+        assert_eq!(
+            plan.range_layout(),
+            Layout::array::<Range<usize>>(expected.len()).unwrap()
+        );
+        for length in [expected.len() - 1, expected.len() + 1] {
+            let mut destination = vec![91..97; length];
+            let error = match plan.fill_into(&mut destination) {
+                Ok(_) => panic!("wrong destination accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error.cause, Cause::Destination { expected: count, actual } if count == expected.len() && actual == length)
+            );
+            assert_eq!(destination, vec![91..97; length]);
+        }
+        let mut destination = vec![91..97; expected.len()];
+        let result = plan.fill_into(&mut destination).unwrap();
+        assert_eq!(result.ranges(), expected);
+        assert!(result.physically_bounded());
+        // The same bound inputs can fill a fresh destination without re-inference.
+        let mut second = vec![0..0; expected.len()];
+        assert_eq!(plan.fill_into(&mut second).unwrap().ranges(), expected);
+    }
+}
+
+#[test]
+fn encoded_projection_range_plan_retains_typed_alignment_and_overflow_errors() {
+    for (shape, selection, output, expected) in [
+        (
+            vec![2, 4],
+            TensorSelection::Indices {
+                axis: 1,
+                indices: vec![1, 3],
+            },
+            vec![2, 2],
+            "FP4 selection crosses a nibble boundary",
+        ),
+        (
+            vec![2, 4],
+            TensorSelection::Contiguous {
+                offset_elements: 1,
+                shape: vec![2],
+            },
+            vec![2],
+            "packed contiguous selection is not byte aligned",
+        ),
+    ] {
+        let error = match encoded_selection_plan("packed", 4, &shape, 4, &selection, &output) {
+            Ok(_) => panic!("unaligned selection accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.cause, Cause::Bounded(message) if message == expected));
+        assert!(
+            matches!(StoreError::from(error), StoreError::BoundedSelectionUnavailable { key, message } if key == "packed" && message == expected)
+        );
+    }
+    let shape = [0, 2, usize::MAX, usize::MAX];
+    let selection = TensorSelection::Range {
+        axis: 1,
+        start: 0,
+        end: 1,
+    };
+    let output = [0, 1, usize::MAX, usize::MAX];
+    let error = match encoded_selection_plan("empty", 8, &shape, 0, &selection, &output) {
+        Ok(_) => panic!("inner stride overflow accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.cause,
+        Cause::Geometry("inner stride overflow")
+    ));
 }

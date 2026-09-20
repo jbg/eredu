@@ -2,7 +2,7 @@
 //! Runtime reads use the same final destinations, source validation and detached
 //! source/working-storage census as contiguous encoded recipes.
 use super::*;
-use crate::store::{EncodedRange, encoded_selection_ranges};
+use crate::store::{EncodedRange, encoded_selection_plan};
 use std::ops::Range;
 
 fn overflow() -> RecipeError {
@@ -111,7 +111,7 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
         output: &RecipeMetadata,
     ) -> Result<Option<Mapping>, RecipeError> {
         let bits = bytes(metadata.dtype.bit_width()?)?;
-        let ranges = match encoded_selection_ranges(
+        let plan = match encoded_selection_plan(
             "encoded recipe",
             bits,
             &metadata.shape,
@@ -119,10 +119,14 @@ impl<C: RecipeCatalog + ?Sized> Compiler<'_, C> {
             selection,
             &output.shape,
         ) {
-            Ok(ranges) => ranges,
-            Err(StoreError::BoundedSelectionUnavailable { .. }) => return Ok(None),
-            Err(error) => return Err(error.into()),
+            Ok(plan) => plan,
+            Err(error) => match StoreError::from(error) {
+                StoreError::BoundedSelectionUnavailable { .. } => return Ok(None),
+                error => return Err(error.into()),
+            },
         };
+        let mut ranges = vec![0..0; plan.range_count()];
+        plan.fill_into(&mut ranges).map_err(StoreError::from)?;
         let mut mapped = Mapping::new();
         for range in ranges {
             mapped.append_slice(&input, range)?;

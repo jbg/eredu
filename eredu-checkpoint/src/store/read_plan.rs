@@ -156,7 +156,7 @@ impl<'a> SafetensorsReadSource<'a> {
             .1
             .checked_sub(self.offsets.0)
             .ok_or_else(|| error(Cause::Geometry("source payload offsets descend")))?;
-        let counted = run(
+        let ranges = SelectionReadDestinationPlan::new(
             self.key,
             self.dtype.bitsize(),
             self.shape,
@@ -164,19 +164,10 @@ impl<'a> SafetensorsReadSource<'a> {
             selection,
             output,
             policy,
-            Fixed::count(),
         )?;
-        let count = counted.ranges.len();
-        let layout = Layout::array::<Range<usize>>(count)
-            .map_err(|_| error(Cause::Geometry("range destination layout overflow")))?;
         Ok(SafetensorsReadDestinationPlan {
             source: *self,
-            selection,
-            output,
-            policy,
-            payload_len,
-            count,
-            layout,
+            ranges,
         })
     }
 }
@@ -185,21 +176,16 @@ impl<'a> SafetensorsReadSource<'a> {
 /// It retains no tensor payload, cache entry or native owner.
 pub struct SafetensorsReadDestinationPlan<'s, 'd> {
     source: SafetensorsReadSource<'s>,
-    selection: &'s TensorSelection,
-    output: &'d [usize],
-    policy: ReadPolicy,
-    payload_len: usize,
-    count: usize,
-    layout: Layout,
+    ranges: SelectionReadDestinationPlan<'s, 'd>,
 }
 impl<'s> SafetensorsReadDestinationPlan<'s, '_> {
     /// Exact caller destination layout, checked against allocation representability.
     pub fn range_layout(&self) -> Layout {
-        self.layout
+        self.ranges.range_layout()
     }
     /// Number of coalesced ranges in the actual order.
     pub fn range_count(&self) -> usize {
-        self.count
+        self.ranges.range_count()
     }
     /// Fill exact range storage and bind a byte destination to this same genuine
     /// admitted source. No file is opened and no payload storage is allocated.
@@ -231,7 +217,7 @@ impl<'s> SafetensorsReadDestinationPlan<'s, '_> {
             file,
             self.source.key,
             start,
-            self.payload_len,
+            self.ranges.payload_len,
             filled.ranges,
             layout,
             filled.physically_bounded,
@@ -243,9 +229,74 @@ impl<'s> SafetensorsReadDestinationPlan<'s, '_> {
         &self,
         ranges: &'r mut [Range<usize>],
     ) -> Result<SafetensorsReadRanges<'r>, SafetensorsReadError<'s>> {
+        self.ranges.fill_into(ranges)
+    }
+}
+
+/// Counted geometry for one already validated selection. Both the source and
+/// inferred output shapes remain borrowed through the actual destination fill.
+/// This crate-private worker grants neither source authority nor admission.
+pub(crate) struct SelectionReadDestinationPlan<'s, 'd> {
+    key: &'s str,
+    bits: usize,
+    shape: &'s [usize],
+    payload_len: usize,
+    selection: &'s TensorSelection,
+    output: &'d [usize],
+    policy: ReadPolicy,
+    count: usize,
+    layout: Layout,
+}
+impl<'s, 'd> SelectionReadDestinationPlan<'s, 'd> {
+    fn new(
+        key: &'s str,
+        bits: usize,
+        shape: &'s [usize],
+        payload_len: usize,
+        selection: &'s TensorSelection,
+        output: &'d [usize],
+        policy: ReadPolicy,
+    ) -> Result<Self, SafetensorsReadError<'s>> {
+        let counted = run(
+            key,
+            bits,
+            shape,
+            payload_len,
+            selection,
+            output,
+            policy,
+            Fixed::count(),
+        )?;
+        let count = counted.ranges.len();
+        let layout = Layout::array::<Range<usize>>(count).map_err(|_| SafetensorsReadError {
+            key,
+            cause: Cause::Geometry("range destination layout overflow"),
+        })?;
+        Ok(Self {
+            key,
+            bits,
+            shape,
+            payload_len,
+            selection,
+            output,
+            policy,
+            count,
+            layout,
+        })
+    }
+    pub(crate) fn range_layout(&self) -> Layout {
+        self.layout
+    }
+    pub(crate) fn range_count(&self) -> usize {
+        self.count
+    }
+    pub(crate) fn fill_into<'r>(
+        &self,
+        ranges: &'r mut [Range<usize>],
+    ) -> Result<SafetensorsReadRanges<'r>, SafetensorsReadError<'s>> {
         if ranges.len() != self.count {
             return Err(SafetensorsReadError {
-                key: self.source.key,
+                key: self.key,
                 cause: Cause::Destination {
                     expected: self.count,
                     actual: ranges.len(),
@@ -253,9 +304,9 @@ impl<'s> SafetensorsReadDestinationPlan<'s, '_> {
             });
         }
         let result = run(
-            self.source.key,
-            self.source.dtype.bitsize(),
-            self.source.shape,
+            self.key,
+            self.bits,
+            self.shape,
             self.payload_len,
             self.selection,
             self.output,
@@ -619,7 +670,7 @@ fn run<'a, P: Policy<'a>>(
             return Err(storage.error(
                 key,
                 Cause::Bounded("packed contiguous selection is not byte aligned"),
-            ))
+            ));
         }
         TensorSelection::Full => unreachable!(),
     };
@@ -704,18 +755,17 @@ pub(super) fn ordinary(
     )
 }
 
-
 /// Reuses the actual bounded read geometry for an already inferred encoded
 /// recipe. The admitted batch, not this geometry helper, owns file authority.
-pub(crate) fn encoded_selection_ranges(
-    key: &str,
+pub(crate) fn encoded_selection_plan<'s, 'd>(
+    key: &'s str,
     bits: usize,
-    shape: &[usize],
+    shape: &'s [usize],
     payload_len: usize,
-    selection: &TensorSelection,
-    output_shape: &[usize],
-) -> Result<Vec<Range<usize>>, StoreError> {
-    run(
+    selection: &'s TensorSelection,
+    output_shape: &'d [usize],
+) -> Result<SelectionReadDestinationPlan<'s, 'd>, SafetensorsReadError<'s>> {
+    SelectionReadDestinationPlan::new(
         key,
         bits,
         shape,
@@ -723,8 +773,7 @@ pub(crate) fn encoded_selection_ranges(
         selection,
         output_shape,
         ReadPolicy::RequireBounded,
-        Ordinary,
-    ).map(|plan| plan.ranges)
+    )
 }
 
 #[cfg(test)]

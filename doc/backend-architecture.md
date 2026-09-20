@@ -841,6 +841,13 @@ inference, retains the original account with the completed metadata, and keeps
 inferred metadata and any converted shape prefix with typed construction errors.
 Its bound covers recipe output metadata and native dimensions; source/header
 admission, encoded-read range construction and native payloads remain separate.
+SafeTensors selection reads and encoded recipe projections share one counted
+range-destination plan. It borrows the validated selection and shapes, counts
+coalesced ranges without cloning indices, and fills only an exactly sized caller
+destination. Encoded projection allocates that destination after counting, so
+range storage follows the selected geometry rather than tensor payload size.
+The plan itself supplies no reservation: read-batch metadata, mapping arrays,
+source/header retention and their construction lifetimes still need admission.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its
