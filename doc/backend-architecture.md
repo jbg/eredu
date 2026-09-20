@@ -364,6 +364,11 @@ same boundary issuer, checkpoint, completion vote and rollback ordering. Context
 guards restore the prior bindings on success, error or unwind; media cut validation
 remains inside execution before publication.
 
+Tensor-only pipeline schedules retain the selected routed bank invocation order
+and each bank's declared reductions even when expert parallelism is disabled.
+The bank-order validation is shared with expert-exchange scheduling; absence of
+an expert communication group does not turn a sparse model unit into a dense one.
+
 Inactive pipeline participants submit each architecture-declared reduction wave
 through the same retained model context as active participants. Runtime validates
 all input contracts before the backend consumes any occurrence. The backend

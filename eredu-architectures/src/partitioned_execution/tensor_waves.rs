@@ -17,6 +17,7 @@ impl<A, R, Q, G, D> PreparedPartitionedAdmission<A, R, Q, G, D>
     /// This cold method never inspects a native communicator or executes a model.
     pub(crate) fn tensor_pipeline_collective_waves<B, S>(
         &self,
+        banks: Option<&BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>>,
     ) -> Result<Option<Arc<TensorPipelineCollectiveWaves>>, String>
     where
         B: eredu_nn::NeuralBackend,
@@ -46,10 +47,19 @@ impl<A, R, Q, G, D> PreparedPartitionedAdmission<A, R, Q, G, D>
             .map_err(|_| "tensor pipeline output width is negative".to_owned())?;
         let blocks = (0..selected.partition().unit_layout().len())
             .map(|unit| {
-                architecture
-                    .partition_routed_tensor_reductions(unit, false)
-                    .map(|sums| vec![RoutedExpertUnitWave::ordinary(unit, hidden, sums)])
-                    .map_err(|cause| cause.to_string())
+                let order = banks.map(|banks| routed_bank_order::<B, S, A>(architecture, banks, unit))
+                    .transpose()?.unwrap_or_default();
+                if order.is_empty() {
+                    architecture.partition_routed_tensor_reductions(unit, false)
+                        .map(|sums| vec![RoutedExpertUnitWave::ordinary(unit, hidden, sums)])
+                        .map_err(|cause| cause.to_string())
+                } else {
+                    order.into_iter().map(|bank| {
+                        architecture.partition_routed_bank_tensor_reductions(unit, bank)
+                            .map(|sums| RoutedExpertUnitWave::ordinary(unit, hidden, sums))
+                            .map_err(|cause| cause.to_string())
+                    }).collect()
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let schedule = RoutedExpertCollectiveWaveSchedule::from_block_waves(
@@ -67,6 +77,29 @@ impl<A, R, Q, G, D> PreparedPartitionedAdmission<A, R, Q, G, D>
     }
 }
 
+/// The selected bank table and architecture must agree on every invocation.
+/// Tensor-only and expert-exchange schedules consume the same ordered source.
+pub(super) fn routed_bank_order<B, S, A>(
+    architecture: &A,
+    banks: &BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
+    unit: usize,
+) -> Result<Vec<eredu_runtime::RoutedBankId>, String>
+where
+    B: eredu_nn::NeuralBackend,
+    S: eredu_runtime::RuntimeState<B>,
+    A: TextPartitionArchitecture<B, S>,
+{
+    let actual = banks.iter()
+        .filter(|(_, bank)| bank.plan().has_unit(bank.owner_group().as_str(), unit))
+        .map(|(id, _)| *id).collect::<BTreeSet<_>>();
+    if actual.is_empty() { return Ok(Vec::new()); }
+    let order = architecture.partition_routed_bank_order(unit);
+    if order.iter().copied().collect::<BTreeSet<_>>() != actual || order.len() != actual.len() {
+        return Err(format!("unit {unit} collective order differs from its bank invocations"));
+    }
+    Ok(order)
+}
+
 impl<B, A, G, D> PreparedPartitionedArchitecture<B, A, G, D>
 where B: eredu_nn::NeuralBackend,
 {
@@ -76,7 +109,7 @@ where B: eredu_nn::NeuralBackend,
     where S: eredu_runtime::RuntimeState<B>, A: TextPartitionArchitecture<B, S>,
         A::Error: std::fmt::Display,
     {
-        self.prepared.tensor_pipeline_collective_waves::<B, S>()
+        self.prepared.tensor_pipeline_collective_waves::<B, S>(None)
     }
 }
 

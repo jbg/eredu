@@ -11575,7 +11575,7 @@ where
                 let _ = prepared.pipeline_plan.set(plan.clone());
                 Some((plan, prepared.selected().partition().units().collect::<Vec<_>>(),
                     prepared.selected().activation_dtype(),
-                    prepared.tensor_pipeline_collective_waves::<B,S>()
+                    prepared.tensor_pipeline_collective_waves::<B,S>(None)
                         .map_err(DenseDecoderPartitionedDispatchError::Architecture)?))
             } else { None };
             // The ordinary session constructor uses this same state-selection
@@ -14332,14 +14332,9 @@ impl PreparedRoutedExecutionHandoff {
                             .map_err(|_| "routed output width is negative".to_owned())?;
                     let mut blocks = Vec::with_capacity(unit_count);
                     for unit in 0..unit_count {
-                        let actual = banks
-                            .iter()
-                            .filter(|(_, bank)| {
-                                bank.plan().has_unit(bank.owner_group().as_str(), unit)
-                            })
-                            .map(|(id, _)| *id)
-                            .collect::<BTreeSet<_>>();
-                        if actual.is_empty() {
+                        let order = tensor_waves::routed_bank_order::<B, S, A>(
+                            prepared.architecture(), banks, unit)?;
+                        if order.is_empty() {
                             let sums = prepared
                                 .architecture()
                                 .partition_routed_tensor_reductions(unit, false)
@@ -14350,14 +14345,6 @@ impl PreparedRoutedExecutionHandoff {
                                 sums,
                             )]);
                             continue;
-                        }
-                        let order = prepared.architecture().partition_routed_bank_order(unit);
-                        if order.iter().copied().collect::<BTreeSet<_>>() != actual
-                            || order.len() != actual.len()
-                        {
-                            return Err(format!(
-                                "unit {unit} collective order differs from its bank invocations"
-                            ));
                         }
                         blocks.push(
                             order
@@ -14409,7 +14396,7 @@ impl PreparedRoutedExecutionHandoff {
             }
         };
         let tensor_waves = if expert_group.is_none() {
-            prepared.tensor_pipeline_collective_waves::<B, S>()?
+            prepared.tensor_pipeline_collective_waves::<B, S>(Some(banks))?
         } else { None };
         Ok(Self {
             tensor_waves,
