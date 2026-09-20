@@ -5358,7 +5358,7 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
     * doctest::skip(!wait_record_facts::layout_qualified)) {
   using namespace pointwise_graph_tests;
   auto stream=new_stream(Device::cpu);prepare(stream,stream);
-  for(const auto dtype:{float16,bfloat16,float32}) {
+  for(const auto dtype:{float16,bfloat16,float32,int32,uint32}) {
     for(size_t rank=1;rank<=4;++rank) {
       for(bool store:{false,true}) {
         cpu::CopyEvalStorage cold;
@@ -5370,7 +5370,7 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
         CHECK(std::memcmp(&before,&cold,sizeof(cold))==0);
         CHECK_FALSE(cpu::host_transfer_eval_layout(dtype,5,store,false,cold));
         CHECK(std::memcmp(&before,&cold,sizeof(cold))==0);
-        CHECK_FALSE(cpu::host_transfer_eval_layout(int32,rank,store,false,cold));
+        CHECK_FALSE(cpu::host_transfer_eval_layout(bool_,rank,store,false,cold));
         CHECK(std::memcmp(&before,&cold,sizeof(cold))==0);
       }
     }
