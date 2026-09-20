@@ -600,7 +600,8 @@ impl LayerwiseWorkspace {
                     let row = self
                         .row(unit, index)
                         .map_err(eredu_nn::Error::backend_retained_source)?;
-                    let layout = WorkspaceLayout::new(row.shape, row.dtype)?;
+                    let layout = WorkspaceLayout::new(row.shape, row.dtype)?
+                        .with_representation(row.representation);
                     let root = WorkspaceExistingStorage::new(Some(row.capacity_bytes), context);
                     Ok((
                         eredu_nn::ParameterId::new(row.binding.name())
@@ -644,7 +645,8 @@ impl LayerwiseWorkspace {
                                 "canonical disk owner capacity differs between aliases",
                             ));
                         }
-                        let layout = WorkspaceLayout::new(row.shape, row.dtype)?;
+                        let layout = WorkspaceLayout::new(row.shape, row.dtype)?
+                            .with_representation(row.representation);
                         Ok((
                             eredu_nn::ParameterId::new(row.binding.name())
                                 .map_err(eredu_nn::Error::backend_retained_source)?,

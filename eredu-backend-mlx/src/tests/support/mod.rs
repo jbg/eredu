@@ -9,3 +9,5 @@ pub(crate) mod test_utils;
 pub(crate) mod provider_failure;
 
 pub(crate) mod media_completion;
+
+pub(crate) mod native_process;

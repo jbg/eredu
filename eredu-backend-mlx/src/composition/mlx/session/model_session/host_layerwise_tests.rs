@@ -364,9 +364,10 @@ fn cause<'a, T: std::error::Error + 'static>(
 
 #[test]
 fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     for depth in [1, 2] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut runtime, _artifact) = runtime(&stream, &pool, Some(depth));
         let controller = Controller::default();
         let before_paths = paths::snapshot();
@@ -446,20 +447,22 @@ fn host_layerwise_quote_is_cold_and_one_byte_short_rejects_before_work() {
         let output = outputs(&mut runtime, 0.7, capacity, true);
         assert!(pool.peak_bytes().unwrap() <= capacity);
         drop((output, runtime));
-        settle(&pool, 0);
+        settle(&pool, native_baseline);
     }
 }
 
 #[test]
 fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     for temperature in [0.0, 0.7] {
         let mut reference = None;
         for depth in [None, Some(1), Some(2)] {
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
                 let (mut runtime, _artifact) = runtime(&stream, &pool, depth);
                 let capacity = exact_capacity(&runtime, &pool, temperature);
+                let previous_peak = pool.peak_bytes().unwrap();
                 let before = paths::bounded_unit_acquisitions();
                 let output = outputs(&mut runtime, temperature, capacity, controlled);
                 let ids = output
@@ -481,9 +484,9 @@ fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
                     assert!(layers.iter().filter(|unit| unit.device_resident()).count() <= depth);
                 }
                 assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-                assert!(pool.peak_bytes().unwrap() <= capacity);
+                assert!(pool.peak_bytes().unwrap() <= previous_peak.max(capacity));
                 drop((output, runtime));
-                settle(&pool, 0);
+                settle(&pool, native_baseline);
             }
         }
     }
@@ -491,11 +494,13 @@ fn host_layerwise_chunked_generation_and_three_cached_decodes_match_resident() {
 
 #[test]
 fn host_layerwise_source_window_and_escaped_token_retire_independently() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     for depth in [1, 2] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut runtime, artifact) = runtime(&stream, &pool, Some(depth));
         let initial = live_bytes(Some(&runtime), &[]);
+        let retained_overhead = pool.used_bytes().unwrap().checked_sub(initial).unwrap();
         let capacity = exact_capacity(&runtime, &pool, 0.7);
         let output = outputs(&mut runtime, 0.7, capacity, true);
         let value = output[0].token_id().unwrap();
@@ -510,30 +515,32 @@ fn host_layerwise_source_window_and_escaped_token_retire_independently() {
         assert!(token_bytes > 0);
         let all_arrays = output.iter().map(|token| &token.value).collect::<Vec<_>>();
         let all = live_bytes(Some(&runtime), &all_arrays);
-        settle(&pool, all);
+        settle(&pool, retained_overhead + all);
         drop(all_arrays);
         drop((output, escaped));
         let session_and_alias = live_bytes(Some(&runtime), &[&alias]);
-        settle(&pool, session_and_alias);
+        settle(&pool, retained_overhead + session_and_alias);
         assert!(live_bytes(Some(&runtime), &[]) > initial);
         assert!(
             session_and_alias < capacity,
             "completed work releases its transient envelope"
         );
         drop((runtime, artifact));
-        settle(&pool, token_bytes);
+        settle(&pool, native_baseline + token_bytes);
         assert_eq!(alias.evaluated().unwrap().item::<u32>(), value);
         drop(alias);
-        settle(&pool, 0);
+        settle(&pool, native_baseline);
     }
 }
 
 #[test]
 fn host_layerwise_abandoned_controlled_run_releases_unused_workspace_after_completion() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     for depth in [1, 2] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut runtime, artifact) = runtime(&stream, &pool, Some(depth));
+        let retained_overhead = pool.used_bytes().unwrap().checked_sub(live_bytes(Some(&runtime), &[])).unwrap();
         let capacity = exact_capacity(&runtime, &pool, 0.7);
         let controller = Controller::default();
         let mut run = ControlledTextGeneration::from_input(
@@ -554,7 +561,7 @@ fn host_layerwise_abandoned_controlled_run_releases_unused_workspace_after_compl
 
         let arrays = [&output.value];
         let retained = live_bytes(Some(&runtime), &arrays);
-        settle(&pool, retained);
+        settle(&pool, retained_overhead + retained);
         assert!(retained < capacity);
         assert!(runtime
             .session()
@@ -568,21 +575,21 @@ fn host_layerwise_abandoned_controlled_run_releases_unused_workspace_after_compl
         let id = output.token_id().unwrap();
         let token_bytes = live_bytes(None, &[&escaped]);
         drop((output, runtime, artifact));
-        settle(&pool, token_bytes);
+        settle(&pool, native_baseline + token_bytes);
         assert_eq!(escaped.evaluated().unwrap().item::<u32>(), id);
         drop(escaped);
-        settle(&pool, 0);
+        settle(&pool, native_baseline);
     }
 }
 
 #[test]
 fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
     use crate::tests::support::provider_failure::{self, Operator};
-    use eredu_runtime::working_memory::PrefillPlanningError;
 
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
     for depth in [1, 2] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        if !crate::tests::support::native_process::enter(&depth.to_string()) { continue; }
+        let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+        let stream = streams.execution();
         let (mut runtime, artifact) = runtime_for(&stream, &pool, Some(depth), "qwen3_moe");
         let baseline = pool.used_bytes().unwrap();
         let before = paths::snapshot();
@@ -593,32 +600,8 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
             config(0.7, Some(u64::MAX)),
             &controller,
         );
-        let preparation = match preparation {
-            Ok(preparation) => preparation,
-            Err(error) => {
-                // Independent-bank or missing mechanism support must remain a
-                // typed cold rejection; a reservation is never a bypass.
-                assert!(
-                    matches!(
-                        cause::<WorkingMemoryError>(&error),
-                        Some(WorkingMemoryError::UnknownBound)
-                    ) || matches!(
-                        cause::<PrefillPlanningError>(&error),
-                        Some(PrefillPlanningError::Admission(
-                            eredu_core::AdmissionRejection::EstimationUnsupported { .. }
-                        ))
-                    ),
-                    "unexpected routed admission failure: {error}"
-                );
-                assert_eq!(paths::snapshot(), before);
-                assert_eq!(controller.0.get(), (0, 0));
-                assert_eq!(pool.used_bytes().unwrap(), baseline);
-                eprintln!("host-layerwise provider-failure coverage unavailable at depth {depth}: {error}");
-                drop((runtime, artifact));
-                settle(&pool, 0);
-                continue;
-            }
-        };
+        let preparation = preparation.unwrap();
+        assert_eq!(paths::snapshot(), before);
         let charge = preparation
             .request
             .as_ref()
@@ -661,7 +644,7 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
         );
         assert_eq!(controller.0.get(), (1, 0));
         assert!(run.next().is_none());
-        assert!(pool.used_bytes().unwrap() >= charge);
+        assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
         drop((fault, error, run));
         // Observe active-owner retirement without retaining the payload.
         // Injecting an Any semantic owner would make the inventory incomplete.
@@ -676,7 +659,7 @@ fn host_layerwise_native_provider_failure_keeps_funding_and_original_cause() {
         // certify this failed operation's complete physical inventory. Its
         // isolated funding account remains quarantined; dropping request
         // metadata and the model must not refund the unproved remainder.
-        assert!(pool.used_bytes().unwrap() >= charge);
+        assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
     }
 }
 
@@ -712,7 +695,9 @@ pub(super) fn family_artifact(family: &str) -> tempfile::TempDir {
 }
 
 fn family_parity(family: &str) {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     let configuration = |capacity| {
         config(0.7, capacity).with_inference_policy(eredu_core::TextInferencePolicy {
             // Five positions exercise two full chunks and a shorter final chunk.
@@ -726,9 +711,9 @@ fn family_parity(family: &str) {
     for depth in [None, Some(1), Some(2)] {
         for controlled in [false, true] {
             eprintln!("host family parity: {family}, depth={depth:?}, controlled={controlled}");
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
             let (mut runtime, artifact) =
                 runtime_from_artifact(&stream, &pool, depth, family_artifact(family));
+            let retained_overhead = pool.used_bytes().unwrap().checked_sub(live_bytes(Some(&runtime), &[])).unwrap();
             let controller = Controller::default();
             let state_layout = runtime
                 .session()
@@ -918,10 +903,10 @@ fn family_parity(family: &str) {
                 .iter()
                 .map(|output| &output.value)
                 .collect::<Vec<_>>();
-            settle(&pool, live_bytes(Some(&runtime), &arrays));
+            settle(&pool, retained_overhead + live_bytes(Some(&runtime), &arrays));
             drop(arrays);
             drop((outputs, runtime, artifact));
-            settle(&pool, 0);
+            settle(&pool, native_baseline);
         }
     }
 }

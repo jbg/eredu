@@ -41,7 +41,6 @@ fn disk_runtime(
         .layerwise_workspace()
         .unwrap()
         .unwrap();
-    assert!(workspace.disk_receipt().is_some());
     assert!(workspace.materialization().bytes().unwrap() > 0);
     let report = runtime.session().residency_report().unwrap().unwrap();
     assert!(report
@@ -127,11 +126,12 @@ fn cold_quote_and_short_rejection(
 
 #[test]
 fn v4_fixed_rotary_host_construction_is_bounded_for_both_host_windows_and_drivers() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     let mut reference = None;
     for depth in [None, Some(1), Some(2)] {
         for controlled in [false, true] {
-            let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
             let (mut runtime, root) = runtime_from_artifact(&stream, &pool, depth, v4_artifact());
             let capacity = if depth.is_some() {
                 cold_quote_and_short_rejection(&mut runtime, &pool)
@@ -162,16 +162,17 @@ fn v4_fixed_rotary_host_construction_is_bounded_for_both_host_windows_and_driver
             assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
             assert!(pool.peak_bytes().unwrap() <= capacity);
             drop((output, runtime, root));
-            settle(&pool, 0);
+            settle(&pool, native_baseline);
         }
     }
 }
 
 #[test]
 fn v4_fixed_rotary_direct_disk_construction_matches_resident_with_exact_admission() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     let reference = {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut runtime, root) = runtime_from_artifact(&stream, &pool, None, v4_artifact());
         let capacity = exact_capacity(&runtime, &pool, 0.7);
         let output = outputs(&mut runtime, 0.7, capacity, false);
@@ -180,11 +181,10 @@ fn v4_fixed_rotary_direct_disk_construction_matches_resident_with_exact_admissio
             .map(|token| token.token_id().unwrap())
             .collect::<Vec<_>>();
         drop((output, runtime, root));
-        settle(&pool, 0);
+        settle(&pool, native_baseline);
         ids
     };
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut runtime, root) = disk_runtime(&stream, &pool);
         let capacity = cold_quote_and_short_rejection(&mut runtime, &pool);
         let output = outputs(&mut runtime, 0.7, capacity, controlled);
@@ -207,6 +207,6 @@ fn v4_fixed_rotary_direct_disk_construction_matches_resident_with_exact_admissio
         assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
         assert!(pool.peak_bytes().unwrap() <= capacity);
         drop((output, runtime, root));
-        settle(&pool, 0);
+        settle(&pool, native_baseline);
     }
 }

@@ -434,6 +434,44 @@ pub struct DetachedEncodedReadSlice<'a, C> {
     range: Range<usize>,
 }
 impl<C> DetachedEncodedReadSlice<'_, C> {
+    /// Snapshot of the detached source stores used by these reads. Counters are
+    /// source-wide, including reads through other slices of the same owner.
+    /// Each source contributes once; independent stores sharing a file remain
+    /// distinct. Direct reads retain no shard cache or ordinary store counters.
+    pub fn diagnostics(&self) -> WeightStoreDiagnostics {
+        let mut report = WeightStoreDiagnostics {
+            backend: WeightStoreBackend::Memory,
+            cache_hits: 0,
+            cache_misses: 0,
+            evictions: 0,
+            currently_cached_shards: 0,
+            touched_shard_paths: Vec::new(),
+            payload_shard_paths: Vec::new(),
+            physical_reads: 0,
+            physical_read_bytes: 0,
+            coalesced_group_hits: 0,
+        };
+        for (index, source) in self.owner.sources.iter().enumerate() {
+            if !self.owner.reads[self.range.clone()]
+                .iter().any(|read| read.source == Some(index))
+            {
+                continue;
+            }
+            report.backend = WeightStoreBackend::Safetensors;
+            report.physical_reads = report.physical_reads.saturating_add(
+                source.telemetry.physical_reads.load(Ordering::Relaxed));
+            report.physical_read_bytes = report.physical_read_bytes.saturating_add(
+                source.telemetry.physical_read_bytes.load(Ordering::Relaxed));
+            report.payload_shard_paths.extend(source.paths.iter()
+                .filter(|(_, used)| used.load(Ordering::Relaxed))
+                .map(|(path, _)| path.clone()));
+        }
+        report.payload_shard_paths.sort_unstable();
+        report.payload_shard_paths.dedup();
+        report.touched_shard_paths = report.payload_shard_paths.clone();
+        report
+    }
+
     fn views(&self) -> DetachedViews<'_, C> {
         DetachedViews {
             owner: self.owner,

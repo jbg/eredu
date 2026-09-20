@@ -226,20 +226,8 @@ impl CheckpointSource for DetachedCatalog {
         })
     }
     fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
-        // The in-memory metadata view acquires no payload. Detached read counters
-        // stay separately source-local in DetachedEncodedReads.
-        Ok(WeightStoreDiagnostics {
-            backend: WeightStoreBackend::Memory,
-            cache_hits: 0,
-            cache_misses: 0,
-            evictions: 0,
-            currently_cached_shards: 0,
-            touched_shard_paths: Vec::new(),
-            payload_shard_paths: Vec::new(),
-            physical_reads: 0,
-            physical_read_bytes: 0,
-            coalesced_group_hits: 0,
-        })
+        Ok(self.reads.slice(self.range.clone())
+            .expect("validated detached read range").diagnostics())
     }
 }
 pub(in crate::backend::runtime::residency::manager) struct OriginalReadSources {

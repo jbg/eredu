@@ -318,6 +318,10 @@ mod tests {
             .unwrap();
         drop(reads);
         drop(source);
+        let fresh = detached.slice(0..3).unwrap().diagnostics();
+        assert_eq!(fresh.backend, WeightStoreBackend::Safetensors);
+        assert_eq!((fresh.physical_reads, fresh.physical_read_bytes), (0, 0));
+        assert!(fresh.payload_shard_paths.is_empty());
         assert!(detached.slice(2..4).is_none());
         assert!(detached.slice(2..1).is_none());
         assert!(detached
@@ -332,6 +336,18 @@ mod tests {
         selected.read_many_into(&mut [&mut output]).unwrap();
         assert_eq!(output, [3; 8]);
         assert_eq!(detached.physical_read_bytes(0), Some(8));
+        let report = selected.diagnostics();
+        assert_eq!((report.physical_reads, report.physical_read_bytes), (1, 8));
+        assert_eq!(report.payload_shard_paths, vec![directory.path().join("b.safetensors").canonicalize().unwrap()]);
+        assert_eq!(report.touched_shard_paths, report.payload_shard_paths);
+        assert_eq!(report, detached.slice(0..3).unwrap().diagnostics());
+        assert_eq!(report, detached.slice(0..1).unwrap().diagnostics());
+        assert_eq!(report.currently_cached_shards, 0);
+        assert_eq!((report.cache_hits, report.cache_misses, report.evictions), (0, 0, 0));
+        let empty = detached.slice(0..0).unwrap().diagnostics();
+        assert_eq!(empty.backend, WeightStoreBackend::Memory);
+        assert_eq!((empty.physical_reads, empty.physical_read_bytes), (0, 0));
+        assert!(empty.payload_shard_paths.is_empty());
         let mut short = [77u8; 7];
         let error = selected.read_many_into(&mut [&mut short]).unwrap_err();
         assert!(matches!(
@@ -340,10 +356,12 @@ mod tests {
         ));
         assert_eq!(short, [77; 7]);
         assert_eq!(detached.physical_read_bytes(0), Some(8));
+        assert_eq!(selected.diagnostics(), report);
         drop(error);
         std::fs::remove_file(directory.path().join("b.safetensors")).unwrap();
         let error = selected.read_many_into(&mut [&mut output]).unwrap_err();
         assert_eq!(error.cause().batch, Some(0));
+        assert_eq!(selected.diagnostics(), report);
         drop(selected);
         drop(detached);
         assert!(alive.upgrade().is_some());
@@ -412,6 +430,15 @@ mod tests {
         assert_eq!(second, [1; 8]);
         assert_eq!(detached.physical_read_bytes(0), Some(16));
         assert_eq!(detached.physical_read_bytes(1), Some(8));
+        let first_report = detached.slice(0..1).unwrap().diagnostics();
+        let second_report = detached.slice(1..2).unwrap().diagnostics();
+        let combined = detached.slice(0..2).unwrap().diagnostics();
+        assert_eq!(first_report.physical_read_bytes, 16);
+        assert_eq!(second_report.physical_read_bytes, 8);
+        assert_eq!(combined.physical_read_bytes, 24);
+        assert_eq!(combined.physical_reads, first_report.physical_reads + second_report.physical_reads);
+        assert!(first_report.physical_reads > 0 && second_report.physical_reads > 0);
+        assert_eq!(combined.payload_shard_paths, vec![directory.path().join("a.safetensors").canonicalize().unwrap()]);
         let mut marked = 0;
         detached.visit_payload_paths(|_, _| marked += 1);
         assert_eq!(marked, 2);

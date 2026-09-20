@@ -431,6 +431,11 @@ mod v4_components {
     }
 
     fn prove(device: DeviceType) {
+        if !crate::tests::support::native_process::enter("capture") { return; }
+        #[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
+        let _streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(
+            &crate::backend::managed_memory::domain(), device,
+        ).unwrap().expect("qualified native stream factory");
         for residency in [
             WeightResidency::default(),
             WeightResidency::layerwise_host(LayerwiseLoadOptions::new(

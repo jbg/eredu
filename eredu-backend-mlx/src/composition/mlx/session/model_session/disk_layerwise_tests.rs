@@ -198,10 +198,6 @@ fn load_runtime_from_artifact(
             .unwrap()
             .unwrap();
         assert_eq!(workspace.layout().len(), LAYERS);
-        assert!(
-            workspace.disk_receipt().is_some(),
-            "file-backed direct read plan is retained"
-        );
         assert!(workspace.materialization().bytes().unwrap() > 0);
     }
     (runtime, artifact)
@@ -373,8 +369,9 @@ pub(super) fn cause<'a, T: std::error::Error + 'static>(
 
 #[test]
 fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     let (mut runtime, artifact) = load_runtime(&stream, &pool, true);
     let controller = Controller::default();
     let before = report(&runtime);
@@ -449,19 +446,21 @@ fn disk_layerwise_cold_quote_and_exact_capacity_reject_before_reads_or_callbacks
     assert_disk_window(&runtime);
     assert!(pool.peak_bytes().unwrap() <= capacity);
     drop((outputs, runtime, artifact));
-    settle(&pool, 0);
+    settle(&pool, native_baseline);
 }
 
 #[test]
 fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drivers() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     for temperature in [0.0, 0.7] {
         let mut reference = None;
         for disk in [false, true] {
             for controlled in [false, true] {
-                let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
                 let (mut runtime, artifact) = load_runtime(&stream, &pool, disk);
                 let (capacity, _) = exact_capacity(&runtime, &pool, &tokens(), temperature, 2);
+                let previous_peak = pool.peak_bytes().unwrap();
                 let acquisitions = paths::bounded_unit_acquisitions();
                 let before = disk.then(|| report(&runtime));
                 let output = outputs(
@@ -496,9 +495,9 @@ fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drive
                             > before.offload().tier_evictions(MemoryTier::Device).count()
                     );
                 }
-                assert!(pool.peak_bytes().unwrap() <= capacity);
+                assert!(pool.peak_bytes().unwrap() <= previous_peak.max(capacity));
                 drop((output, runtime, artifact));
-                settle(&pool, 0);
+                settle(&pool, native_baseline);
             }
         }
     }
@@ -506,10 +505,12 @@ fn disk_layerwise_uneven_prefill_and_cached_decodes_match_resident_in_both_drive
 
 #[test]
 fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_physical_roots() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     for controlled in [false, true] {
-        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
         let (mut runtime, artifact) = load_runtime(&stream, &pool, true);
+        let retained_overhead = pool.used_bytes().unwrap().checked_sub(live_bytes(Some(&runtime), &[])).unwrap();
         let (cold_capacity, _) = exact_capacity(&runtime, &pool, &tokens(), 0.0, 2);
         // Exercise reuse within one finite ceiling. The separate capacity
         // handoff tests cover an explicitly larger successor policy.
@@ -533,7 +534,7 @@ fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_ph
             .iter()
             .map(|token| &token.value)
             .collect::<Vec<_>>();
-        settle(&pool, live_bytes(Some(&runtime), &old_arrays));
+        settle(&pool, retained_overhead + live_bytes(Some(&runtime), &old_arrays));
         drop(old_arrays);
         assert_eq!(pool.effective_capacity().unwrap(), capacity);
 
@@ -604,73 +605,65 @@ fn disk_layerwise_next_request_progresses_with_escaped_old_token_and_releases_ph
             .chain(output_b.iter())
             .map(|token| &token.value)
             .collect::<Vec<_>>();
-        settle(&pool, live_bytes(Some(&runtime), &all));
+        settle(&pool, retained_overhead + live_bytes(Some(&runtime), &all));
         drop(all);
         let token_bytes = live_bytes(None, &[&alias]);
         assert!(token_bytes > 0);
         drop((output_a, output_b, old_owner, runtime, artifact));
-        settle(&pool, token_bytes);
+        settle(&pool, native_baseline + token_bytes);
         assert_eq!(pool.effective_capacity().unwrap(), capacity);
         assert_eq!(alias.evaluated().unwrap().item::<u32>(), ids_a[0]);
         drop(alias);
-        settle(&pool, 0);
+        settle(&pool, native_baseline);
         assert_eq!(pool.effective_capacity().unwrap(), u64::MAX);
     }
 }
 
 #[test]
-fn disk_route_release_waits_for_recovery_ticket_but_not_completed_owner_aliases() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+fn disk_payload_release_waits_for_recovery_ticket_but_not_completed_owner_aliases() {
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     let (runtime, artifact) = load_runtime(&stream, &pool, true);
-    let workspace = runtime
-        .session()
-        .payload
-        .model
-        .layerwise_workspace()
-        .unwrap()
-        .unwrap();
-    let receipt = workspace.disk_receipt().unwrap();
+    let retired = runtime.session().test_payload_retirement_probe();
     let mut authority = eredu_core::SessionAuthority::new();
-    let owner = SubmissionResources::new(
+    let owner = SubmissionResources::with_purpose(
         authority.begin_submission().unwrap(),
         Rc::new(Cell::new(false)),
+        SubmissionPurpose::OriginalModel,
     );
-    let before = report(&runtime);
+    owner.payload.replace(Some(runtime.session().payload.clone()));
     let bytes = pool.used_bytes().unwrap();
-    owner
-        .direct_route
-        .replace(Some(receipt.activate().unwrap()));
+    assert!(bytes > native_baseline);
     let ticket = owner.ticket();
     let escaped_owner = owner.clone();
     owner.request_release();
     assert!(authority.require_idle().is_err());
-    let blocked = receipt
-        .activate()
-        .err()
-        .expect("unresolved recovery retains operation restriction");
-    assert_eq!(
-        cause::<WorkingMemoryError>(&blocked),
-        Some(&WorkingMemoryError::ExecutionFenced)
-    );
-    assert!(owner.direct_route.borrow().is_some());
-    drop((owner, blocked));
+    assert!(authority.begin_submission().is_err());
+    assert!(owner.payload.borrow().is_some());
+    drop((owner, runtime, artifact));
+    reclaim();
+    assert!(!retired());
+    assert_eq!(pool.used_bytes().unwrap(), bytes);
     drop(ticket);
     authority.require_idle().unwrap();
-    assert!(escaped_owner.direct_route.borrow().is_none());
-    let next = receipt.activate().unwrap();
+    assert!(escaped_owner.payload.borrow().is_none());
     assert!(escaped_owner.resources_releasable());
+    let next = authority.begin_submission().unwrap();
     drop(next);
-    assert_eq!(report(&runtime), before);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
-    drop((escaped_owner, receipt, workspace, runtime, artifact));
-    settle(&pool, 0);
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        reclaim();
+        retired()
+    });
+    settle(&pool, native_baseline);
+    drop(escaped_owner);
 }
 
 #[test]
 fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding() {
-    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Gpu, 0));
-    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    if !crate::tests::support::native_process::enter("main") { return; }
+    let (streams, pool, native_baseline) = crate::tests::support::native_process::metal();
+    let stream = streams.execution();
     let (mut runtime, artifact) = load_runtime(&stream, &pool, true);
     let (capacity, charge) = exact_capacity(&runtime, &pool, &tokens(), 0.7, 2);
     let controller = Controller::default();
@@ -697,14 +690,17 @@ fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding
         .expect("retained source identity must reject replacement");
     assert!(
         matches!(
-            cause::<eredu_checkpoint::store::StoreError>(&error),
-            Some(eredu_checkpoint::store::StoreError::AdmittedFileChanged { .. })
+            cause::<eredu_checkpoint::store::EncodedReadFailure>(&error),
+            Some(eredu_checkpoint::store::EncodedReadFailure {
+                batch: Some(0), shard: Some(0), completed_shards: 0,
+                cause: eredu_checkpoint::store::EncodedReadFailureCause::Changed,
+            })
         ),
         "changed source must preserve its typed cause: {error:?}",
     );
     assert_eq!(controller.0.get().1, 1, "failed work commits no token");
     assert!(run.next().is_none());
-    assert!(pool.used_bytes().unwrap() >= charge);
+    assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
     assert_eq!(first.token_id().unwrap(), first_id);
     drop((run, error, first));
     let retained = pool.used_bytes().unwrap();
@@ -745,5 +741,5 @@ fn disk_layerwise_changed_source_preserves_typed_failure_and_uncertified_funding
     reclaim();
     // Source failure leaves this operation's complete physical inventory
     // uncertified. Recovery and request teardown cannot refund that envelope.
-    assert!(pool.used_bytes().unwrap() >= charge);
+    assert!(pool.used_bytes().unwrap() >= native_baseline + charge);
 }

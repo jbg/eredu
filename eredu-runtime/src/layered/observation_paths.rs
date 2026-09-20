@@ -742,9 +742,12 @@ where
         Provider:crate::RoutedExpertProvider<B>,Provider::Error:std::fmt::Display,
         H:crate::LayeredTraversalHook<B,A::ForwardContext,A::Error>+?Sized,
     {
-        self.forward_with_unit_executor_and_traversal_hook_with_readout(input,state,context,
-            |architecture,group,index,unit,hidden,state,forward,context|
-                architecture.forward_unit_with_provider(group,index,unit,hidden,state,forward,pass,provider,context),hook,demand)
+        self.forward_with_unit_executor_and_invocation(
+            OrdinaryLayeredInput::new(input), state, context,
+            |architecture, group, index, unit, hidden, state, forward, context, _hook|
+                architecture.forward_unit_with_provider(
+                    group, index, unit, hidden, state, forward, pass, provider, context),
+            hook, false, true, demand)
     }
     /// Executes the provider through the existing prepared observation binding.
     pub fn forward_serial_routed_with_prepared_paths<'a, Provider, O>(

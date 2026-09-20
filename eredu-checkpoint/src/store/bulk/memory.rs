@@ -146,6 +146,12 @@ mod tests {
         assert_eq!(output, expected);
         assert_eq!(detached.physical_read_bytes(0), None);
         detached.visit_payload_paths(|_, _| panic!("memory source has no file"));
+        let report = detached.slice(0..1).unwrap().diagnostics();
+        assert_eq!(report.backend, WeightStoreBackend::Memory);
+        assert_eq!((report.physical_reads, report.physical_read_bytes), (0, 0));
+        assert!(report.payload_shard_paths.is_empty());
+        assert!(report.touched_shard_paths.is_empty());
+        assert_eq!(report.currently_cached_shards, 0);
         let mut short = vec![99; expected.len() - 1];
         let error = detached.read_many_into(&mut [&mut short]).unwrap_err();
         assert!(matches!(
