@@ -126,7 +126,7 @@ impl SpeculativeNumericalRecipe {
     }
 }
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
 mod tests {
     use super::*;
     use eredu_nn::Tensor;

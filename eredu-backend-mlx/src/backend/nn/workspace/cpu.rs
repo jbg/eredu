@@ -126,7 +126,7 @@ impl MlxCpuWorkspaceMechanisms {
         if let Some(plan)=comparison::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=token_scores::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=candidates::inspect(operation,self)? {return Ok(Some(plan));}
-        if let Some(plan)=static_slice::inspect(operation)? {return Ok(Some(plan));}
+        if let Some(plan)=static_slice::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=static_update::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=indexed_elements::inspect(operation,self)? {return Ok(Some(plan));}
         if let Some(plan)=gelu::inspect(operation,self)? {return Ok(Some(plan));}

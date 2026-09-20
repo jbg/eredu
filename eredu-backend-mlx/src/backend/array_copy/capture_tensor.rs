@@ -1,4 +1,4 @@
-//! Metal static selection, explicit half-to-F32 conversion, then settled host iteration.
+//! CPU and Metal static selection, half-to-F32 conversion, and settled host iteration.
 use super::ExistingArrayProjection;
 mod fragment;
 mod generated;
@@ -54,11 +54,11 @@ use std::{cell::RefCell, collections::TryReserveError, fmt};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CaptureTensorNativeError {
-    #[error("direct capture host reads currently require the audited Metal allocator")]
+    #[error("direct capture host reads require the audited Apple CPU or Metal allocator")]
     UnsupportedMechanism,
-    #[error("capture requires a Metal GPU stream, got {0:?}")]
+    #[error("capture stream is unavailable in this build: {0:?}")]
     UnsupportedStream(safemlx::DeviceType),
-    #[error("selected Metal capture requires F32, F16 or BF16 source, got {0:?}")]
+    #[error("selected capture requires F32, F16 or BF16 source, got {0:?}")]
     UnsupportedDtype(Dtype),
     #[error("capture source does not match admitted source geometry")]
     ShapeMismatch,
@@ -114,7 +114,7 @@ pub(crate) enum CaptureTensorNativeError {
 /// mechanism, not capture admission or a whole-request quote. The enclosing
 /// caller must authenticate invocation/quota and include its full trace plus H
 /// in the original request. Source aliases remain settled/exclusive throughout.
-/// F32, F16 and BF16 use Metal shared storage. Half conversion is the actual
+/// F32, F16 and BF16 use CPU or shared Metal storage. Half conversion is the actual
 /// native AsType, preserving its exceptional-value semantics. Empty half outputs
 /// skip conversion/iteration. F64 and other transfer mechanisms are unfinished.
 /// This leaf does not lower any managed capture gate.
@@ -200,7 +200,6 @@ impl<'a> PreparedCaptureTensor<'a> {
 
     fn validate_mechanism() -> Result<(), CaptureTensorNativeError> {
         if !cfg!(all(
-            feature = "metal",
             target_vendor = "apple",
             not(feature = "cuda")
         )) {
@@ -232,7 +231,8 @@ impl<'a> PreparedCaptureTensor<'a> {
     /// authorize a stream from its compile-time availability alone.
     pub(crate) fn validate_stream(stream: &Stream) -> Result<(), CaptureTensorNativeError> {
         let device_type = stream.device_type()?;
-        if device_type != safemlx::DeviceType::Gpu {
+        Self::validate_mechanism()?;
+        if device_type == safemlx::DeviceType::Gpu && !cfg!(feature = "metal") {
             return Err(CaptureTensorNativeError::UnsupportedStream(device_type));
         }
         Ok(())

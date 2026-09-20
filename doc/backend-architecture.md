@@ -1756,6 +1756,17 @@ Global observations require architecture-derived ownership, bounded transport,
 complete receipts and shared commit. Ordinary rank-local inspection does not
 implicitly gather. Raw and precompiled enforced capture use the funded retained
 layout/support source above. Prior lazy discovery cannot authorize that storage.
+CPU and Metal capture use the same selection, readout, source publication and
+completion workers. The stream retained by the resident plan selects the CPU or
+Metal operation recipes and compiled allocator facts. Completed positive strides
+remain explicit in projected source metadata, including row gaps. Empty CPU
+slices reserve the compiled allocator's zero-size backing independently of the
+input storage. A supported stream alone
+supplies no admission: the enclosing work retains the exact native scope, source
+pins, completion roots and host destination claim. CPU-only builds can use those
+workers without enabling Metal; unavailable operation bounds still refuse the
+request before native submission.
+
 Native Ring fixtures separately exercise source publication and compare actual
 distributed capture with an ordinary local reference; their execution results
 are recorded in the partition-source evidence.

@@ -1,7 +1,7 @@
 //! Exact static rectangles through the ordinary CPU Slice source.
 use super::*;
 
-pub(super) fn inspect(operation:WorkspaceOperationView<'_>)
+pub(super) fn inspect(operation:WorkspaceOperationView<'_>, mechanism:MlxCpuWorkspaceMechanisms)
     ->facts::FactResult<Option<OperationPlan>> {
     let WorkspaceOperationKindView::StaticSlice {strides,..}=operation.kind else {return Ok(None);};
     if !super::super::basic::is_static_slice(operation) {
@@ -51,15 +51,17 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>)
     let mut population=CpuPopulation::default();
     if !whole {
         let Some(source)=OperationEvent::cpu_slice_layout(rank, empty, false) else {return Ok(None);};
-        if source.backing_births()!=0 || population.copy(source,1).is_none() {return Ok(None);}
-        // The empty branch calls allocate_data(0), publishing one Data owner
-        // without a physical birth. Nonempty Slice shares the original Data.
+        if source.backing_births()!=usize::from(empty && mechanism.allocation.cpu_header)
+            || population.copy(source,1).is_none() {return Ok(None);}
+        // Empty Slice constructs Data with the compiled allocator's zero-size
+        // backing. Nonempty Slice shares the original Data.
         population.maximum_captures=usize::from(empty);
     }
     let frames=[if representation.is_some() && !empty {
             views::physical_stride_control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?
         } else {0},
         crate::tensor::narrow::control_bytes(rank).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
+        size_of::<MlxCpuWorkspaceMechanisms>(),size_of::<u64>(),
         size_of::<WorkspaceOperationView<'_>>(),size_of::<WorkspaceLayoutView<'_>>()*2,
         size_of::<WorkspaceRepresentation>(),size_of::<Option<WorkspaceRepresentation>>(),
         size_of::<WorkspaceDtype>(),size_of::<WorkspaceFloatingType>(),
@@ -77,8 +79,9 @@ pub(super) fn inspect(operation:WorkspaceOperationView<'_>)
         size_of::<u64>()*3,size_of::<Option<u64>>(),size_of::<usize>()];
     population.controls=frames.into_iter().try_fold(population.controls.checked_add(size_of_val(&frames))
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,|n,b|n.checked_add(b).ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW))?;
+    let output_bytes=if empty && !whole {mechanism.allocation.fixed_buffer_capacity(0)?}else{0};
     Ok(Some(OperationPlan {dtype,population,alias_input:(!empty||whole).then_some(0),
-        output_bytes:0,scratch_bytes:0,rank,parameter_shells:usize::from(whole),seeds:0,validations:0}))
+        output_bytes,scratch_bytes:0,rank,parameter_shells:usize::from(whole),seeds:0,validations:0}))
 }
 
 /// A rectangular alias can introduce gaps between rows. Compare the retained
@@ -304,5 +307,5 @@ mod index_tests {
 #[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
 mod scalar_tests;
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
 mod empty_tests;

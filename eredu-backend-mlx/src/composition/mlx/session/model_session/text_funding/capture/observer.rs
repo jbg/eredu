@@ -403,16 +403,7 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
         source: &Array,
         geometry: &eredu_core::capture::CaptureCandidateGeometry<'_>,
     ) -> Result<TensorDtype, FundedCaptureError<Error>> {
-        let check = || {
-            if !cfg!(all(
-                feature = "metal",
-                target_vendor = "apple",
-                not(feature = "cuda")
-            )) {
-                return Err(
-                    crate::backend::array_copy::CaptureTensorNativeError::UnsupportedMechanism,
-                );
-            }
+        let check = || -> Result<_, crate::backend::array_copy::CaptureTensorNativeError> {
             let program = crate::backend::array_copy::CandidateExtraction::from_geometry(geometry)?;
             program.validate_source(source)?;
             PreparedCaptureTensor::validate_stream(self.stream)?;
@@ -552,16 +543,7 @@ impl ScheduledCaptureBackend for NativeScheduledCapture<'_> {
         source: &Array,
         geometry: &eredu_core::capture::CaptureTokenScoreGeometry<'_>,
     ) -> Result<TensorDtype, FundedCaptureError<Error>> {
-        let check = || {
-            if !cfg!(all(
-                feature = "metal",
-                target_vendor = "apple",
-                not(feature = "cuda")
-            )) {
-                return Err(
-                    crate::backend::array_copy::CaptureTensorNativeError::UnsupportedMechanism,
-                );
-            }
+        let check = || -> Result<_, crate::backend::array_copy::CaptureTensorNativeError> {
             let program = crate::backend::array_copy::TokenScoreProgram::from_geometry(geometry)?;
             program.validate_source(source)?;
             PreparedCaptureTensor::validate_stream(self.stream)?;

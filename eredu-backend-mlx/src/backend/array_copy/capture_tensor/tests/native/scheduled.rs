@@ -639,10 +639,7 @@ fn source_geometry_validation_accepts_lazy_metadata_without_settling_or_authoriz
     let stream = stream();
     let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
     PreparedCaptureTensor::validate_stream(&stream).unwrap();
-    assert!(matches!(
-        PreparedCaptureTensor::validate_stream(&cpu),
-        Err(CaptureTensorNativeError::UnsupportedStream(DeviceType::Cpu))
-    ));
+    PreparedCaptureTensor::validate_stream(&cpu).unwrap();
     let admitted = admission(&[3, 2], CaptureTransform::FullTensor, vec![]);
     let wrong = admission(&[2, 3], CaptureTransform::FullTensor, vec![]);
     let f64_source = Array::from_slice_f64(&[1f64, -0., f64::INFINITY, -2., 3., 4.], &[3, 2]);

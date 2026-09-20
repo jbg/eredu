@@ -2,10 +2,12 @@ use super::*;
 use eredu_nn::Tensor;
 
 #[test]
-fn cpu_empty_static_slice_prices_zero_data_without_retaining_source_backing() {
+fn cpu_empty_static_slice_prices_allocator_backing_without_retaining_source() {
     let ordinary=MlxMetalWorkspaceMechanisms::current_host().unwrap();
     let selected=MlxCpuMatmulMechanism::select(eredu_nn::CpuMatmulImplementation::Float32Tiles).unwrap();
     let cpu=MlxCpuWorkspaceMechanisms::new(ordinary.allocation(),selected);
+    let capacity=ordinary.allocation().buffer_capacity(0).unwrap();
+    let births=usize::from(capacity!=0);
     let cases=[
         (WorkspaceDtype::Int32,None),(WorkspaceDtype::Uint32,None),
         (WorkspaceDtype::Uint8,None),(WorkspaceDtype::Bool,None),
@@ -25,18 +27,18 @@ fn cpu_empty_static_slice_prices_zero_data_without_retaining_source_backing() {
             let report=context.finish_report(&[output]).unwrap();
             assert!(report.unpriced_operations.is_empty(),"{dtype:?} {shape:?}");
             assert!(report.unpriced_host_operations.is_empty());
-            assert_eq!(report.tensor_buffers.total_bytes,Some(0));
-            assert_eq!(report.state.as_ref().unwrap().retained_bytes,Some(0));
+            assert_eq!(report.tensor_buffers.total_bytes,Some(capacity));
+            assert_eq!(report.state.as_ref().unwrap().retained_bytes,Some(capacity));
             assert_eq!(report.state.as_ref().unwrap().displaced_bytes,Some(8192));
             let operation=report.operations[0].as_view();
             let plan=cpu.plan(operation).unwrap().unwrap();
             assert_eq!((plan.alias_input,plan.population.births,plan.output_bytes,plan.scratch_bytes),
-                (None,0,0,0));
+                (None,births,capacity,0));
             assert_eq!((plan.population.primitives,plan.population.maximum_captures),(1,1));
             assert!(plan.population.extents>0&&plan.population.controls>0);
             assert_eq!(cpu.output_representation(operation,0).map(|r|r.dtype()),precision);
             let recipe=SpeculativeNumericalRecipe::inspect_cpu_outputs(&report,1,ordinary,cpu,&context).unwrap();
-            assert_eq!(recipe.storage.maximum_births(),0);
+            assert_eq!(recipe.storage.maximum_births(),births);
             assert_eq!(recipe.kernels,0);
         }
     }

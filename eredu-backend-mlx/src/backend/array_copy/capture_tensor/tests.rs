@@ -40,11 +40,15 @@ pub(super) fn after_evaluation() -> Result<(), Exception> {
         Ok(())
     }
 }
-#[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
-mod metal {
+#[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
+mod native {
+    #[cfg(feature = "metal")]
     mod floating;
+    #[cfg(feature = "metal")]
     mod fragments;
+    #[cfg(feature = "metal")]
     mod prepared_fragments;
+    #[cfg(feature = "metal")]
     mod scheduled;
     use super::*;
     use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
@@ -206,7 +210,21 @@ mod metal {
     }
 
     fn stream() -> Stream {
-        Stream::new_with_device(&Device::new(DeviceType::Gpu, 0))
+        Stream::new_with_device(&Device::new(
+            if cfg!(feature = "metal") { DeviceType::Gpu } else { DeviceType::Cpu }, 0,
+        ))
+    }
+    fn workspace() -> WorkspaceContext {
+        let native = MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        if cfg!(feature = "metal") {
+            WorkspaceContext::new(native)
+        } else {
+            use crate::backend::nn::workspace::{MlxCpuMatmulMechanism, MlxCpuWorkspaceMechanisms};
+            let matmul = MlxCpuMatmulMechanism::select(
+                eredu_nn::CpuMatmulImplementation::Float32Tiles,
+            ).unwrap();
+            WorkspaceContext::new(MlxCpuWorkspaceMechanisms::new(native.allocation(), matmul))
+        }
     }
     fn host(source: &AdmittedCapturePlan) -> CaptureTensorHostPlan<'_> {
         CaptureTensorHostPlan::prepare(
@@ -323,14 +341,13 @@ mod metal {
             assert_eq!(host(&admitted).geometry().source_shape(), &[3, 4]);
             let plan = PreparedCaptureTensor::new(&view, host(&admitted)).unwrap();
             let p = plan.host_peak_bytes();
-            let context =
-                WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
+            let context = workspace();
             let mut projection = ExistingArrayProjection::new(&context);
             let input = projection.project(&view).unwrap();
             context.begin_state_span(&[input.clone()]).unwrap();
             let output = plan.trace(&mut projection).unwrap();
             let report = context.report(&[input, output]).unwrap();
-            assert!(report.unpriced_operations.is_empty());
+            assert!(report.unpriced_operations.is_empty(), "{:?}: {:?}", shape, report.unpriced_operations);
             assert!(report.unpriced_host_operations.is_empty());
             assert_eq!(report.host_workspace_bytes, Some(0));
             let root_bytes = view.allocation_info().unwrap().unwrap().bytes() as u64;
@@ -452,8 +469,7 @@ mod metal {
         {
             let _cold = Cold::new();
             let plan = PreparedCaptureTensor::new(&source, host(&admitted)).unwrap();
-            let context =
-                WorkspaceContext::new(MlxMetalWorkspaceMechanisms::current_host().unwrap());
+            let context = workspace();
             let mut projection = ExistingArrayProjection::new(&context);
             let output = plan.trace(&mut projection).unwrap();
             let report = context.report(&[output]).unwrap();
@@ -631,21 +647,6 @@ mod metal {
         let mut native = run.scope().unwrap();
         let mut wrong = other_run.scope().unwrap();
         let roots = RefCell::new(vec![]);
-        let cpu = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-        let before = pool.used_bytes().unwrap();
-        let error = PreparedCaptureTensor::new(&source, host(&admitted))
-            .unwrap()
-            .transfer(&run, &reservation, &mut native, &cpu, &roots)
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            CaptureTensorExecutionError::Mechanism(CaptureTensorNativeError::UnsupportedStream(
-                DeviceType::Cpu
-            ))
-        ));
-        drop(error);
-        assert!(roots.borrow().is_empty());
-        assert_eq!(pool.used_bytes().unwrap(), before);
         {
             let _borrow = roots.borrow_mut();
             let error = PreparedCaptureTensor::new(&source, host(&admitted))

@@ -60,7 +60,7 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism: MlxCpuWo
         rank: 1, parameter_shells: 0, seeds: 0, validations: 0 }))
 }
 
-#[cfg(all(test, target_vendor="apple", feature="metal", not(feature="cuda")))]
+#[cfg(all(test, target_vendor="apple", not(feature="cuda")))]
 mod tests {
     use super::*;
     use crate::backend::array_copy::TokenScoreProgram;

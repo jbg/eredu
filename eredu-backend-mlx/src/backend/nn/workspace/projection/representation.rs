@@ -25,6 +25,28 @@ pub(super) fn from_descriptor(
     if representation.row_contiguous() || shape.len() > 8 {
         return Some(representation);
     }
+    // Preserve a bounded positive-stride rectangle even when it has row gaps.
+    // This is the same completed descriptor loan used for storage identity.
+    if !shape.is_empty() && shape.len() <= 4 {
+        let mut actual = [1u64; 4];
+        let mut qualified = true;
+        for axis in 0..shape.len() {
+            if shape[axis] <= 0 {
+                qualified = false;
+                break;
+            }
+            if shape[axis] > 1 {
+                match u64::try_from(strides[axis]) {
+                    Ok(stride) if stride > 0 && stride <= u32::MAX as u64 => actual[axis] = stride,
+                    _ => { qualified = false; break; }
+                }
+            }
+        }
+        if qualified {
+            representation = representation.with_element_strides(&actual[..shape.len()])
+                .unwrap_or(representation);
+        }
+    }
     // Singleton strides are immaterial. Keep those axes first in logical order,
     // then insertion-sort nonunit axes by decreasing actual positive stride.
     let mut axes = [0usize; 8];
@@ -81,6 +103,13 @@ pub(super) fn control_bytes() -> Option<usize> {
         size_of::<Option<&[i64]>>(),
         size_of::<(&[i32], &[i64])>(),
         size_of::<[usize; 8]>(),
+        size_of::<[u64; 4]>(),
+        size_of::<[u32; 4]>(),
+        size_of::<bool>(),
+        size_of::<u64>(),
+        size_of::<Result<u64, std::num::TryFromIntError>>(),
+        size_of::<(&[u64], usize, u64)>(),
+        size_of::<std::iter::Enumerate<std::slice::Iter<'_, u64>>>(),
         size_of::<[usize; 6]>(),
         size_of::<[i64; 2]>(),
         size_of::<Option<i64>>(),

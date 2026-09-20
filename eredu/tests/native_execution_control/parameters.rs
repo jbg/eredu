@@ -233,8 +233,8 @@ pub(super) fn parameter_logits_mode<
         }) = record.event.progress()
         {
             assert!(!forced);
-            let Some(CapturePayload::Tensor(tensor)) = &step.records[0].payload else {
-                panic!("missing logits")
+            let Some(tensor) = step.records[0].payload.as_ref().and_then(CapturePayload::as_tensor) else {
+                panic!("missing logits: {:?}", step.records[0])
             };
             let eredu_core::TensorObservationData::F32(values) = tensor.data() else {
                 panic!("dtype")

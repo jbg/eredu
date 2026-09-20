@@ -26,7 +26,7 @@ pub(super) fn control_bytes()->Option<usize> {
     frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
 }
 
-#[cfg(all(test,target_vendor="apple",feature="metal",not(feature="cuda")))]
+#[cfg(all(test,target_vendor="apple",not(feature="cuda")))]
 mod tests {
     use super::*;
     use crate::backend::array_copy::{SummaryProgram,HistogramProgram};

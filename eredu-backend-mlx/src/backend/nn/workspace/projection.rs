@@ -507,10 +507,32 @@ mod tests {
         assert!(!sparse_rep.row_contiguous());
         assert!(sparse_rep.last_axis_contiguous());
         assert_eq!(sparse_rep.dense_axis_at(4, 0), None, "strided slice is not dense");
+        assert_eq!((0..4).map(|axis| sparse_rep.element_stride_at(4, axis)).collect::<Vec<_>>(),
+            vec![Some(1), Some(16), Some(1), Some(1)]);
+
         let storage = projection.into_storage();
         assert!(storage.is_complete());
         assert_eq!(storage.iter().len(), 1, "all views retain the original backing");
         assert_eq!(context.report(&[root, retained, sparse]).unwrap().operations.len(), 0);
+
+        let root = Array::from_slice(&(0..12).map(|n| n as f32).collect::<Vec<_>>(), &[12]);
+        for (strides, offset, expected) in [
+            ([6, 2], 0, [Some(6), Some(2)]),
+            ([6, -2], 4, [None, None]),
+            ([0, 1], 0, [None, None]),
+        ] {
+            let view = root.as_strided(&[2, 3][..], &strides[..], offset, &stream).unwrap();
+            view.evaluated().unwrap();
+            let context = WorkspaceContext::new(NoOperations);
+            let mut projection = ExistingArrayProjection::new(&context);
+            let value = projection.project(&view).unwrap();
+            let representation = value.layout().representation().unwrap();
+            assert!(!representation.row_contiguous());
+            assert_eq!([representation.element_stride_at(2, 0),
+                representation.element_stride_at(2, 1)], expected);
+            assert_eq!(projection.into_storage().iter().len(), 1);
+            assert!(context.report(&[value]).unwrap().operations.is_empty());
+        }
     }
 
     #[test]
