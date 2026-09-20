@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -17,6 +18,28 @@ use safetensors::tensor::{Metadata, TensorInfo};
 
 pub(crate) const MAX_HEADER_BYTES: u64 = 100_000_000;
 
+/// Input limits for checkpoint discovery and lazy shard-header decoding.
+///
+/// These cap encoded input, not decoded metadata or process memory. Header
+/// limits are retained with shard admissions and apply when each header is read.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SafetensorsDiscoveryLimits {
+    /// Maximum encoded index length, including whitespace. Defaults to 100 MB.
+    pub max_index_bytes: u64,
+    /// Maximum JSON header length, excluding its eight-byte length prefix.
+    /// Values above the format reader's 100 MB ceiling cannot raise that ceiling.
+    pub max_header_bytes: u64,
+}
+
+impl Default for SafetensorsDiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_index_bytes: 100_000_000,
+            max_header_bytes: MAX_HEADER_BYTES,
+        }
+    }
+}
+
 /// One canonically resolved SafeTensors checkpoint shard set.
 ///
 /// Discovery parses an optional Hugging Face index exactly once, requires its
@@ -31,13 +54,22 @@ pub struct SafetensorsShards {
     tensor_locations: Option<BTreeMap<String, PathBuf>>,
     admissions: BTreeMap<PathBuf, Arc<AdmittedShard>>,
     recipes: Arc<crate::recipe::RecipeInferenceCache>,
+    limits: SafetensorsDiscoveryLimits,
 }
 
 impl SafetensorsShards {
     /// Discovers, admits, and validates a SafeTensors file or checkpoint directory.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
+        Self::discover_with_limits(path, SafetensorsDiscoveryLimits::default())
+    }
+
+    /// Strict discovery with explicit index and per-shard header input limits.
+    pub fn discover_with_limits(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+    ) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
-        let shards = Self::discover_catalog(path)?;
+        let shards = Self::discover_catalog(path, limits)?;
         for payload in shards.payload_paths() {
             shards
                 .admission(payload)
@@ -60,10 +92,13 @@ impl SafetensorsShards {
     ///
     /// The neutral weight store uses this path so it can validate and buffer only
     /// shards requested by the caller. Public discovery remains strict.
-    pub(crate) fn discover_catalog(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
+    pub(crate) fn discover_catalog(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+    ) -> Result<Self, SafetensorsShardError> {
         let path = path.as_ref();
         if path.is_dir() {
-            return Self::discover_directory(path);
+            return Self::discover_directory(path, limits);
         }
         let payload = canonicalize(path)?;
         Self {
@@ -72,11 +107,15 @@ impl SafetensorsShards {
             tensor_locations: None,
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
+            limits,
         }
         .admit()
     }
 
-    fn discover_directory(root: &Path) -> Result<Self, SafetensorsShardError> {
+    fn discover_directory(
+        root: &Path,
+        limits: SafetensorsDiscoveryLimits,
+    ) -> Result<Self, SafetensorsShardError> {
         let access_root = canonical_checkpoint_access_root(root)?;
         let index_path = root.join("model.safetensors.index.json");
         if !index_path.exists() {
@@ -87,12 +126,22 @@ impl SafetensorsShards {
                 tensor_locations: None,
                 admissions: BTreeMap::new(),
                 recipes: Arc::default(),
+                limits,
             }
             .admit();
         }
 
-        let raw =
-            std::fs::read_to_string(&index_path).map_err(|error| io_error(&index_path, error))?;
+        let mut file =
+            std::fs::File::open(&index_path).map_err(|error| io_error(&index_path, error))?;
+        let length = file
+            .metadata()
+            .map_err(|error| io_error(&index_path, error))?
+            .len();
+        if length > limits.max_index_bytes {
+            return Err(index_too_large(&index_path, limits.max_index_bytes));
+        }
+        // The read limit also applies if the file grows after metadata inspection.
+        let raw = read_index(&index_path, &mut file, limits.max_index_bytes)?;
         let index: SafetensorsIndex =
             serde_json::from_str(&raw).map_err(|error| SafetensorsShardError::MalformedIndex {
                 path: index_path.clone(),
@@ -132,6 +181,7 @@ impl SafetensorsShards {
             tensor_locations: Some(tensor_locations),
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
+            limits,
         }
         .admit()
     }
@@ -147,11 +197,17 @@ impl SafetensorsShards {
             }
         }
         for path in &self.payload_paths {
-            let shard = AdmittedShard::new(path, expected.remove(path))
-                .map_err(|error| malformed_shard(path, error.to_string()))?;
+            let shard =
+                AdmittedShard::new(path, expected.remove(path), self.limits.max_header_bytes)
+                    .map_err(|error| malformed_shard(path, error.to_string()))?;
             self.admissions.insert(path.clone(), Arc::new(shard));
         }
         Ok(self)
+    }
+
+    /// Input limits retained by this admitted shard set.
+    pub const fn limits(&self) -> SafetensorsDiscoveryLimits {
+        self.limits
     }
 
     pub(crate) fn recipe_cache(&self) -> &crate::recipe::RecipeInferenceCache {
@@ -195,6 +251,7 @@ impl PartialEq for SafetensorsShards {
         self.payload_paths == other.payload_paths
             && self.logical_payload_paths == other.logical_payload_paths
             && self.tensor_locations == other.tensor_locations
+            && self.limits == other.limits
     }
 }
 impl Eq for SafetensorsShards {}
@@ -214,7 +271,15 @@ pub struct SafetensorsMetadataCatalog {
 impl SafetensorsMetadataCatalog {
     /// Discovers an exact shard set and validates all tensor metadata from headers only.
     pub fn discover(path: impl AsRef<Path>) -> Result<Self, SafetensorsShardError> {
-        Self::from_admitted(SafetensorsShards::discover(path)?)
+        Self::discover_with_limits(path, SafetensorsDiscoveryLimits::default())
+    }
+
+    /// Reads exact metadata with explicit encoded index and header limits.
+    pub fn discover_with_limits(
+        path: impl AsRef<Path>,
+        limits: SafetensorsDiscoveryLimits,
+    ) -> Result<Self, SafetensorsShardError> {
+        Self::from_admitted(SafetensorsShards::discover_with_limits(path, limits)?)
     }
 
     /// Builds a catalog using the retained shard admissions without rereading headers.
@@ -303,6 +368,14 @@ impl RecipeCatalog for SafetensorsMetadataCatalog {
 /// Failure to discover and admit a SafeTensors checkpoint shard set.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum SafetensorsShardError {
+    /// The encoded index exceeds the configured discovery input limit.
+    #[error("SafeTensors index {path} exceeds {limit_bytes} bytes", path = .path.display())]
+    IndexTooLarge {
+        /// Rejected index path.
+        path: PathBuf,
+        /// Configured maximum encoded index length.
+        limit_bytes: u64,
+    },
     /// A checkpoint path or referenced payload does not exist.
     #[error("SafeTensors checkpoint shard does not exist: {path}", path = .path.display())]
     MissingShard {
@@ -431,6 +504,34 @@ pub(crate) fn parse_header(bytes: &[u8]) -> Result<Metadata, serde_json::Error> 
     let mut header = serde_json::from_slice::<UniqueHeader>(bytes)?;
     header.tensors.sort_by_key(|(_, info)| info.data_offsets);
     Metadata::new(header.metadata, header.tensors).map_err(serde::de::Error::custom)
+}
+
+fn index_too_large(path: &Path, limit_bytes: u64) -> SafetensorsShardError {
+    SafetensorsShardError::IndexTooLarge {
+        path: path.into(),
+        limit_bytes,
+    }
+}
+
+fn read_index(
+    path: &Path,
+    reader: &mut impl Read,
+    limit_bytes: u64,
+) -> Result<String, SafetensorsShardError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(path, error))?;
+    if bytes.len() as u64 > limit_bytes {
+        return Err(index_too_large(path, limit_bytes));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        io_error(
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        )
+    })
 }
 
 fn malformed_shard(path: &Path, message: impl Into<String>) -> SafetensorsShardError {
@@ -853,3 +954,6 @@ mod tests {
 
 mod header;
 pub use header::{SafetensorsHeaderError, SafetensorsHeaderPlan};
+
+#[cfg(test)]
+mod limits_tests;

@@ -7,15 +7,15 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, OnceLock, Weak,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use crate::{
-    recipe::RecipeInferenceCache,
-    safetensors::{SafetensorsShards, MAX_HEADER_BYTES},
     StoredDtype,
+    recipe::RecipeInferenceCache,
+    safetensors::{MAX_HEADER_BYTES, SafetensorsDiscoveryLimits, SafetensorsShards},
 };
 use safetensors::tensor::{Dtype, Metadata};
 
@@ -1991,6 +1991,7 @@ impl AdmittedFile {
 pub(crate) struct AdmittedShard {
     pub(crate) file: Arc<AdmittedFile>,
     expected: Option<BTreeSet<String>>,
+    max_header_bytes: u64,
     header: OnceLock<Result<AdmittedHeader, StoreError>>,
     #[cfg(test)]
     header_reads: AtomicU64,
@@ -2004,10 +2005,15 @@ pub(crate) struct AdmittedHeader {
 }
 
 impl AdmittedShard {
-    pub(crate) fn new(path: &Path, expected: Option<BTreeSet<String>>) -> Result<Self, StoreError> {
+    pub(crate) fn new(
+        path: &Path,
+        expected: Option<BTreeSet<String>>,
+        max_header_bytes: u64,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
             file: Arc::new(AdmittedFile::open(path)?),
             expected,
+            max_header_bytes: max_header_bytes.min(MAX_HEADER_BYTES),
             header: OnceLock::new(),
             #[cfg(test)]
             header_reads: AtomicU64::new(0),
@@ -2019,7 +2025,8 @@ impl AdmittedShard {
             .get_or_init(|| {
                 #[cfg(test)]
                 self.header_reads.fetch_add(1, Ordering::Relaxed);
-                let (payload_offset, metadata) = read_safetensors_metadata(path, &self.file)?;
+                let (payload_offset, metadata) =
+                    read_safetensors_metadata(path, &self.file, self.max_header_bytes)?;
                 if let Some(expected) = &self.expected {
                     let actual = metadata.offset_keys().into_iter().collect::<BTreeSet<_>>();
                     if let Some(key) = expected.difference(&actual).next() {
@@ -2127,7 +2134,21 @@ impl SafetensorsWeightStore {
         path: impl AsRef<Path>,
         max_cached_shards: usize,
     ) -> Result<Self, StoreError> {
-        let shards = SafetensorsShards::discover_catalog(path)?;
+        Self::open_with_limits(
+            path,
+            max_cached_shards,
+            SafetensorsDiscoveryLimits::default(),
+        )
+    }
+
+    /// Opens with a nonzero shard-cache bound and encoded metadata input limits.
+    /// Indexed headers remain lazy; each admission retains its header limit.
+    pub fn open_with_limits(
+        path: impl AsRef<Path>,
+        max_cached_shards: usize,
+        limits: SafetensorsDiscoveryLimits,
+    ) -> Result<Self, StoreError> {
+        let shards = SafetensorsShards::discover_catalog(path, limits)?;
         Self::open_admitted(shards, max_cached_shards)
     }
 
@@ -2478,12 +2499,13 @@ impl crate::validation::SafetensorsCatalog for SafetensorsWeightStore {
 fn read_safetensors_metadata(
     path: &Path,
     admitted_file: &AdmittedFile,
+    max_header_bytes: u64,
 ) -> Result<(usize, Metadata), StoreError> {
     let mut file = admitted_file.open_validated(path)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| io_error(path, error))?;
     let file_len = admitted_file.identity.version.length;
-    let metadata = read_safetensors_metadata_from(path, &mut file, file_len)?;
+    let metadata = read_safetensors_metadata_from(path, &mut file, file_len, max_header_bytes)?;
     admitted_file.validate_file(path, &file)?;
     Ok(metadata)
 }
@@ -2492,16 +2514,18 @@ fn read_safetensors_metadata_from(
     path: &Path,
     reader: &mut impl Read,
     file_len: u64,
+    max_header_bytes: u64,
 ) -> Result<(usize, Metadata), StoreError> {
     let mut encoded_header_len = [0u8; 8];
     reader
         .read_exact(&mut encoded_header_len)
         .map_err(|error| io_error(path, error))?;
     let header_len = u64::from_le_bytes(encoded_header_len);
-    if header_len > MAX_HEADER_BYTES {
+    let max_header_bytes = max_header_bytes.min(MAX_HEADER_BYTES);
+    if header_len > max_header_bytes {
         return Err(StoreError::MalformedSafetensors {
             path: path.to_path_buf(),
-            message: format!("header exceeds {MAX_HEADER_BYTES} bytes"),
+            message: format!("header exceeds {max_header_bytes} bytes"),
         });
     }
     let payload_offset = 8u64
@@ -2898,6 +2922,23 @@ mod tests {
     }
 
     #[test]
+    fn header_input_limit_refuses_before_reading_the_body() {
+        for (declared, limit) in [(17, 16), (MAX_HEADER_BYTES + 1, u64::MAX)] {
+            let mut prefix = std::io::Cursor::new(declared.to_le_bytes());
+            let error = read_safetensors_metadata_from(
+                Path::new("header.safetensors"),
+                &mut prefix,
+                declared + 8,
+                limit,
+            )
+            .unwrap_err();
+            assert!(matches!(error, StoreError::MalformedSafetensors { .. }));
+            assert!(error.to_string().contains("header exceeds"));
+            assert_eq!(prefix.position(), 8);
+        }
+    }
+
+    #[test]
     fn failed_header_admission_is_not_retried() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("broken.safetensors");
@@ -2907,7 +2948,11 @@ mod tests {
             br#"{"weight_map":{"weight":"broken.safetensors"}}"#,
         )
         .unwrap();
-        let shards = SafetensorsShards::discover_catalog(directory.path()).unwrap();
+        let shards = SafetensorsShards::discover_catalog(
+            directory.path(),
+            SafetensorsDiscoveryLimits::default(),
+        )
+        .unwrap();
         let store = SafetensorsWeightStore::open_admitted(shards.clone(), 1).unwrap();
         assert!(matches!(
             store.source_metadata_borrowed("weight"),
@@ -3104,6 +3149,7 @@ mod tests {
             &path,
             &mut header_only,
             u64::try_from(encoded.len()).unwrap(),
+            MAX_HEADER_BYTES,
         )
         .unwrap();
 
@@ -3596,7 +3642,8 @@ mod tests {
         )
         .unwrap();
         let admitted = AdmittedFile::open(&path).unwrap();
-        let (payload_offset, _) = read_safetensors_metadata(&path, &admitted).unwrap();
+        let (payload_offset, _) =
+            read_safetensors_metadata(&path, &admitted, MAX_HEADER_BYTES).unwrap();
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
         let telemetry = SafetensorsReadTelemetry::default();
         let result = read_safetensors_ranges_with_hook(

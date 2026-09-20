@@ -884,6 +884,15 @@ owner identities return no plan without invoking ordinary read construction.
 The selected plan needs no routing callbacks during construction; rejected plans
 retain their source until retirement, and completed batches retain the original
 payload handles after the surrounding views and catalog store retire.
+SafeTensors discovery retains configurable encoded index and header limits.
+The default index limit is 100 MB; the header limit defaults to the reader's
+existing 100 MB ceiling and can be lowered. Oversized index files are rejected
+before reading their contents, and a bounded read also detects growth after the
+length check. Header limits are checked before allocating or reading the JSON
+body and remain attached to shared shard admissions. Indexed stores still read
+headers only on demand; strict discovery validates every shard. These are input
+limits, separate from decoded-metadata estimates and lifetime admission.
+
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that
 same constructor. The admitted entry refuses missing headers and lends retained
