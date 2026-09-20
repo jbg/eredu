@@ -942,6 +942,18 @@ they are not enforceable metadata or process ceilings. Payload/read buffers,
 subsequent cache contents and independently exported metadata have separate
 admission requirements. Ordinary opening and runtime-funded opening share the
 same discovery, index and header workers.
+Runtime can move a funded SafeTensors source into a typed closed retained
+source owner. It checks the actual private discovery-policy type and owning pool
+before admitting the outer allocation; an ordinary source, caller-defined policy
+or foreign pool supplies no such origin. Refusals retain the original source.
+Strong aliases share the closed source, while opaque weak identities keep the
+outer allocation and its custody after nested source storage retires. These
+owners keep no strong reference back to the pool. Retaining a source prepares no
+headers and reopens no artifacts. Explicit metadata preparation borrows the
+retained header through its original policy, and ordinary owned metadata uses
+that same worker. The typed owner supplies the existing authenticated file route
+for prepared reads without copying headers; generic closed provider ownership
+does not supply a typed acquisition route.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that

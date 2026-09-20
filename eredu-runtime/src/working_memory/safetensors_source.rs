@@ -112,6 +112,22 @@ impl Error for OriginalSafetensorsSourceError {
     }
 }
 impl WorkingMemoryPool {
+    /// Validate the actual private source policy installed by this pool's
+    /// original constructor. Public policy callbacks cannot supply this origin.
+    /// This covers discovery/header policy, not later payload/cache/read storage.
+    pub fn validate_safetensors_source_controls(
+        &self,
+        source: &SafetensorsWeightStore,
+    ) -> Result<(), WorkingMemoryError> {
+        let policy = source.source_admission_owner::<SourcePolicy>()
+            .ok_or(WorkingMemoryError::UnknownBound)?;
+        if policy.account.matches_pool(self) {
+            Ok(())
+        } else {
+            Err(WorkingMemoryError::IdentityMismatch)
+        }
+    }
+
     /// Initial policy/account controls, potential admission error Arcs and
     /// configurable path/discovery headroom, before any filesystem discovery.
     /// Path and map estimates are not enforceable allocation ceilings.

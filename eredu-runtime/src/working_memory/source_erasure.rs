@@ -2,7 +2,7 @@
 use super::{gguf_source::SourceAccount, qualified_storage, WorkingMemoryError, WorkingMemoryPool};
 use eredu_checkpoint::{
     gguf_store::GgufWeightStore,
-    store::{CompositeCheckpointSource, RetainedCheckpointSource, SourceErasureStorageRequest},
+    store::{CompositeCheckpointSource, RetainedCheckpointSource, SafetensorsWeightStore, SourceErasureStorageRequest},
 };
 use std::{
     fmt,
@@ -13,24 +13,28 @@ use std::{
 struct ErasureCustody(SourceAccount);
 
 enum Input {
+    Safetensors(SafetensorsWeightStore),
     Gguf(GgufWeightStore),
     Composite(CompositeCheckpointSource),
 }
 impl Input {
     fn validate(&self, pool: &WorkingMemoryPool) -> Result<(), WorkingMemoryError> {
         match self {
+            Self::Safetensors(source) => pool.validate_safetensors_source_controls(source),
             Self::Gguf(source) => pool.validate_gguf_source_controls(source),
             Self::Composite(source) => pool.validate_gguf_composite_controls(source),
         }
     }
     fn requested(&self) -> Result<u64, WorkingMemoryError> {
         match self {
+            Self::Safetensors(_) => WorkingMemoryPool::safetensors_source_erasure_required_bytes(),
             Self::Gguf(_) => WorkingMemoryPool::gguf_source_erasure_required_bytes(),
             Self::Composite(_) => WorkingMemoryPool::gguf_composite_erasure_required_bytes(),
         }
     }
     fn retain(self, custody: ErasureCustody) -> RetainedCheckpointSource {
         match self {
+            Self::Safetensors(source) => RetainedCheckpointSource::from_safetensors_with_custody(source, custody),
             Self::Gguf(source) => RetainedCheckpointSource::from_gguf_with_custody(source, custody),
             Self::Composite(source) => {
                 RetainedCheckpointSource::from_composite_with_custody(source, custody)
@@ -51,6 +55,13 @@ impl OriginalRetainedSourceError {
     /// Typed qualification, source-domain or admission refusal.
     pub fn accounting_failure(&self) -> &WorkingMemoryError {
         &self.cause
+    }
+    /// Borrow the original SafeTensors source retained by a refused erasure.
+    pub fn rejected_safetensors(&self) -> Option<&SafetensorsWeightStore> {
+        match self.input.as_ref()? {
+            Input::Safetensors(source) => Some(source),
+            _ => None,
+        }
     }
     /// Borrow the original GGUF input when erasure was not invoked.
     pub fn rejected_gguf(&self) -> Option<&GgufWeightStore> {
@@ -126,6 +137,21 @@ fn required(request: Option<SourceErasureStorageRequest>) -> Result<u64, Working
 }
 
 impl WorkingMemoryPool {
+    /// Concrete SafeTensors outer allocation, custody/account shells and fixed
+    /// transports. Its discovery and header contributions remain independent.
+    pub fn safetensors_source_erasure_required_bytes() -> Result<u64, WorkingMemoryError> {
+        required(RetainedCheckpointSource::safetensors_storage_request::<ErasureCustody>())
+    }
+    /// Admit closed outer ownership of this pool's original SafeTensors source.
+    /// Ordinary/custom-policy and foreign-pool sources are retained on refusal.
+    /// Erasure does not prepare lazy headers, read payloads or reopen artifacts.
+    pub fn retain_safetensors_source(
+        &self,
+        source: SafetensorsWeightStore,
+    ) -> Result<RetainedCheckpointSource, OriginalRetainedSourceError> {
+        self.retain_source(Input::Safetensors(source))
+    }
+
     /// One exact GGUF outer allocation, control/account shells and named finite
     /// transports. Nested reader/catalog storage has its independent account.
     pub fn gguf_source_erasure_required_bytes() -> Result<u64, WorkingMemoryError> {

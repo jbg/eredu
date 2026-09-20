@@ -240,3 +240,5 @@ fn retained_composite_routes_same_root_and_refuses_foreign_or_ordinary_promotion
     drop(identity);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+mod safetensors;

@@ -1,6 +1,6 @@
 //! Closed source erasure: strong and opaque weak aliases retain one custody.
 use super::{
-    CheckpointSource, CompositeCheckpointSource, PreparedAcquisitionOwner, SharedCheckpointSource,
+    CheckpointSource, CompositeCheckpointSource, PreparedAcquisitionOwner, SafetensorsWeightStore, SharedCheckpointSource,
     storage::{CheckpointSourceHandle, SourceControl, SourceHandle, SourceStorageIdentity},
 };
 use crate::gguf_store::GgufWeightStore;
@@ -14,7 +14,7 @@ use std::{
 
 /// A retained checkpoint root whose source allocation is never exported as Arc.
 /// Ordinary providers keep their existing Arc and callback behavior. The typed
-/// GGUF constructors move the actual source into one private shared allocation;
+/// constructors move the actual built-in source into one private shared allocation;
 /// clones and identities retain its same constructor custody.
 ///
 /// This is source lifetime, not physical payload inventory or a fit certificate.
@@ -30,6 +30,7 @@ use std::{
 pub struct RetainedCheckpointSource(Owner);
 #[derive(Clone)]
 enum Owner {
+    Safetensors(SourceHandle<SafetensorsWeightStore>),
     Ordinary(SharedCheckpointSource),
     Gguf(SourceHandle<GgufWeightStore>),
     Composite(SourceHandle<CompositeCheckpointSource>),
@@ -54,6 +55,7 @@ impl std::ops::Deref for RetainedCheckpointSource {
 impl AsRef<dyn CheckpointSource> for RetainedCheckpointSource {
     fn as_ref(&self) -> &(dyn CheckpointSource + 'static) {
         match &self.0 {
+            Owner::Safetensors(source) => &**source,
             Owner::Ordinary(source) => source.as_ref(),
             Owner::Gguf(source) => &**source,
             Owner::Composite(source) => &**source,
@@ -62,6 +64,21 @@ impl AsRef<dyn CheckpointSource> for RetainedCheckpointSource {
     }
 }
 impl RetainedCheckpointSource {
+    /// Move the concrete SafeTensors source into closed lifetime ownership.
+    /// The typed source supplies the existing file acquisition route; arbitrary
+    /// caller custody does not certify runtime admission of source or outer data.
+    pub fn from_safetensors_with_custody<C: Any + fmt::Debug + Send + Sync>(
+        source: SafetensorsWeightStore,
+        custody: C,
+    ) -> Self {
+        Self(Owner::Safetensors(SourceHandle::new(
+            source, Some(SourceControl::new(custody)),
+        )))
+    }
+    /// Owning requests for the concrete SafeTensors source allocation and custody.
+    pub fn safetensors_storage_request<C>() -> Option<SourceErasureStorageRequest> {
+        request::<SafetensorsWeightStore, C>()
+    }
     /// Ordinary typed GGUF construction using the same private allocation.
     /// No constructor custody or original accounting claim is installed.
     pub fn from_gguf(source: GgufWeightStore) -> Self {
@@ -103,7 +120,7 @@ impl RetainedCheckpointSource {
     }
     /// Moves a caller's concrete source into closed lifetime ownership after
     /// admission. This erases source access, not acquisition qualification: a
-    /// custom callback cannot become a typed GGUF or composite acquisition.
+    /// custom callback cannot become a typed GGUF, SafeTensors or composite acquisition.
     /// The caller separately accounts the source's owned payload and C's origin.
     pub fn from_source_with_custody<
         T: CheckpointSource + 'static,
@@ -139,6 +156,7 @@ impl RetainedCheckpointSource {
     pub fn constructor_control_owner<C: Any>(&self) -> Option<&C> {
         match &self.0 {
             Owner::Ordinary(_) => None,
+            Owner::Safetensors(source) => source.origin(),
             Owner::Gguf(source) => source.origin(),
             Owner::Composite(source) => source.origin(),
             Owner::Closed(source) => source.origin(),
@@ -148,6 +166,7 @@ impl RetainedCheckpointSource {
     pub fn same_source(&self, other: &Self) -> bool {
         match (&self.0, &other.0) {
             (Owner::Ordinary(a), Owner::Ordinary(b)) => Arc::ptr_eq(a, b),
+            (Owner::Safetensors(a), Owner::Safetensors(b)) => a.same(b),
             (Owner::Gguf(a), Owner::Gguf(b)) => a.same(b),
             (Owner::Composite(a), Owner::Composite(b)) => a.same(b),
             (Owner::Closed(a), Owner::Closed(b)) => a.same(b),
@@ -163,6 +182,7 @@ impl RetainedCheckpointSource {
     pub fn identity(&self) -> CheckpointSourceIdentity {
         CheckpointSourceIdentity(match &self.0 {
             Owner::Ordinary(source) => Identity::Ordinary(Arc::downgrade(source)),
+            Owner::Safetensors(source) => Identity::Closed(source.identity()),
             Owner::Gguf(source) => Identity::Closed(source.identity()),
             Owner::Composite(source) => Identity::Closed(source.identity()),
             Owner::Closed(source) => Identity::Closed(source.identity()),
@@ -174,6 +194,7 @@ impl RetainedCheckpointSource {
                 let owner = Arc::clone(source).prepared_acquisition_owner()?;
                 std::ptr::addr_eq(owner.source(), source.as_ref()).then_some(owner)
             }
+            Owner::Safetensors(source) => Some(PreparedAcquisitionOwner::retained_safetensors(source.clone())),
             Owner::Gguf(source) => Some(PreparedAcquisitionOwner::retained_gguf(source.clone())),
             Owner::Composite(source) => {
                 Some(PreparedAcquisitionOwner::retained_composite(source.clone()))

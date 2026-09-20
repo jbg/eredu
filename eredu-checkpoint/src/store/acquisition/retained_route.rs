@@ -7,6 +7,7 @@ use std::alloc::Layout;
 /// return its own built-in owner. Forwarding another owner's loan is rejected.
 pub struct PreparedAcquisitionOwner(Owner);
 enum Owner {
+    RetainedSafetensors(SourceHandle<SafetensorsWeightStore>),
     RetainedGguf(SourceHandle<crate::gguf_store::GgufWeightStore>),
     RetainedComposite(SourceHandle<CompositeCheckpointSource>),
     Memory(Arc<MemoryWeightStore>),
@@ -18,6 +19,11 @@ enum Owner {
     Resolved(Arc<ResolvedCheckpointSource>),
 }
 impl PreparedAcquisitionOwner {
+    pub(in crate::store) fn retained_safetensors(
+        owner: SourceHandle<SafetensorsWeightStore>,
+    ) -> Self {
+        Self(Owner::RetainedSafetensors(owner))
+    }
     pub(crate) fn gguf(owner: Arc<crate::gguf_store::GgufWeightStore>) -> Self {
         Self(Owner::Gguf(owner))
     }
@@ -33,6 +39,7 @@ impl PreparedAcquisitionOwner {
     }
     pub(in crate::store) fn source(&self) -> &dyn CheckpointSource {
         match &self.0 {
+            Owner::RetainedSafetensors(owner) => &**owner,
             Owner::RetainedGguf(owner) => &**owner,
             Owner::RetainedComposite(owner) => &**owner,
             Owner::Memory(owner) => owner.as_ref(),
@@ -46,6 +53,7 @@ impl PreparedAcquisitionOwner {
     }
     fn route(&self) -> Route<'_> {
         match &self.0 {
+            Owner::RetainedSafetensors(owner) => Route::Safetensors(owner),
             Owner::RetainedGguf(owner) => Route::Gguf(owner),
             Owner::RetainedComposite(owner) => Route::Composite(owner),
             Owner::Memory(owner) => Route::Memory(owner),

@@ -1,6 +1,6 @@
 //! Policy boundary for source discovery and catalog construction.
 use super::SafetensorsHeaderAdmission;
-use std::{error::Error, fmt, sync::Arc};
+use std::{any::Any, error::Error, fmt, sync::Arc};
 
 /// Encoded index extent inspected on its retained file handle.
 #[derive(Debug, Clone, Copy)]
@@ -18,7 +18,7 @@ pub struct SafetensorsIndexRequest {
 /// the store catalog. Shared catalogs, files and diagnostics retain the policy.
 /// The owner completes construction after opening returns and keeps accepted
 /// custody with either the source or its returned failure.
-pub trait SafetensorsSourceAdmission: fmt::Debug + Send + Sync {
+pub trait SafetensorsSourceAdmission: Any + fmt::Debug + Send + Sync {
     /// Reserve the measured index buffer and estimated decoded metadata.
     fn reserve_index(
         &self,

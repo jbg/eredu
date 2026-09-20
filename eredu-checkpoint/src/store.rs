@@ -2170,6 +2170,14 @@ pub struct SafetensorsWeightStore {
 }
 
 impl SafetensorsWeightStore {
+    /// Borrows this source's actual discovery-policy value without extracting it.
+    /// This is concrete type inspection, not a provider-reported admission claim.
+    /// Ordinary sources have no policy; callers validate their own private type.
+    pub fn source_admission_owner<C: std::any::Any>(&self) -> Option<&C> {
+        let policy: &dyn std::any::Any = self.shards.source_admission()?.as_ref();
+        policy.downcast_ref()
+    }
+
     /// Opens a file, indexed directory, or directory containing `model.safetensors`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with_max_cached_shards(path, DEFAULT_MAX_CACHED_SHARDS)
@@ -2314,7 +2322,10 @@ impl SafetensorsWeightStore {
         })
     }
 
-    fn cached_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+    /// Prepares the containing header through its retained admission policy and
+    /// borrows the resulting tensor metadata. This reads no payload and creates
+    /// no independent metadata copy. Repeated calls reuse the shared header.
+    pub fn prepare_metadata(&self, key: &str) -> Result<&TensorMetadata, StoreError> {
         let entry = self
             .catalog
             .get(key)
@@ -2325,11 +2336,14 @@ impl SafetensorsWeightStore {
             .header(&entry.shard)?
             .tensors
             .get(key)
-            .cloned()
             .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
         cache_policy::touch_metadata(&self.cache, &entry.shard)?;
         Ok(metadata)
     }
+    fn cached_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+        self.prepare_metadata(key).cloned()
+    }
+
 }
 
 impl WeightStore for SafetensorsWeightStore {
