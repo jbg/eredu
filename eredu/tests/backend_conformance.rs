@@ -148,6 +148,8 @@ impl Drop for TestDirectory {
 
 struct MockBackend;
 thread_local! {
+    static LOADING_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FACTORY_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // One-shot completed-prefix disposition, confined to the invoking test.
     static SPECULATIVE_RESULT_FAULT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static TOKEN_READ_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1021,6 +1023,14 @@ impl ModelLoadingBackend for MockBackend {
         &eredu_architectures::configuration::MODEL_CONFIGURATIONS
     }
 
+    fn inspect_model_artifact(
+        &self, path: &std::path::Path,
+    ) -> Result<eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>, eredu_core::ModelLoadError<Self::Error>> {
+        LOADING_INSPECTIONS.with(|count| count.set(count.get() + 1));
+        eredu_core::inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver())
+            .map_err(eredu_core::ModelLoadError::Artifact)
+    }
+
     fn select_preparation(
         &self,
         inspection: &eredu_core::ArtifactInspection<
@@ -1157,6 +1167,16 @@ impl ExecutionPlanBackendFactory for MockBackend {
     type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
     type SelectedDrafterPreparation = eredu_architectures::ExternalDraftPreparation;
     type Drafter = MockDrafter;
+
+    fn inspect_loading_artifact<R: eredu_core::ModelConfigurationResolver>(
+        &self, path: &std::path::Path, resolver: &R,
+    ) -> Result<eredu_core::ArtifactInspection<R::ArtifactPlan>, AutomaticPlanningError>
+    where R::ArtifactPlan: Send + Sync + 'static,
+    {
+        FACTORY_INSPECTIONS.with(|count| count.set(count.get() + 1));
+        eredu_core::inspect_artifact_with_prepared_gguf_headers(path, resolver)
+            .map_err(|error| AutomaticPlanningError::backend("inspect_loading_artifact", error))
+    }
 
     fn select_target(
         &self,
@@ -2463,8 +2483,17 @@ fn assert_automatic_planning_conformance() {
         ));
     }
 
+    FACTORY_INSPECTIONS.with(|count| count.set(0));
     let mut planned = LoadedModel::load_execution_plan(&backend, artifact.path(), &external)
         .expect("generic plan loading realizes the external assistant");
+    FACTORY_INSPECTIONS.with(|count| assert_eq!(count.get(), 1));
+    let retained = eredu_core::inspect_artifact_with_prepared_gguf_headers(
+        artifact.path(), &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+    ).unwrap();
+    let retained_model = LoadedModel::load_inspected_execution_plan(&backend, retained, &external)
+        .expect("retained inspection uses the same loading worker");
+    FACTORY_INSPECTIONS.with(|count| assert_eq!(count.get(), 1));
+    assert!(retained_model.drafting().is_external());
     assert!(planned.drafting().is_external());
     assert_eq!(planned.drafting_plan(), external.drafting());
     let controls = planned
@@ -2593,7 +2622,9 @@ fn assert_loading_generation_capability_and_multimodal_conformance() {
     let artifact = TestDirectory::new();
     write_loadable_text_artifact(artifact.path());
 
+    LOADING_INSPECTIONS.with(|count| count.set(0));
     let mut model = LoadedModel::load(MockBackend, artifact.path(), ()).unwrap();
+    LOADING_INSPECTIONS.with(|count| assert_eq!(count.get(), 1));
 
     assert_eq!(model.model_family(), ModelKind::Llama);
     assert_eq!(model.effective_model_type(), "mistral");

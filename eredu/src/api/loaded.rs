@@ -180,11 +180,9 @@ where
             >,
     {
         let artifact = artifact.as_ref();
-        let inspection =
-            eredu_architectures::configuration::inspect_artifact_with_prepared_gguf_headers(
-                artifact,
-            )
-            .map_err(LoadedModelLoadError::Artifact)?;
+        let inspection = factory.inspect_loading_artifact(
+            artifact, &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+        )?;
         Self::load_inspected_execution_plan_with_text_options(
             factory,
             inspection,
@@ -409,10 +407,7 @@ where
         policy: tokenizers::ModelCachePolicy,
     ) -> Result<Self, LoadedModelLoadError> {
         let artifact = artifact.as_ref();
-        let inspection =
-            eredu_architectures::configuration::inspect_artifact_with_prepared_gguf_headers(
-                artifact,
-            )?;
+        let inspection = backend.inspect_model_artifact(artifact).map_err(map_model_load_error)?;
         let (tokenizer, config) =
             loaded_text_artifact_with_cache_policy(&inspection, text_options, policy)?;
         Self::from_inspected(backend, inspection, options, tokenizer, config)

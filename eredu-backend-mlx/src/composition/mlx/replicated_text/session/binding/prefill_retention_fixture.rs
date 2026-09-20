@@ -566,7 +566,7 @@ impl PrefillRetentionFixture {
             eredu_core::plan_model_preparation(inspection, policy, selected.session_capabilities())
                 .map_err(|error| Error::Other(Box::new(error)))?;
         let (sources, rank) =
-            crate::composition::mlx::loading::prepare_selected_sources(plan, selected)?;
+            crate::composition::mlx::loading::prepare_selected_sources(plan, selected, None)?;
         assert!(rank.is_none(), "fixture is ordinary resident construction");
         let weights_stream =
             Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));

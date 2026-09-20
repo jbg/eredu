@@ -163,8 +163,8 @@ fn bounded_probe_selects_before_native_resources() {
             &error,
             AutomaticPlanningError::Backend {
                 operation: "select_model_preparation",
-                message,
-            } if message.contains("loading protocol Realtime")
+                failure,
+            } if failure.to_string().contains("loading protocol Realtime")
         ),
         "{error:?}"
     );

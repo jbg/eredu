@@ -16,9 +16,10 @@ impl MlxModelConfig {
 
     pub(crate) fn new(
         selected: eredu_core::SelectedModelPreparation<crate::backend::MlxBackend<'_>>,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
     ) -> Result<Self, Error> {
         let (plan, selected) = selected.into_parts();
-        let (sources, rank_context) = prepare_selected_sources(plan, selected)?;
+        let (sources, rank_context) = prepare_selected_sources(plan, selected, Some(pool))?;
         Ok(Self {
             sources,
             rank_context,
@@ -29,13 +30,13 @@ impl MlxModelConfig {
 pub(crate) fn prepare_selected_sources(
     plan: eredu_core::ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: MlxSelectedPreparation,
+    pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
 ) -> Result<(PreparedModelSources, Option<crate::backend::MlxRankContext>), Error> {
-    let MlxSelectedPreparation {
-        selected,
-        rank_context,
-    } = selected;
-    let sources = prepare_model_sources(plan, selected)
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+    let MlxSelectedPreparation { selected, rank_context } = selected;
+    let sources = match pool {
+        Some(pool) => eredu_architectures::prepared_sources::prepare_model_sources_with_inspection_admission(plan, selected, pool),
+        None => prepare_model_sources(plan, selected),
+    }.map_err(Error::SourcePreparation)?;
     #[cfg(test)]
     {
         // Every admitted primary source is prepared once, independent of its

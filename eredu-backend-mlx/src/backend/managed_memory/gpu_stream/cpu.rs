@@ -85,6 +85,19 @@ impl SharedNativeInitializer for Initializer {
 #[error("CPU execution ownership: {0}")]
 pub(super) struct CpuExecutionError(#[source] SharedNativeInitializationError<Initializer>);
 
+impl CpuExecutionError {
+    pub(super) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        eredu_core::BackendFailure::from_error(self.0.retire_output_and_map_error(|error| {
+            match error {
+                ConstructorFailure::Selection(error) => eredu_core::BackendFailure::from_error(error),
+                ConstructorFailure::Selected(error) => eredu_core::BackendFailure::from_error(error),
+                ConstructorFailure::Stream(error) => error.into_backend_failure(),
+                ConstructorFailure::Worker(error) => error.into_backend_failure(),
+            }
+        }))
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PreparedCpuExecution(InitializedSharedNative<CpuExecution>);
 impl PreparedCpuExecution {

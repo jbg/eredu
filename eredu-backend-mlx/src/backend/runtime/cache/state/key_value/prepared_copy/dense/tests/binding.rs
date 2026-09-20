@@ -22,7 +22,7 @@ fn load(root: &std::path::Path, stream: &Stream) -> Executable {
         selected.session_capabilities(),
     )
     .unwrap();
-    let (sources, _) = loading::prepare_selected_sources(plan, selected).unwrap();
+    let (sources, _) = loading::prepare_selected_sources(plan, selected, None).unwrap();
     loading::materialize_model_plan(sources, None, stream, &source_stream)
         .unwrap()
         .into_executable()

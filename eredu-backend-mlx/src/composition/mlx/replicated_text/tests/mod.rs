@@ -87,7 +87,7 @@ fn materialize_model_plan(
         plan.policy(),
         selected.session_capabilities(),
     )?;
-    let (sources, _rank_context) = super::super::loading::prepare_selected_sources(plan, selected)?;
+    let (sources, _rank_context) = super::super::loading::prepare_selected_sources(plan, selected, None)?;
     super::super::loading::materialize_model_plan(sources, None, stream, weights_stream)
 }
 

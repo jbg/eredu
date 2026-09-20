@@ -350,6 +350,16 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         &eredu_architectures::configuration::MODEL_CONFIGURATIONS
     }
 
+    fn inspect_model_artifact(
+        &self, path: &std::path::Path,
+    ) -> Result<eredu_core::ArtifactInspection<eredu_architectures::processor_plan::ArtifactArchitecturePlan>, eredu_core::ModelLoadError<Self::Error>> {
+        self.memory_pool().inspect_artifact_for_loading(
+            path, self.configuration_resolver(),
+            eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
+            eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+        ).map_err(|error| eredu_core::ModelLoadError::Backend(Error::ArtifactInspection(error)))
+    }
+
     fn select_preparation(
         &self,
         inspection: &eredu_core::ArtifactInspection<
@@ -371,6 +381,6 @@ impl ModelLoadingBackend for MlxBackend<'_> {
         &self,
         selected: eredu_core::SelectedModelPreparation<Self>,
     ) -> Result<Self::ModelConfig, Self::Error> {
-        crate::composition::mlx::loading::MlxModelConfig::new(selected)
+        crate::composition::mlx::loading::MlxModelConfig::new(selected, self.memory_pool())
     }
 }

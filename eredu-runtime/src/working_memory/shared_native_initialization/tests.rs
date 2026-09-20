@@ -155,6 +155,26 @@ fn shared_initializer_failed_prefix_retains_exact_debit_until_storage_retirement
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 #[test]
+fn mapped_constructor_error_retires_prefix_before_releasing_original_account() {
+    let Some(bytes) = requirement() else { return; };
+    let pool = WorkingMemoryPool::new(bytes, 0).unwrap();
+    let plan = constructor(&pool, true);
+    let drops = plan.drops.clone();
+    let error = pool.initialize_shared_native(plan).unwrap_err();
+    let diagnostic = error.retire_output_and_map_error(|prefix| {
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(prefix);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.used_bytes().unwrap(), bytes);
+        std::io::Error::other("native construction refused")
+    });
+    assert!(diagnostic.completed_output().is_none());
+    assert!(std::error::Error::source(&diagnostic).unwrap().is::<std::io::Error>());
+    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    drop(diagnostic);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+#[test]
 fn shared_initializer_keeps_existing_unquoted_exclusion() {
     let Some(bytes) = requirement() else {
         return;

@@ -239,6 +239,18 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
     type SelectedDrafterPreparation = eredu_architectures::PreparedExternalDraft;
     type Drafter = MlxDrafter;
 
+    fn inspect_loading_artifact<R: eredu_core::ModelConfigurationResolver>(
+        &self, path: &Path, resolver: &R,
+    ) -> Result<eredu_core::ArtifactInspection<R::ArtifactPlan>, AutomaticPlanningError>
+    where R::ArtifactPlan: Send + Sync + 'static,
+    {
+        crate::backend::managed_memory::domain().inspect_artifact_for_loading(
+            path, resolver,
+            eredu_checkpoint::safetensors::SafetensorsDiscoveryLimits::default(),
+            eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
+        ).map_err(|error| AutomaticPlanningError::backend("inspect_loading_artifact", error))
+    }
+
     fn select_target(
         &self,
         inspection: &eredu_core::ArtifactInspection<
@@ -359,7 +371,7 @@ fn realize_backend(device: &DevicePlan) -> Result<MlxBackend<'static>, Automatic
         let index=realized.device.get_index().map_err(|error|planning_backend_error("execution_device_index",error))?;
         if index==0 {
             let pool=crate::backend::managed_memory::domain();
-            let streams=crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(&pool,kind).map_err(|error|planning_backend_error("create_admitted_execution_stream",error))?;
+            let streams=crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(&pool,kind).map_err(|error|planning_backend_error("create_admitted_execution_stream",error.into_backend_failure()))?;
             if let Some(streams)=streams {
                 return Ok(MlxBackend::for_prepared_execution_plan(streams,realized.identity));
             }
@@ -456,12 +468,9 @@ fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlannin
 
 fn planning_backend_error(
     operation: &'static str,
-    error: impl std::fmt::Display,
+    error: impl std::error::Error + Send + Sync + 'static,
 ) -> AutomaticPlanningError {
-    AutomaticPlanningError::Backend {
-        operation,
-        message: error.to_string(),
-    }
+    AutomaticPlanningError::backend(operation, error)
 }
 
 #[cfg(test)]

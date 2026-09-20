@@ -51,6 +51,22 @@ impl SharedNativeInitializer for Initializer {
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct MaterializationSourceStreamError(Failure);
+impl MaterializationSourceStreamError {
+    pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self.0 {
+            Failure::Layout(error) | Failure::Native(error) => BackendFailure::from_error(error),
+            Failure::Accounting(error) => BackendFailure::from_error(error),
+            Failure::Initialization(error) => BackendFailure::from_error(
+                error.retire_output_and_map_error(|error| match error {
+                    ConstructorFailure::Preparation(error) => error.cause(),
+                    ConstructorFailure::Native(error) => error.cause(),
+                }),
+            ),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum Failure {
     #[error("source stream producer qualification: {0}")]

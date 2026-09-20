@@ -57,6 +57,31 @@ impl SharedNativeInitializer for Initializer {
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct MlxGpuStreamError(#[from] Failure);
+
+impl MlxGpuStreamError {
+    /// Retires thread-local constructor wrappers before crossing the public
+    /// error boundary. Native registrations retain their own custody; disposing
+    /// a wrapper does not release a live registration's reservation.
+    pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self.0 {
+            Failure::Accounting(error) => BackendFailure::from_error(error),
+            Failure::Native(error) => BackendFailure::from_error(error),
+            Failure::Runtime(error) => BackendFailure::from_error(error),
+            Failure::Device(error) => BackendFailure::from_error(error),
+            Failure::Scheduler(error) => BackendFailure::from_error(error),
+            Failure::CpuExecution(error) => error.into_backend_failure(),
+            Failure::Source(error) => error.into_backend_failure(),
+            Failure::Worker(error) => error.into_backend_failure(),
+            Failure::Constructor(error) => BackendFailure::from_error(
+                error.retire_output_and_map_error(|error| match error {
+                    ConstructorFailure::Preparation(error) => error.cause(),
+                    ConstructorFailure::Native(error) => error.cause(),
+                }),
+            ),
+        }
+    }
+}
 /// Actual prerequisite or constructor refusal, retaining native-prefix custody.
 #[derive(Debug, thiserror::Error)]
 enum Failure {

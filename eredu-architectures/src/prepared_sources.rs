@@ -995,6 +995,9 @@ pub enum PreparedModelSourcesError {
     /// Exact original root allocation refused before source publication.
     #[error(transparent)]
     SourceErasure(#[from] eredu_runtime::working_memory::OriginalRetainedSourceError),
+    /// Original inspection custody belongs to a different source-admission pool.
+    #[error(transparent)]
+    SourceAdmission(#[from] eredu_runtime::working_memory::WorkingMemoryError),
     /// SafeTensors source and pinned-view construction refused with retained custody.
     #[error(transparent)]
     SafetensorsConstructor(#[from] eredu_runtime::working_memory::OriginalPreparedSafetensorsError),
@@ -1027,6 +1030,22 @@ pub fn prepare_model_sources_with_catalog_pool(
     pool: &eredu_runtime::working_memory::WorkingMemoryPool,
 ) -> Result<PreparedModelSources, PreparedModelSourcesError> {
     prepare_model_sources_impl(plan, selected, Some(pool))
+}
+
+/// Prepares a loading request while preserving the original inspection's policy.
+/// Same-pool SafeTensors discovery uses admitted store/view construction. Ordinary
+/// inspections keep ordinary preparation; foreign original custody is rejected.
+/// GGUF retains its ordinary loading route; explicit catalog-pool construction
+/// remains available through [`prepare_model_sources_with_catalog_pool`].
+pub fn prepare_model_sources_with_inspection_admission(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected: SelectedPreparation,
+    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+) -> Result<PreparedModelSources, PreparedModelSourcesError> {
+    let admitted = plan.inspection().safetensors_shards()
+        .map(|shards| pool.safetensors_shards_have_source_admission(shards))
+        .transpose()?.unwrap_or(false);
+    prepare_model_sources_impl(plan, selected, admitted.then_some(pool))
 }
 
 fn prepare_model_sources_impl(

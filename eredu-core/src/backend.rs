@@ -956,6 +956,15 @@ pub trait ModelLoadingBackend: BackendProvider {
     /// Returns the architecture-owned model configuration registry.
     fn configuration_resolver(&self) -> &Self::ConfigurationResolver;
 
+    /// Inspects through the shared portable driver before selected preparation.
+    /// Adapters may supply neutral source admission from their existing pool;
+    /// format dispatch and model semantics remain in the portable inspection.
+    fn inspect_model_artifact(
+        &self, path: &std::path::Path,
+    ) -> Result<ArtifactInspection<<Self::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan>, ModelLoadError<Self::Error>> {
+        inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver()).map_err(Into::into)
+    }
+
     /// Intersects normalized architecture requirements and the caller request
     /// with backend support, returning the sole construction-policy handoff.
     ///
@@ -1055,8 +1064,7 @@ pub fn load_model<B: ModelLoadingBackend>(
     artifact: impl AsRef<Path>,
     options: B::LoadOptions,
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let inspection =
-        inspect_artifact_with_prepared_gguf_headers(artifact, backend.configuration_resolver())?;
+    let inspection = backend.inspect_model_artifact(artifact.as_ref())?;
     prepare_inspected_model(backend, inspection, options)
 }
 
@@ -4209,6 +4217,7 @@ mod tests {
 
     #[derive(Default)]
     struct LoadingMock {
+        inspections: std::sync::atomic::AtomicUsize,
         selections: std::sync::atomic::AtomicUsize,
         materializations: std::sync::atomic::AtomicUsize,
         selected_gguf: std::cell::RefCell<Option<eredu_gguf::Checkpoint>>,
@@ -4383,6 +4392,11 @@ mod tests {
 
         fn configuration_resolver(&self) -> &Self::ConfigurationResolver {
             &LOADING_CONFIGURATION_RESOLVER
+        }
+
+        fn inspect_model_artifact(&self, path: &std::path::Path) -> Result<ArtifactInspection, ModelLoadError<Self::Error>> {
+            self.inspections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inspect_artifact_with_prepared_gguf_headers(path, self.configuration_resolver()).map_err(Into::into)
         }
 
         fn select_preparation(
@@ -4707,8 +4721,15 @@ mod tests {
     fn generic_loader_inspects_plans_and_prepares_on_the_selected_backend() {
         let root = tempfile::tempdir().unwrap();
         write_loading_fixture(root.path());
-        let prepared = load_model(&LoadingMock::default(), root.path(), 41).unwrap();
+        let backend = LoadingMock::default();
+        let prepared = load_model(&backend, root.path(), 41).unwrap();
         assert_eq!(*prepared, 41);
+        assert_eq!(backend.inspections.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let inspection = inspect_artifact_with_prepared_gguf_headers(root.path(), backend.configuration_resolver()).unwrap();
+        std::fs::remove_file(root.path().join("config.json")).unwrap();
+        assert_eq!(*prepare_inspected_model(&backend, inspection, 42).unwrap(), 42);
+        assert_eq!(backend.inspections.load(std::sync::atomic::Ordering::Relaxed), 1);
+        write_loading_fixture(root.path());
 
         let runtime = ModelRuntime::load(LoadingMock::default(), root.path(), 7).unwrap();
         assert_eq!(runtime.backend().descriptor().name, "loading-mock");

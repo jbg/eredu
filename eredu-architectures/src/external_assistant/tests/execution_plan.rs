@@ -252,10 +252,7 @@ fn execution_plan_validates_policy_lowering_compatibility_and_capacity_before_so
             |_, _| None,
             &capabilities()
         ),
-        Err(AutomaticPlanningError::Backend {
-            operation: "select_external_drafter",
-            ..
-        })
+        Err(AutomaticPlanningError::Invalid(message)) if message.contains("external drafter materialization")
     ));
     assert!(matches!(prepare_execution_plan_assistant(
         &execution_plan(DraftPlacementPlan::Target, 2), &incompatible, retained.clone(), direct_lowering, &capabilities()

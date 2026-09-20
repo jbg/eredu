@@ -71,7 +71,14 @@ fn gpu_stream_birth_preserves_short_source_and_factory_accounts_execute_nonzero(
             assert!(failure.rejected_plan().is_some());
             assert!(failure.constructor_failure().is_none());
             assert_eq!(short.used_bytes().unwrap(), 0);
-            drop(failure);
+            let public = MlxGpuStreamError(Failure::Constructor(failure)).into_backend_failure();
+            let diagnostic = std::error::Error::source(&public).unwrap()
+                .downcast_ref::<eredu_runtime::working_memory::SharedNativeInitializationFailure<(), GpuStreamRegistrationCause>>().unwrap();
+            assert!(diagnostic.constructor_failure().is_none());
+            assert!(matches!(diagnostic.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+            assert!(std::error::Error::source(diagnostic).unwrap().is::<WorkingMemoryError>());
+            assert_eq!(short.used_bytes().unwrap(), 0);
+            drop(public);
 
             let before = pool.used_bytes().unwrap();
             let streams = PreparedExecutionStreams::for_factory(&pool)

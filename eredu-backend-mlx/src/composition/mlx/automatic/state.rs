@@ -70,6 +70,13 @@ impl ExecutionPlanBackendFactory for MlxStateBackendFactory {
     type DrafterPreparation = eredu_architectures::ExternalDraftPreparation;
     type SelectedDrafterPreparation = eredu_architectures::PreparedExternalDraft;
     type Drafter = MlxDrafter;
+    fn inspect_loading_artifact<R: eredu_core::ModelConfigurationResolver>(
+        &self, path: &Path, resolver: &R,
+    ) -> Result<eredu_core::ArtifactInspection<R::ArtifactPlan>, AutomaticPlanningError>
+    where R::ArtifactPlan: Send + Sync + 'static,
+    {
+        self.base.inspect_loading_artifact(path, resolver)
+    }
     fn select_target(
         &self,
         inspection: &Inspection,
@@ -107,9 +114,9 @@ pub(super) fn inspect_resources(
     model_path: &Path,
     options: MlxInspectionOptions,
 ) -> Result<(ModelResourceProfile, Inspection), AutomaticPlanningError> {
-    let inspection =
-        eredu_architectures::configuration::inspect_artifact_with_prepared_gguf_headers(model_path)
-            .map_err(|error| planning_backend_error("inspect_resources", error))?;
+    let inspection = MlxBackendFactory::default().inspect_loading_artifact(
+        model_path, &eredu_architectures::configuration::MODEL_CONFIGURATIONS,
+    )?;
     let report = super::super::inspection::inspect_selected_artifact(&inspection, options);
     Ok((report.resources, inspection))
 }

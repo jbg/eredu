@@ -238,3 +238,98 @@ fn malformed_inspection_keeps_accepted_account_and_tensor_catalog_does_not_keep_
     drop(error);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+#[test]
+fn loading_inspection_preserves_limits_and_refusals_across_admission_availability() {
+    let dir = fixture();
+    if !super::qualified(dir.path()) {
+        return;
+    }
+    let pool = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    let ordinary_owner = pool.acquire_unquoted().unwrap();
+    let ordinary = pool
+        .inspect_artifact_for_loading(
+            dir.path(),
+            &Resolver,
+            SafetensorsDiscoveryLimits::default(),
+            POLICY,
+        )
+        .unwrap();
+    assert!(
+        !pool
+            .safetensors_shards_have_source_admission(ordinary.safetensors_shards().unwrap())
+            .unwrap()
+    );
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    let limits = SafetensorsDiscoveryLimits {
+        max_index_bytes: 0,
+        ..Default::default()
+    };
+    let refused = pool
+        .inspect_artifact_for_loading(dir.path(), &Resolver, limits, POLICY)
+        .unwrap_err();
+    assert!(refused.construction_failure().is_some());
+    assert!(refused.to_string().contains("index"));
+    drop(refused);
+    drop(ordinary);
+    drop(ordinary_owner);
+    let admitted = pool
+        .inspect_artifact_for_loading(
+            dir.path(),
+            &Resolver,
+            SafetensorsDiscoveryLimits::default(),
+            POLICY,
+        )
+        .unwrap();
+    assert!(
+        pool.safetensors_shards_have_source_admission(admitted.safetensors_shards().unwrap())
+            .unwrap()
+    );
+    let foreign = WorkingMemoryPool::new(1_000_000, 0).unwrap();
+    assert!(matches!(
+        foreign.safetensors_shards_have_source_admission(admitted.safetensors_shards().unwrap()),
+        Err(WorkingMemoryError::IdentityMismatch)
+    ));
+    drop(admitted);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    let initial = WorkingMemoryPool::safetensors_source_initial_bytes(dir.path(), POLICY).unwrap();
+    let short = WorkingMemoryPool::new(initial - 1, 0).unwrap();
+    assert!(matches!(
+        short
+            .inspect_artifact_for_loading(
+                dir.path(),
+                &Resolver,
+                SafetensorsDiscoveryLimits::default(),
+                POLICY
+            )
+            .unwrap_err()
+            .memory_failure(),
+        Some(WorkingMemoryError::BudgetExceeded { .. })
+    ));
+    std::fs::write(dir.path().join("model.safetensors.index.json"), b"bad JSON").unwrap();
+    let error = pool
+        .inspect_artifact_for_loading(
+            dir.path(),
+            &Resolver,
+            SafetensorsDiscoveryLimits::default(),
+            POLICY,
+        )
+        .unwrap_err();
+    let accepted = pool.used_bytes().unwrap();
+    assert!(accepted > 0);
+    let error = eredu_core::AutomaticPlanningError::backend("inspect-loading-fixture", error);
+    let alias = error.clone();
+    drop(error);
+    assert_eq!(pool.used_bytes().unwrap(), accepted);
+    let mut cause: &(dyn std::error::Error + 'static) = &alias;
+    while cause
+        .downcast_ref::<OriginalArtifactInspectionError<()>>()
+        .is_none()
+    {
+        cause = cause
+            .source()
+            .expect("original inspection cause remains in the chain");
+    }
+    drop(alias);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}

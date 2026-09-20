@@ -189,6 +189,26 @@ impl<P: SharedNativeInitializer> SharedNativeInitializationError<P> {
     ) {
         (self.plan, self.failure)
     }
+
+    /// Disposes the rejected plan and any completed output locally, then maps
+    /// the owned constructor error. The original account remains in the returned
+    /// failure until its diagnostics retire. The mapper must dispose or retain
+    /// every constructor prefix; this operation grants no completion authority.
+    pub fn retire_output_and_map_error<E>(
+        self,
+        map: impl FnOnce(P::Error) -> E,
+    ) -> SharedNativeInitializationFailure<(), E> {
+        let (plan, failure) = self.into_parts();
+        let SharedNativeInitializationFailure { accounting, construction, output, account } = failure;
+        drop(plan);
+        drop(output);
+        SharedNativeInitializationFailure {
+            accounting,
+            construction: construction.map(map),
+            output: None,
+            account,
+        }
+    }
 }
 impl<P: SharedNativeInitializer> fmt::Debug for SharedNativeInitializationError<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

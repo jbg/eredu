@@ -1061,6 +1061,18 @@ pub trait ExecutionPlanBackendFactory: AutomaticPlanningBackend {
     /// Backend-owned separately prepared assistant type.
     type Drafter;
 
+    /// Inspects for loading through the portable resolver before native resources
+    /// exist. Factories can install neutral source admission here; caller-supplied
+    /// inspections continue through the separate retained-inspection entry.
+    fn inspect_loading_artifact<R: ModelConfigurationResolver>(
+        &self, path: &std::path::Path, resolver: &R,
+    ) -> Result<ArtifactInspection<R::ArtifactPlan>, AutomaticPlanningError>
+    where R::ArtifactPlan: Send + Sync + 'static,
+    {
+        crate::inspect_artifact_with_prepared_gguf_headers(path, resolver)
+            .map_err(|error| AutomaticPlanningError::backend("inspect_loading_artifact", error))
+    }
+
     /// Selects the backend preparation without creating a native device or queue.
     fn select_target(
         &self,
@@ -1173,10 +1185,7 @@ pub fn realize_execution_plan_target<F: ExecutionPlanBackendFactory>(
         realization
             .backend()
             .devices()
-            .map_err(|error| AutomaticPlanningError::Backend {
-                operation: "realize_execution_plan_devices",
-                message: error.to_string(),
-            })?;
+            .map_err(|error| AutomaticPlanningError::backend("realize_execution_plan_devices", error))?;
     let capabilities = devices
         .iter()
         .find_map(|(device, capabilities)| {
@@ -1274,21 +1283,31 @@ pub fn select_execution_plan_drafting<F: ExecutionPlanBackendFactory>(
 }
 
 /// Failure produced by portable planning or its selected backend adapter.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum AutomaticPlanningError {
     /// A portable request or policy invariant is invalid.
     #[error("automatic planning error: {0}")]
     Invalid(String),
-    /// A selected backend observation or admission operation failed.
-    #[error("automatic planning backend failed during {operation}: {message}")]
+    /// A backend operation failed with retained typed source ownership.
+    /// Clones share the original failure and its ownership.
+    #[error("automatic planning backend failed during {operation}: {failure}")]
     Backend {
         /// Stable high-level operation name.
         operation: &'static str,
-        /// Backend-provided context.
-        message: String,
+        /// Neutral error retaining the original source and any admission custody.
+        #[source]
+        failure: std::sync::Arc<crate::BackendFailure>,
     },
 }
-
+impl AutomaticPlanningError {
+    /// Preserves the actual typed failure and its ownership across error clones.
+    pub fn backend(
+        operation: &'static str,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Backend { operation, failure: std::sync::Arc::new(crate::BackendFailure::from_error(error)) }
+    }
+}
 /// Backend-neutral automatic planner.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Default)]
 pub struct AutomaticPlanner {

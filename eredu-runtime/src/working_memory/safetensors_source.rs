@@ -153,6 +153,55 @@ impl<P: fmt::Debug> Error for OriginalArtifactInspectionError<P> {
 }
 
 impl WorkingMemoryPool {
+    /// Loading entry that installs source admission before inspection when the
+    /// pool can establish it. Unknown admission before any construction retains
+    /// ordinary inspection behavior. Once any contribution is accepted, every
+    /// failure propagates without reopening or retrying the artifact.
+    pub fn inspect_artifact_for_loading<R: eredu_core::ModelConfigurationResolver>(
+        &self,
+        path: impl AsRef<Path>,
+        resolver: &R,
+        limits: SafetensorsDiscoveryLimits,
+        metadata: DependencyMemoryPolicy,
+    ) -> Result<
+        eredu_core::ArtifactInspection<R::ArtifactPlan>,
+        OriginalArtifactInspectionError<R::ArtifactPlan>,
+    > {
+        let path = path.as_ref();
+        match self.inspect_artifact_with_safetensors_pool(path, resolver, limits, metadata) {
+            Err(error)
+                if matches!(error.memory, Some(WorkingMemoryError::UnknownBound))
+                    && error._policy.is_none()
+                    && error.construction.is_none() =>
+            {
+                eredu_core::artifact::inspect_artifact_with_safetensors_limits(
+                    path, resolver, limits,
+                )
+                .map_err(|construction| OriginalArtifactInspectionError {
+                    memory: None,
+                    construction: Some(construction),
+                    _completed: None,
+                    _policy: None,
+                })
+            }
+            result => result,
+        }
+    }
+
+    /// Reports whether the exact shards have this pool's original discovery
+    /// policy. Ordinary or caller-defined policies are not promoted; an original
+    /// policy from another pool is an identity error rather than an ordinary input.
+    pub fn safetensors_shards_have_source_admission(
+        &self,
+        shards: &SafetensorsShards,
+    ) -> Result<bool, WorkingMemoryError> {
+        match shards.source_admission_owner::<SourcePolicy>() {
+            None => Ok(false),
+            Some(policy) if policy.account.matches_pool(self) => Ok(true),
+            Some(_) => Err(WorkingMemoryError::IdentityMismatch),
+        }
+    }
+
     /// Builds independent store/cache metadata over this pool's already admitted
     /// shards. No directory, index or header is rediscovered. The input and any
     /// fresh accepted contribution remain owned on failure.

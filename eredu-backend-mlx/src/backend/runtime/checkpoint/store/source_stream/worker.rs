@@ -64,6 +64,21 @@ fn requested(
 #[error(transparent)]
 pub struct MaterializationSourceWorkerError(Failure);
 impl MaterializationSourceWorkerError {
+    pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        use eredu_core::BackendFailure;
+        match self.0 {
+            Failure::Native(error) => BackendFailure::from_error(error),
+            Failure::Accounting(error) => BackendFailure::from_error(error),
+            Failure::Stream(error) => error.into_backend_failure(),
+            Failure::Scheduler(error) => BackendFailure::from_error(error),
+            Failure::Initialization(error) => BackendFailure::from_error(
+                error.retire_output_and_map_error(|error| match error {
+                    ConstructorFailure::Preparation(error) => error.cause(),
+                    ConstructorFailure::Native(error) => error.cause(),
+                }),
+            ),
+        }
+    }
     pub(crate) fn is_busy(&self) -> bool {
         matches!(self.0, Failure::Native(CpuWorkerCause::Busy))
     }

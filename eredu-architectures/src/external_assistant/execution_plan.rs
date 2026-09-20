@@ -176,10 +176,7 @@ pub fn prepare_execution_plan_assistant(
     let preparation = artifact
         .preparation
         .select_materialization(quantization, max_cached_sources, lowering)
-        .map_err(|message| AutomaticPlanningError::Backend {
-            operation: "select_external_drafter",
-            message,
-        })?;
+        .map_err(|message| AutomaticPlanningError::Invalid(format!("external drafter materialization: {message}")))?;
     let target_profile = target
         .architecture_plan()
         .external_assistant_target_profile()
@@ -224,10 +221,7 @@ pub fn prepare_execution_plan_assistant(
     .map_err(|error| invalid(&error))?;
     let source = preparation
         .prepare_source(max_cached_sources)
-        .map_err(|error| AutomaticPlanningError::Backend {
-            operation: "prepare_external_drafter_source",
-            message: error.to_string(),
-        })?;
+        .map_err(|error| AutomaticPlanningError::backend("prepare_external_drafter_source", error))?;
     Ok(ExternalDraftArtifact {
         preparation: PreparedExternalAssistantExecution {
             source,

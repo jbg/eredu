@@ -282,6 +282,14 @@ pub enum Error {
     #[error(transparent)]
     Artifact(#[from] eredu_core::artifact::ArtifactError),
 
+    /// Portable inspection failed while retaining source admission custody.
+    #[error(transparent)]
+    ArtifactInspection(#[from] eredu_runtime::working_memory::OriginalArtifactInspectionError<eredu_architectures::processor_plan::ArtifactArchitecturePlan>),
+
+    /// Architecture source preparation failed with its original retained inputs.
+    #[error(transparent)]
+    SourcePreparation(#[from] eredu_architectures::prepared_sources::PreparedModelSourcesError),
+
     /// Portable architecture, artifact, request, and mechanism admission failed.
     #[error(transparent)]
     PreparationAdmission(#[from] eredu_core::PreparationAdmissionError),

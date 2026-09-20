@@ -972,9 +972,16 @@ stores retain their selected cache limits while sharing immutable shard and
 header data. The store's policy identifies its own construction contribution;
 ordinary store construction over funded shards does not establish that origin.
 The input shards and accepted fresh contribution remain owned on refusal.
-These explicit inspection and store entries do not establish admission for the
-ordinary production inspection/preparation entry points. Subsequent prepared
-views, provenance maps, payloads and recipe storage require separate admission.
+Model loading invokes a neutral backend/factory inspection hook before source
+preparation. The MLX adapter installs the runtime policy through that hook;
+loading an already inspected artifact consumes its retained inspection directly.
+Both entries share preparation. An unavailable admission bound before any
+construction permits ordinary inspection with the same encoded input limits.
+Budget refusals and failures after accepted construction propagate without a
+retry. Foreign-pool inspection custody is rejected, and ordinary caller-supplied
+inspections are never promoted to funded origins. GGUF loading retains its
+ordinary route; explicit catalog-pool preparation is independently available.
+Payloads and subsequent recipe storage require separate admission.
 
 Runtime can pin an admitted SafeTensors leaf to the inspected metadata and
 selected checkpoint contract. Ordinary and admitted preparation share the same
@@ -993,6 +1000,13 @@ retains the existing GGUF catalog construction path. Ordinary source preparation
 continues through its shared constructors without claiming pool admission.
 Architecture graph snapshots, projected views, manager storage and native
 materialization have independent ownership and admission responsibilities.
+
+Automatic planning errors retain a neutral backend failure with its typed source;
+clones share its ownership. Native stream-construction errors dispose local
+wrappers before crossing this thread-safe boundary and preserve typed constructor
+and accounting diagnostics. The shared initializer account outlives that disposal.
+Native process registrations retain their own custody independently; wrapper
+disposal neither establishes completion nor refunds surviving registrations.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that

@@ -282,3 +282,51 @@ fn admitted_safetensors_inspection_reaches_selected_source_graph_without_redisco
     drop(identity);
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+#[test]
+fn loading_preparation_uses_actual_inspection_admission_and_preserves_ordinary_inputs() {
+    let (dir, ordinary_inspection) = crate::preparation_selection::tests::inspected_llama();
+    let quote = WorkingMemoryPool::safetensors_source_erasure_required_bytes();
+    if std::env::var_os("EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE").is_some() {
+        assert!(quote.is_ok(), "{quote:?}");
+    }
+    if matches!(quote, Err(WorkingMemoryError::UnknownBound)) {
+        return;
+    }
+    quote.unwrap();
+    let pool = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let (plan, selected) = selected_inspection(ordinary_inspection);
+    let ordinary = prepare_model_sources_with_inspection_admission(plan, selected, &pool).unwrap();
+    assert!(matches!(
+        pool.validate_retained_source_controls(ordinary.primary()),
+        Err(WorkingMemoryError::UnknownBound)
+    ));
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+    let inspection = pool
+        .inspect_artifact_for_loading(
+            dir.path(),
+            &crate::configuration::MODEL_CONFIGURATIONS,
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+    let foreign = WorkingMemoryPool::new(8_000_000, 0).unwrap();
+    let (plan, selected) = selected_inspection(inspection.clone());
+    assert!(matches!(
+        prepare_model_sources_with_inspection_admission(plan, selected, &foreign),
+        Err(PreparedModelSourcesError::SourceAdmission(
+            WorkingMemoryError::IdentityMismatch
+        ))
+    ));
+    assert_eq!(foreign.used_bytes().unwrap(), 0);
+    let (plan, selected) = selected_inspection(inspection);
+    std::fs::remove_file(dir.path().join("config.json")).unwrap();
+    let admitted = prepare_model_sources_with_inspection_admission(plan, selected, &pool).unwrap();
+    pool.validate_retained_source_controls(admitted.primary())
+        .unwrap();
+    assert_eq!(admitted.source_metadata(), ordinary.source_metadata());
+    assert_eq!(admitted.resolutions(), ordinary.resolutions());
+    drop(admitted);
+    drop(ordinary);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
