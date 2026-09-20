@@ -36,12 +36,12 @@ pub(super) enum ConstructionError {
 /// are admitted from the same pool inside the invocation. No output or failed
 /// prefix is detached from its owner when the callback returns.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn plan<'a, I: 'static>(
+pub(super) fn plan<'a, I: 'static, C: 'a>(
     pool: &'a WorkingMemoryPool,
     runtime: &'a PreparedInputRuntime,
     capacity: NativeRoleCapacity,
     invocation: I,
-    input: PreparedEncodedInputPlan<'a>,
+    input: PreparedEncodedInputPlan<'a, C>,
     quantization: eredu_checkpoint::AffineQuantization,
     target: &'a BoundedQuantizationTarget,
     stream: &'a Stream,
@@ -50,10 +50,10 @@ pub(super) fn plan<'a, I: 'static>(
     'a,
     I,
     impl FnOnce(
-            &I,
-            &NativeRoleContext<'_>,
-        ) -> Result<Result<WeightMaterialization, ConstructionError>, Error>
-        + 'a,
+        &I,
+        &NativeRoleContext<'_>,
+    ) -> Result<Result<WeightMaterialization, ConstructionError>, Error>
+    + 'a,
 > {
     cold::Plan::new(runtime, capacity, None, invocation, move |_, context| {
         Ok((|| {

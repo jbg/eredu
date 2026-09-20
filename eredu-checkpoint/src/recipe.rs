@@ -316,16 +316,29 @@ impl<'a> RecipeMetadataView<'a> {
 
 /// A validated recipe whose output can be filled directly from encoded ranges.
 /// This owns metadata and read admission, never a tensor allocation.
-/// Clones preserve the exact inferred output and original source admission,
-/// without reading payloads or pinning cached tensors. Borrowed reads reuse that
-/// immutable admission; source validation still occurs on every read.
+/// Borrowed reads reuse the immutable source records and validate their source
+/// on every read. Caller custody retires after output metadata and read records.
+/// Cloning is available only when custody itself permits it; cloning metadata
+/// has separate storage costs.
 #[derive(Clone)]
-pub struct EncodedRecipeRead {
+pub struct EncodedRecipeRead<C = ()> {
     output: RecipeMetadata,
     batch: crate::store::EncodedReadBatch,
+    _custody: C,
 }
 
-impl EncodedRecipeRead {
+impl<C> EncodedRecipeRead<C> {
+    /// Assemble already constructed output metadata and read records without
+    /// copying either. A byte-length mismatch retains both owners and custody.
+    pub fn from_prepared(
+        output: RecipeMetadata, read: crate::store::PreparedEncodedRead<C>,
+    ) -> Result<Self, EncodedRecipeReadAssemblyError<C>> {
+        if u64::try_from(read.byte_len()).ok() != Some(output.byte_len()) {
+            return Err(EncodedRecipeReadAssemblyError { output, read });
+        }
+        Ok(Self { output, batch: read.batch, _custody: read._custody })
+    }
+
     pub(crate) fn admitted_batch(&self) -> &crate::store::EncodedReadBatch {
         &self.batch
     }
@@ -340,6 +353,37 @@ impl EncodedRecipeRead {
         self.batch.tensors()
     }
 
+    /// Finite synchronous-read scratch over these exact immutable read plans.
+    pub fn borrowed_read_layout<'a>(
+        reads: impl IntoIterator<Item = &'a Self>,
+    ) -> Option<crate::store::EncodedReadLayout> where C: 'a {
+        crate::store::EncodedReadLayout::inspect(reads.into_iter().map(|read| &read.batch))
+    }
+
+    /// Fills caller-owned outputs without cloning source metadata or read spans.
+    /// The caller retains the read plans and its scratch/error account through
+    /// this synchronous operation and discards every output on failure.
+    pub fn read_many_borrowed_into<'a, I>(
+        reads: I,
+        outputs: &mut [&mut [u8]],
+    ) -> Result<(), crate::store::EncodedReadFailure>
+    where
+        I: Iterator<Item = &'a Self> + Clone + ExactSizeIterator,
+        C: 'a,
+    {
+        crate::store::EncodedReadBatch::read_many_borrowed_into(
+            reads.map(|read| &read.batch),
+            outputs,
+        )
+    }
+
+    /// Fills the caller's final output allocation in recipe order.
+    pub fn read_into(self, output: &mut [u8]) -> Result<(), StoreError> {
+        self.batch.read_into(output)
+    }
+}
+
+impl EncodedRecipeRead {
     /// Plans a detached finite source from these exact admitted recipe reads.
     /// Construction copies metadata only, after the caller supplies source custody.
     pub fn prepare_detached<'a, I>(reads: I) -> Option<crate::store::DetachedEncodedReadPlan<'a, I>>
@@ -375,29 +419,6 @@ impl EncodedRecipeRead {
             .checked_add(std::mem::size_of::<String>())
     }
 
-    /// Finite synchronous-read scratch over these exact immutable read plans.
-    pub fn borrowed_read_layout<'a>(
-        reads: impl IntoIterator<Item = &'a Self>,
-    ) -> Option<crate::store::EncodedReadLayout> {
-        crate::store::EncodedReadLayout::inspect(reads.into_iter().map(|read| &read.batch))
-    }
-
-    /// Fills caller-owned outputs without cloning source metadata or read spans.
-    /// The caller retains the read plans and its scratch/error account through
-    /// this synchronous operation and discards every output on failure.
-    pub fn read_many_borrowed_into<'a, I>(
-        reads: I,
-        outputs: &mut [&mut [u8]],
-    ) -> Result<(), crate::store::EncodedReadFailure>
-    where
-        I: Iterator<Item = &'a Self> + Clone + ExactSizeIterator,
-    {
-        crate::store::EncodedReadBatch::read_many_borrowed_into(
-            reads.map(|read| &read.batch),
-            outputs,
-        )
-    }
-
     /// Fills multiple final recipe outputs with a shared shard-ordered read pass.
     pub fn read_many_into(reads: Vec<Self>, outputs: &mut [&mut [u8]]) -> Result<(), StoreError> {
         crate::store::EncodedReadBatch::read_many_into(
@@ -406,11 +427,20 @@ impl EncodedRecipeRead {
         )
     }
 
-    /// Fills the caller's final output allocation in recipe order.
-    pub fn read_into(self, output: &mut [u8]) -> Result<(), StoreError> {
-        self.batch.read_into(output)
+}
+
+/// Byte-length disagreement retains actual output metadata and the read owner.
+#[derive(Debug)]
+pub struct EncodedRecipeReadAssemblyError<C> {
+    output: RecipeMetadata,
+    read: crate::store::PreparedEncodedRead<C>,
+}
+impl<C> std::fmt::Display for EncodedRecipeReadAssemblyError<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "recipe output has {} bytes but its read has {}", self.output.byte_len(), self.read.byte_len())
     }
 }
+impl<C: std::fmt::Debug> std::error::Error for EncodedRecipeReadAssemblyError<C> {}
 
 /// A named recipe collection that becomes observable only after every output
 /// has passed metadata inference. This is the atomic unit used for fused
@@ -1085,7 +1115,7 @@ impl DerivedWeightRecipe {
             // as bytes. Leave those transformations to the ordinary path.
             return Ok(None);
         }
-        Ok(Some(EncodedRecipeRead { output, batch }))
+        Ok(Some(EncodedRecipeRead { output, batch, _custody: () }))
     }
 
     /// Creates a recipe reading one selected checkpoint tensor.

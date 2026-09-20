@@ -235,7 +235,7 @@ pub(super) fn prepare(
         return Ok(None);
     };
     let batch = batch.project_ranges(&mapping.ranges, mapping.length)?;
-    Ok(Some(EncodedRecipeRead { output, batch }))
+    Ok(Some(EncodedRecipeRead { output, batch, _custody: () }))
 }
 
 #[cfg(test)]

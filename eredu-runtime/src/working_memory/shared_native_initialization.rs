@@ -14,6 +14,8 @@ mod recipe_mapping;
 mod selection_ranges;
 mod read_projection;
 mod recipe_compilation;
+mod recipe_read;
+pub use recipe_read::{CompiledRecipeCustody, EncodedRecipeReadPreparationError};
 pub use recipe_compilation::{AdmittedRecipeConstruction, EncodedRecipeConstructionError};
 
 /// Closed raw accounting custody for a shared native constructor. The producer

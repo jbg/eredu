@@ -6,7 +6,7 @@ use eredu_checkpoint::{
         TensorSelection,
     },
 };
-use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
+use safetensors::tensor::{Dtype as SafeDtype, TensorView, serialize_to_file};
 
 fn bytes() -> Vec<u8> {
     (0..256)
@@ -146,10 +146,12 @@ fn encoded_input_source_failure_publishes_nothing_and_retains_error_account() {
     // The retained typed failure no longer borrows the read, shape or runtime.
     fn require_static<T: 'static>(_: &T) {}
     require_static(&error);
-    assert!(std::error::Error::source(&error)
-        .unwrap()
-        .downcast_ref::<EncodedInputConstructionError>()
-        .is_some());
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<EncodedInputConstructionError>()
+            .is_some()
+    );
     assert!(matches!(
         error.constructor_failure(),
         Some(EncodedInputConstructionError::Read(EncodedReadFailure {
@@ -163,3 +165,65 @@ fn encoded_input_source_failure_publishes_nothing_and_retains_error_account() {
     safemlx::reclaim_allocation_owners();
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
+
+// Runtime and source birth are fixture prerequisites. Every key, read record,
+// compiler allocation, projected span and native input below uses the same pool.
+macro_rules! compiled_input {
+    ($name:ident, $fixture:expr, $plan:ident) => {
+        #[test]
+        fn $name() {
+            use eredu_checkpoint::{recipe::EncodedRecipeKeysPlan, store::$plan};
+            let runtime = PreparedInputRuntime::prepare().unwrap();
+            let (_directory, source) = $fixture;
+            let recipe = DerivedWeightRecipe::Select {
+                input: Box::new(DerivedWeightRecipe::Concatenate {
+                    axis: 0,
+                    inputs: vec![DerivedWeightRecipe::source("weight", TensorSelection::Full); 2],
+                }),
+                selection: TensorSelection::Indices {
+                    axis: 0,
+                    indices: vec![7, 1],
+                },
+            };
+            let pool = WorkingMemoryPool::new(1 << 26, 0).unwrap();
+            let keys = pool
+                .initialize_shared_native(EncodedRecipeKeysPlan::new(&recipe).unwrap().unwrap())
+                .unwrap();
+            let batch = pool
+                .initialize_shared_native($plan::new(&source, keys.output().keys()).unwrap())
+                .unwrap();
+            let read = batch.compile_recipe(&recipe, &pool).unwrap().unwrap();
+            drop((keys, recipe));
+            assert_eq!(read.output().shape(), [2, 64]);
+            assert_eq!(source.source_diagnostics().unwrap().physical_read_bytes, 0);
+            let read_bytes = pool.used_bytes().unwrap();
+            assert!(read_bytes > 0);
+            let plan =
+                PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32).unwrap();
+            let required = plan.required_bytes().unwrap();
+            let input = plan.prepare(&pool).unwrap();
+            assert_eq!(pool.used_bytes().unwrap(), read_bytes + required);
+            let alias = input.output().try_prepared_source_array().unwrap();
+            drop(input);
+            safemlx::reclaim_allocation_owners();
+            assert_eq!(pool.used_bytes().unwrap(), read_bytes + required);
+            drop((read, source));
+            safemlx::reclaim_allocation_owners();
+            assert_eq!(pool.used_bytes().unwrap(), required);
+            assert_selected(&alias);
+            drop(alias);
+            safemlx::reclaim_allocation_owners();
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+        }
+    };
+}
+compiled_input!(
+    compiled_memory_read_fills_native_input_with_original_custody,
+    ((), memory()),
+    MemoryEncodedReadPlan
+);
+compiled_input!(
+    compiled_file_read_fills_native_input_with_original_custody,
+    file(),
+    SafetensorsEncodedReadPlan
+);

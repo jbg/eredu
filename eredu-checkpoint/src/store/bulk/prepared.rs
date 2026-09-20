@@ -10,8 +10,8 @@ use super::*;
 /// fn copy(read: PreparedEncodedRead<()>) { let _ = read.clone(); }
 /// ```
 pub struct PreparedEncodedRead<C> {
-    pub(super) batch: EncodedReadBatch,
-    pub(super) _custody: C,
+    pub(crate) batch: EncodedReadBatch,
+    pub(crate) _custody: C,
 }
 impl<C> PreparedEncodedRead<C> {
     /// Metadata in original occurrence order, including repeated sources.

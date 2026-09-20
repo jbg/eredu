@@ -18,8 +18,8 @@ use std::mem::{size_of, size_of_val};
 /// birth is covered here. The caller retains and funds those prerequisites.
 /// The native source, its one array alias slot and synchronous read scratch are
 /// admitted together before allocating a destination or performing payload I/O.
-pub(crate) struct PreparedEncodedInputPlan<'a> {
-    read: &'a EncodedRecipeRead,
+pub(crate) struct PreparedEncodedInputPlan<'a, C> {
+    read: &'a EncodedRecipeRead<C>,
     native: PreparedHostTransferPlan<'a>,
     scratch: EncodedReadLayout,
 }
@@ -36,9 +36,9 @@ pub(crate) enum EncodedInputConstructionError {
     Read(#[source] EncodedReadFailure),
 }
 
-impl<'a> PreparedEncodedInputPlan<'a> {
+impl<'a, C> PreparedEncodedInputPlan<'a, C> {
     pub(crate) fn new(
-        read: &'a EncodedRecipeRead,
+        read: &'a EncodedRecipeRead<C>,
         runtime: &'a PreparedInputRuntime,
         shape: &'a [i32],
         dtype: Dtype,
@@ -87,7 +87,7 @@ impl<'a> PreparedEncodedInputPlan<'a> {
     }
 }
 
-impl SharedNativeInitializer for PreparedEncodedInputPlan<'_> {
+impl<C> SharedNativeInitializer for PreparedEncodedInputPlan<'_, C> {
     type Output = ImmutableHostTransferBuffer;
     type Error = EncodedInputConstructionError;
 
@@ -104,7 +104,7 @@ impl SharedNativeInitializer for PreparedEncodedInputPlan<'_> {
                 .control_bytes()
                 .ok_or(WorkingMemoryError::Overflow)?,
             size_of::<[&mut [u8]; 1]>(),
-            size_of::<std::iter::Once<&EncodedRecipeRead>>(),
+            size_of::<std::iter::Once<&EncodedRecipeRead<C>>>(),
             size_of::<EncodedInputConstructionError>(),
         ];
         controls

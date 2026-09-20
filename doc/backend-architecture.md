@@ -923,6 +923,25 @@ their typed causes without allocating a stringified store error. Machine stack,
 source birth, recipe declarations, subsequent read scratch/output and complete
 producer construction have separate limits and admission.
 
+Runtime can consume an initialized encoded batch to compile and assemble one
+recipe-read owner. It validates the original pool, admits a batch catalog,
+invokes the shared recursive compiler, admits projected spans and moves the
+inferred metadata with its account into the completed read. No successful
+metadata or source record is cloned. A catalog failure retires borrowed scratch
+locally while retaining its diagnostic account; projection failures keep actual
+constructed prefixes. Numerical recipes return no encoded read and release the
+consumed batch without ordinary preparation.
+
+EncodedRecipeRead carries caller custody after its metadata and read records;
+cloning is available only when that custody permits it. Existing ordinary reads
+use unit custody. Assembly checks the inferred byte length and retains both
+owners on disagreement. The native encoded-input constructor and affine cold
+submission accept this same read type with either custody, using the same
+borrowed read worker and source checks. Native input aliases retain their own
+input account after compiler/read storage retires. Runtime and source birth,
+recipe declarations, native shape storage, producer scheduling and prepared
+manager handoff remain separate construction responsibilities.
+
 File and memory encoded-read constructors return one move-only prepared read
 owner. Memory reads retain their direct, scratch-free copy worker; file reads
 retain original file validation and diagnostics through the borrowed worker.
