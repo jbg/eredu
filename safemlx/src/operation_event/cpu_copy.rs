@@ -95,9 +95,9 @@ impl OperationEvent {
         unsafe { safemlx_sys::mlx_operation_event_cpu_scalar_update_eval_layout(
             &mut native, elements, tracer) }.then_some(CpuCopyEvalLayout { native })
     }
-    /// Exact partial F32/I32 static rectangle through the existing full copy and
+    /// Exact partial F32/F16/BF16/I32 static rectangle through the existing full copy and
     /// shaped overwrite tasks. The native producer authenticates complete row
-    /// sources, matching precision, exact coordinates and unit strides.
+    /// sources, matching precision, exact coordinates and positive strides.
     pub fn cpu_static_update_layout(rank:usize,elements:usize,update_elements:usize,tracer:bool)->Option<CpuCopyEvalLayout>{
         let mut native=safemlx_sys::mlx_cpu_copy_eval_layout::default();
         // SAFETY: pure scalar query writes initialized output only on success.

@@ -24,9 +24,10 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism:MlxCpuWor
         return Err(MlxWorkspaceFactError::descriptor("CPU static update coordinates or representation differ"));
     }
     if !(1..=4).contains(&rank) || source.dtype() != WorkspaceDtype::Float32
-        || source.elements()? > i32::MAX as u64 || strides.iter().any(|&n| n != 1) { return Ok(None); }
-    if [source, update].iter().any(|value| value.representation()
-        .is_none_or(|r| r.dtype() != WorkspaceFloatingType::Float32)) { return Ok(None); }
+        || source.elements()? > i32::MAX as u64 { return Ok(None); }
+    let Some(precision) = source.representation() else { return Ok(None); };
+    let dtype = precision.dtype();
+    if update.representation().is_none_or(|r| r.dtype() != dtype) { return Ok(None); }
     let whole=starts.iter().all(|&n|n==0) && ends==source.shape() && update.shape()==source.shape();
     let mut population=CpuPopulation::default();
     if !whole {
@@ -42,7 +43,7 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism:MlxCpuWor
     // destination copy and one shaped overwrite inside the same primitive.
     let frames = [
         safemlx::Array::static_slice_update_control_bytes().ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,
-        size_of::<MlxCpuWorkspaceMechanisms>(),size_of::<bool>(),
+        size_of::<MlxCpuWorkspaceMechanisms>(),size_of::<bool>(),size_of::<WorkspaceFloatingType>(),
         size_of::<CpuCopyEvalLayout>(),size_of::<Option<CpuCopyEvalLayout>>(),
         size_of::<Result<usize,std::num::TryFromIntError>>(),size_of::<u64>()*2,
         size_of::<WorkspaceOperationView<'_>>(), size_of::<WorkspaceLayoutView<'_>>() * 3,
@@ -58,14 +59,15 @@ pub(super) fn inspect(operation: WorkspaceOperationView<'_>, mechanism:MlxCpuWor
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?,usize::checked_add)
         .ok_or(MlxWorkspaceFactError::POPULATION_OVERFLOW)?;
     Ok(Some(OperationPlan {
-        dtype: WorkspaceFloatingType::Float32,
+        dtype,
         population, alias_input:whole.then_some(1),
-        output_bytes:if whole{0}else{mechanism.allocation.fixed_buffer_capacity(output.bytes()?)?},
+        output_bytes:if whole{0}else{mechanism.allocation.fixed_buffer_capacity(facts::mul(output.elements()?,
+            if dtype == WorkspaceFloatingType::Float32 {4} else {2})?)?},
         scratch_bytes:0,rank,parameter_shells:usize::from(whole),seeds:0,validations:0,
     }))
 }
 
-#[cfg(all(test, target_vendor="apple", feature="metal", not(feature="cuda")))]
+#[cfg(all(test, target_vendor="apple", not(feature="cuda")))]
 mod tests {
     use super::*;
     use eredu_nn::Tensor;

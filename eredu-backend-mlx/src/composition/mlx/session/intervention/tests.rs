@@ -521,3 +521,7 @@ fn static_activation_all_actions_match_strided_host_oracle_and_trace_population(
 
 #[path = "tests/precision.rs"]
 mod precision;
+
+#[cfg(all(target_vendor = "apple", not(feature = "cuda")))]
+#[path = "tests/zero.rs"]
+mod zero;

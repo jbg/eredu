@@ -219,7 +219,7 @@ else()
       mlx-cpu-token-update-source.patch
       mlx-cpu-candidate-sort-source.patch
       mlx-cpu-static-update-source.patch
-      mlx-cpu-i32-static-update-source.patch
+      mlx-cpu-typed-static-update-source.patch
       mlx-cpu-half-gather-source.patch
       mlx-cpu-half-squeeze-source.patch
       mlx-cpu-half-softmax-source.patch

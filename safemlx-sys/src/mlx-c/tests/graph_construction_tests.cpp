@@ -3690,7 +3690,8 @@ TEST_CASE("CPU scalar overwrite source prices both copy tasks and rejects change
   CHECK_FALSE(cpu::copy_eval_storage(invalid(SliceUpdate::Sum,{2},{3},{1}),actual));
   CHECK_FALSE(cpu::copy_eval_storage(invalid(SliceUpdate::None,{5},{6},{1}),actual));
   CHECK_FALSE(cpu::copy_eval_storage(invalid(SliceUpdate::None,{2},{4},{1}),actual));
-  CHECK_FALSE(cpu::copy_eval_storage(invalid(SliceUpdate::None,{2},{3},{2}),actual));
+  CHECK(cpu::copy_eval_storage(invalid(SliceUpdate::None,{2},{3},{2}),actual));
+  CHECK_FALSE(cpu::copy_eval_storage(invalid(SliceUpdate::None,{2},{3},{0}),actual));
   CHECK_FALSE(cpu::copy_eval_storage(invalid(SliceUpdate::None,{},{},{1}),actual));
   struct Derived final:SliceUpdate {using SliceUpdate::SliceUpdate;};
   auto derived=array(Shape{5},float32,std::make_shared<Derived>(stream,SliceUpdate::None,Shape{2},Shape{3},Shape{1}),{source,update});
@@ -3834,7 +3835,7 @@ TEST_CASE("CPU static rectangle update source authenticates rank coordinates and
   auto half_source=astype(source,float16,stream),half_update=astype(update,float16,stream);
   eval(half_source,half_update);
   auto half=slice_update(half_source,half_update,Shape{0,1,2},Shape{2,3,5},Shape{1,1,1},stream);
-  CHECK_FALSE(cpu::copy_eval_storage(half,actual));
+  CHECK(cpu::copy_eval_storage(half,actual));
   CHECK(std::memcmp(saved.data(),&actual,sizeof(actual))==0);
   mlx_cpu_copy_eval_layout raw{};REQUIRE(mlx_operation_event_cpu_static_update_eval_layout(&raw,3,42,12,false));
   CHECK(raw.graph_extents==cold.allocation_extents);CHECK(raw.worker_graph_extents==cold.worker_graph_extents);
@@ -5431,3 +5432,5 @@ TEST_CASE("CPU Host transfer source preserves scalar copy geometry and rejects f
 #include "mxfp4_payload_tests.cpp"
 
 #include "cpu_prepared_host_storage_tests.cpp"
+
+#include "cpu_static_update_tests.cpp"

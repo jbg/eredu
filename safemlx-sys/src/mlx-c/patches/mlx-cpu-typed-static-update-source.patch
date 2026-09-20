@@ -1,22 +1,22 @@
 --- a/mlx/backend/cpu/copy_storage.cpp
 +++ b/mlx/backend/cpu/copy_storage.cpp
-@@ -309,8 +309,8 @@
+@@ -404,8 +404,8 @@
  bool scalar_update_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
    return static_update_eval_layout(1,elements,1,tracer,out);
  }
 -static bool complete_f32_row(const array& value,size_t rank) noexcept {
 -  if(value.ndim()!=rank || value.dtype()!=float32 || value.itemsize()!=sizeof(float) ||
 +static bool complete_update_row(const array& value,size_t rank) noexcept {
-+  if(value.ndim()!=rank || (value.dtype()!=float32 && value.dtype()!=int32) || value.itemsize()!=sizeof(uint32_t) ||
++  if(value.ndim()!=rank || (value.dtype()!=float32 && value.dtype()!=int32 && value.dtype()!=float16 && value.dtype()!=bfloat16) || value.itemsize()!=(value.dtype()==float16 || value.dtype()==bfloat16 ? 2 : 4) ||
        value.strides().size()!=rank || !value.flags().row_contiguous || value.data_size()!=value.size())return false;
    size_t dense_stride=1;
    for(size_t axis=rank;axis-->0;) {
-@@ -322,10 +322,11 @@
+@@ -417,16 +417,17 @@
  }
  static bool static_update_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
    const size_t rank=output.ndim();
 -  if(rank<1 || rank>4 || output.dtype()!=float32 || output.itemsize()!=sizeof(float) ||
-+  if(rank<1 || rank>4 || (output.dtype()!=float32 && output.dtype()!=int32) || output.itemsize()!=sizeof(uint32_t) ||
++  if(rank<1 || rank>4 || (output.dtype()!=float32 && output.dtype()!=int32 && output.dtype()!=float16 && output.dtype()!=bfloat16) || output.itemsize()!=(output.dtype()==float16 || output.dtype()==bfloat16 ? 2 : 4) ||
        output.inputs().size()!=2 || output.size()<2)return false;
    const auto& source=output.inputs()[0];const auto& update=output.inputs()[1];
 -  if(!complete_f32_row(source,rank) || !complete_f32_row(update,rank) ||
@@ -25,3 +25,11 @@
        source.shape()!=output.shape() || update.size()>=source.size())return false;
    const auto [kind,starts,ends,strides]=static_cast<const SliceUpdate&>(output.primitive()).state();
    if(kind!=SliceUpdate::None || starts.size()!=rank || ends.size()!=rank || strides.size()!=rank)return false;
+   for(size_t axis=0;axis<rank;++axis) {
+-    if(starts[axis]<0 || ends[axis]<=starts[axis] || ends[axis]>source.shape(axis) || strides[axis]!=1 ||
+-        ends[axis]-starts[axis]!=update.shape(axis))return false;
++    if(starts[axis]<0 || ends[axis]<=starts[axis] || ends[axis]>source.shape(axis) || strides[axis]<=0 ||
++        1+(ends[axis]-starts[axis]-1)/strides[axis]!=update.shape(axis))return false;
+   }
+   return static_update_eval_layout(rank,source.size(),update.size(),output.is_tracer(),out);
+ }
