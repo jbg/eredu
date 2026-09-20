@@ -680,7 +680,7 @@ impl SubmittedQuantizationTile {
         for ((layout, output), buffer) in shard
             .layouts
             .iter()
-            .zip(self.completion.outputs())
+            .zip(self.completion.completed_outputs())
             .zip(&mut shard.buffers)
         {
             write_tile(
@@ -688,7 +688,7 @@ impl SubmittedQuantizationTile {
                 layout,
                 self.output_start,
                 self.rows,
-                output,
+                &output?,
             )?;
         }
         Ok(())
@@ -728,8 +728,9 @@ fn write_tile(
     layout: &OutputLayout,
     start_row: usize,
     rows: usize,
-    output: &Array,
+    evaluated: &safemlx::EvaluatedArray<'_>,
 ) -> Result<(), Error> {
+    let output = evaluated.as_array();
     let expected_bytes = layout
         .row_bytes
         .checked_mul(rows as u64)
@@ -762,7 +763,6 @@ fn write_tile(
                 start_row + rows
             ))
         })?;
-    let evaluated = output.evaluated()?;
     match output.dtype() {
         Dtype::Uint32 | Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 | Dtype::Uint8 => {}
         dtype => {

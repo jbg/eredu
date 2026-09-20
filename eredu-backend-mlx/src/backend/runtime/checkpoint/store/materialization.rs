@@ -6,6 +6,7 @@ use safemlx::{
     OriginalScopeObserver,
 };
 type MaterializationRecovery<T: Retention> = OperationRecovery<T, OriginalTextControlGuard>;
+mod readback;
 
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
 use std::{cell::Cell, rc::Rc};
@@ -354,6 +355,17 @@ impl WeightMaterialization {
 
     pub(crate) fn outputs(&self) -> &[Array] {
         &self.retained.retention().outputs
+    }
+
+    /// Borrow output storage after waiting for this materialization. Original
+    /// outputs use their retained observer without another native submission.
+    pub(crate) fn completed_outputs(
+        &self,
+    ) -> impl ExactSizeIterator<
+        Item = Result<safemlx::EvaluatedArray<'_>, CheckpointMaterializationError>,
+    > {
+        readback::completed_outputs(self.outputs(), self.retained.original_observer())
+            .map(|result| result.map_err(|source| self.mlx_error("output readback", source)))
     }
 
     /// Returns preparation dependencies only after its eager native work is

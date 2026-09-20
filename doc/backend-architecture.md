@@ -815,6 +815,11 @@ constructor. Packing changes the final dimension; leading bank dimensions remain
 in the weights and companion outputs. Native allocation queries describe that
 same geometry, with source preparation and companion dtype conversion funded
 separately.
+Quantization tile writers borrow output views from the materialization owner
+after its exact completion wait. Ordinary owners retain their existing evaluation
+behavior; original owners validate completed storage through their retained
+observer, including after the scope is sealed, without submitting another Eval.
+The encoded destination copy consumes that view and cannot initiate evaluation.
 
 CPU MXFP4 construction uses the same resident bank, with a source-derived bound
 for binary/Select casts and broadcasts, unary operators, views, reductions and
