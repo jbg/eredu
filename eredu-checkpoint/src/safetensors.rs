@@ -46,15 +46,21 @@ impl Default for SafetensorsDiscoveryLimits {
 /// tensor map to exactly match the referenced shard headers, and resolves every
 /// payload beneath the checkpoint access root. Snapshot payload symlinks may
 /// target the sibling repository `blobs` directory, but no path may escape that
-/// repository.
+/// repository. Clones share the immutable path/tensor catalog and its shard
+/// admissions; cloning does not copy those maps or their strings.
 #[derive(Debug, Clone)]
 pub struct SafetensorsShards {
+    catalog: Arc<ShardCatalog>,
+    limits: SafetensorsDiscoveryLimits,
+}
+
+#[derive(Debug)]
+struct ShardCatalog {
     payload_paths: Vec<PathBuf>,
     logical_payload_paths: BTreeMap<String, PathBuf>,
     tensor_locations: Option<BTreeMap<String, PathBuf>>,
     admissions: BTreeMap<PathBuf, Arc<AdmittedShard>>,
     recipes: Arc<crate::recipe::RecipeInferenceCache>,
-    limits: SafetensorsDiscoveryLimits,
 }
 
 impl SafetensorsShards {
@@ -101,15 +107,14 @@ impl SafetensorsShards {
             return Self::discover_directory(path, limits);
         }
         let payload = canonicalize(path)?;
-        Self {
+        ShardCatalog {
             payload_paths: vec![payload.clone()],
             logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
             tensor_locations: None,
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
-            limits,
         }
-        .admit()
+        .admit(limits)
     }
 
     fn discover_directory(
@@ -120,15 +125,14 @@ impl SafetensorsShards {
         let index_path = root.join("model.safetensors.index.json");
         if !index_path.exists() {
             let payload = admit_payload(&root.join("model.safetensors"), &access_root)?;
-            return Self {
+            return ShardCatalog {
                 payload_paths: vec![payload.clone()],
                 logical_payload_paths: BTreeMap::from([("weights".into(), payload)]),
                 tensor_locations: None,
                 admissions: BTreeMap::new(),
                 recipes: Arc::default(),
-                limits,
             }
-            .admit();
+            .admit(limits);
         }
 
         let mut file =
@@ -175,18 +179,65 @@ impl SafetensorsShards {
             };
             tensor_locations.insert(tensor, payload);
         }
-        Self {
+        ShardCatalog {
             payload_paths: payload_paths.into_iter().collect(),
             logical_payload_paths,
             tensor_locations: Some(tensor_locations),
             admissions: BTreeMap::new(),
             recipes: Arc::default(),
-            limits,
         }
-        .admit()
+        .admit(limits)
     }
 
-    fn admit(mut self) -> Result<Self, SafetensorsShardError> {
+    /// Input limits retained by this admitted shard set.
+    pub const fn limits(&self) -> SafetensorsDiscoveryLimits {
+        self.limits
+    }
+
+    pub(crate) fn recipe_cache(&self) -> &crate::recipe::RecipeInferenceCache {
+        &self.catalog.recipes
+    }
+
+    pub(crate) fn admission(&self, path: &Path) -> &Arc<AdmittedShard> {
+        &self.catalog.admissions[path]
+    }
+
+    /// Returns the canonical, deterministically ordered payload paths.
+    pub fn payload_paths(&self) -> &[PathBuf] {
+        &self.catalog.payload_paths
+    }
+
+    /// Returns location-independent logical shard roles paired with admitted paths.
+    ///
+    /// Indexed artifacts retain the relative member names from the admitted
+    /// index even when snapshot symlinks resolve outside the submitted
+    /// directory. Direct artifacts use the stable semantic role `weights`.
+    pub fn logical_payload_paths(&self) -> &BTreeMap<String, PathBuf> {
+        &self.catalog.logical_payload_paths
+    }
+
+    /// Consumes the discovery result into independently owned canonical paths.
+    /// Shared catalogs copy the paths; the last catalog owner moves them out.
+    pub fn into_payload_paths(self) -> Vec<PathBuf> {
+        match Arc::try_unwrap(self.catalog) {
+            Ok(catalog) => catalog.payload_paths,
+            Err(catalog) => catalog.payload_paths.clone(),
+        }
+    }
+
+    /// Returns indexed tensor-to-canonical-shard mappings.
+    ///
+    /// `None` denotes a direct file or an unindexed `model.safetensors` file.
+    pub fn tensor_locations(&self) -> Option<&BTreeMap<String, PathBuf>> {
+        self.catalog.tensor_locations.as_ref()
+    }
+}
+
+impl ShardCatalog {
+    fn admit(
+        mut self,
+        limits: SafetensorsDiscoveryLimits,
+    ) -> Result<SafetensorsShards, SafetensorsShardError> {
         let mut expected = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         if let Some(locations) = &self.tensor_locations {
             for (key, path) in locations {
@@ -197,60 +248,23 @@ impl SafetensorsShards {
             }
         }
         for path in &self.payload_paths {
-            let shard =
-                AdmittedShard::new(path, expected.remove(path), self.limits.max_header_bytes)
-                    .map_err(|error| malformed_shard(path, error.to_string()))?;
+            let shard = AdmittedShard::new(path, expected.remove(path), limits.max_header_bytes)
+                .map_err(|error| malformed_shard(path, error.to_string()))?;
             self.admissions.insert(path.clone(), Arc::new(shard));
         }
-        Ok(self)
-    }
-
-    /// Input limits retained by this admitted shard set.
-    pub const fn limits(&self) -> SafetensorsDiscoveryLimits {
-        self.limits
-    }
-
-    pub(crate) fn recipe_cache(&self) -> &crate::recipe::RecipeInferenceCache {
-        &self.recipes
-    }
-
-    pub(crate) fn admission(&self, path: &Path) -> &Arc<AdmittedShard> {
-        &self.admissions[path]
-    }
-
-    /// Returns the canonical, deterministically ordered payload paths.
-    pub fn payload_paths(&self) -> &[PathBuf] {
-        &self.payload_paths
-    }
-
-    /// Returns location-independent logical shard roles paired with admitted paths.
-    ///
-    /// Indexed artifacts retain the relative member names from the admitted
-    /// index even when snapshot symlinks resolve outside the submitted
-    /// directory. Direct artifacts use the stable semantic role `weights`.
-    pub fn logical_payload_paths(&self) -> &BTreeMap<String, PathBuf> {
-        &self.logical_payload_paths
-    }
-
-    /// Consumes the discovery result into canonical payload paths.
-    pub fn into_payload_paths(self) -> Vec<PathBuf> {
-        self.payload_paths
-    }
-
-    /// Returns indexed tensor-to-canonical-shard mappings.
-    ///
-    /// `None` denotes a direct file or an unindexed `model.safetensors` file.
-    pub fn tensor_locations(&self) -> Option<&BTreeMap<String, PathBuf>> {
-        self.tensor_locations.as_ref()
+        Ok(SafetensorsShards {
+            catalog: Arc::new(self),
+            limits,
+        })
     }
 }
 
 // Memoization is not part of the value's catalog identity.
 impl PartialEq for SafetensorsShards {
     fn eq(&self, other: &Self) -> bool {
-        self.payload_paths == other.payload_paths
-            && self.logical_payload_paths == other.logical_payload_paths
-            && self.tensor_locations == other.tensor_locations
+        self.catalog.payload_paths == other.catalog.payload_paths
+            && self.catalog.logical_payload_paths == other.catalog.logical_payload_paths
+            && self.catalog.tensor_locations == other.catalog.tensor_locations
             && self.limits == other.limits
     }
 }
@@ -354,7 +368,7 @@ impl SafetensorsCatalog for SafetensorsMetadataCatalog {
 
 impl RecipeCatalog for SafetensorsMetadataCatalog {
     fn recipe_cache(&self) -> Option<&crate::recipe::RecipeInferenceCache> {
-        Some(&self.shards.recipes)
+        Some(self.shards.recipe_cache())
     }
 
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
@@ -957,3 +971,6 @@ pub use header::{SafetensorsHeaderError, SafetensorsHeaderPlan};
 
 #[cfg(test)]
 mod limits_tests;
+
+#[cfg(test)]
+mod shared_catalog_tests;

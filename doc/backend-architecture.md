@@ -892,6 +892,11 @@ length check. Header limits are checked before allocating or reading the JSON
 body and remain attached to shared shard admissions. Indexed stores still read
 headers only on demand; strict discovery validates every shard. These are input
 limits, separate from decoded-metadata estimates and lifetime admission.
+Shard-set clones share one immutable catalog containing canonical paths, tensor
+locations and admission handles. A shared clone allocates no new path maps or
+strings. Owned path export moves the catalog's vector when uniquely owned and
+copies it when aliases remain. Header admissions and leased file/payload owners
+keep their own lifetimes after the last catalog map owner retires.
 
 File-backed encoded reads have a sized constructor over already retained shard
 headers. Ordinary reads perform their lazy header preparation before using that
