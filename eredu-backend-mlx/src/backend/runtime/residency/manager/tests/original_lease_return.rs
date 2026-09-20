@@ -17,35 +17,52 @@ pub(crate) struct LeaseReturnFixture {
     _directory: tempfile::TempDir,
 }
 impl LeaseReturnFixture {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(pool: &eredu_runtime::working_memory::WorkingMemoryPool) -> Self {
         let (directory, source) = fixture_store();
+        let ids = [id("first"), id("second")];
+        let graph = eredu_runtime::ExecutionGraph::new(
+            vec![eredu_runtime::ExecutionGroupSpec::root("only")],
+            "only",
+        )
+        .unwrap();
+        let layout = eredu_runtime::execution::ExecutionUnitLayout::new(&graph, [2]).unwrap();
         let make = || {
             let source_stream = cpu_stream();
             let device_stream = cpu_stream();
             let native_runtime =
                 safemlx::PrefillRootsRuntime::prepare_for_stream(&device_stream, &source_stream)
                     .unwrap();
-            let manager = ResidencyManager::new(
-                Arc::clone(&source),
-                OffloadPlan::new(
-                    OffloadConfig::new(Some(16), Some(fixture_host_capacity(2)), 1).unwrap(),
-                    [
-                        spec("first", 8, ResidencyPolicy::Cacheable, MemoryTier::Host),
-                        spec("second", 8, ResidencyPolicy::Cacheable, MemoryTier::Host),
-                    ],
-                )
-                .unwrap(),
-                [single("first", "a"), single("second", "b")],
-                source_stream,
-                device_stream,
+            let plan = OffloadPlan::new(
+                OffloadConfig::new(Some(16), Some(fixture_host_capacity(2)), 1).unwrap(),
+                [
+                    spec("first", 8, ResidencyPolicy::Cacheable, MemoryTier::Host),
+                    spec("second", 8, ResidencyPolicy::Cacheable, MemoryTier::Host),
+                ],
             )
             .unwrap();
-            manager.initialize().unwrap();
+            let manager = ResidencyManager::prepare_original_host(
+                source.clone().into(),
+                BTreeMap::new(),
+                &plan,
+                &[single("first", "a"), single("second", "b")],
+                &["only".into()],
+                &ids,
+                &layout,
+                2,
+                &std::collections::BTreeSet::new(),
+                None,
+                &source_stream,
+                &device_stream,
+                pool,
+            )
+            .unwrap()
+            .expect("admitted immutable host sources for both requested units");
+            manager.inner.validate_pool(pool).unwrap();
             (manager, native_runtime)
         };
         let (manager, native_runtime) = make();
         let (foreign, foreign_runtime) = make();
-        let aliases = AliasClosureFixture::new(source);
+        let aliases = AliasClosureFixture::new(source, pool);
         Self {
             manager,
             foreign,
@@ -137,6 +154,7 @@ impl LeaseReturnFixture {
             .prepare_source_acquisitions(&roots, &mut scratch, controls.clone())
             .unwrap();
         let before = self.pin_counts(observer);
+        let _graph = (refusal == 0).then(|| copy_bank(observer, 2, 2));
         let result = manager.acquire_many_with_original_transfer(
             &requests,
             MemoryTier::Device,
@@ -455,9 +473,42 @@ fn bank<S>(count: usize, mut make: impl FnMut() -> S) -> PreparedOperationBank<S
     PreparedOperationBank::try_new(count, |_| Ok::<_, std::convert::Infallible>(make())).unwrap()
 }
 
+fn copy_bank(
+    observer: &OriginalScopeObserver,
+    copies: usize,
+    bindings: usize,
+) -> safemlx::PreparedResidentGraph {
+    use safemlx::{OperationEvalTraversalLimits, OperationEvent};
+    // Each physical source constructs one leaf and one copy; each published
+    // binding can clone one native handle. The same admitted Graph/Record
+    // quotas cover the copy frontiers and the final alias-expanded aggregate.
+    let layout =
+        OperationEvent::resident_graph_layout_with_shells(copies, copies, 1, 4, bindings)
+            .unwrap();
+    let roots = bindings.max(2);
+    let traversal = OperationEvent::eval_traversal_layout(OperationEvalTraversalLimits {
+        roots,
+        arrays: roots + 1,
+        tape_entries: 2,
+        input_edges: roots,
+        output_slots: 2,
+        streams: 1,
+        captures: OperationEvent::eval_record_layout(2, 1, 2)
+            .unwrap()
+            .capture_slots(),
+    })
+    .unwrap();
+    let mut graph = OperationEvent::prepare_resident_graph(layout, observer).unwrap();
+    graph
+        .configure_nested_completions(&traversal, copies + 1)
+        .unwrap();
+    graph
+}
+
 // The actual admitted fixture invokes this under the same genuine controls and
 // observer as the miss/warm lease test. Its manager and ordinary reference are
 // built before the original role, including all host source materialization.
+// The original manager admits its immutable host sources through the same pool.
 struct AliasClosureFixture {
     manager: ResidencyManager,
     _native_runtime: safemlx::PrefillRootsRuntime,
@@ -465,55 +516,91 @@ struct AliasClosureFixture {
     expected: [[i32; 2]; 4],
 }
 impl AliasClosureFixture {
-    fn new(source: Arc<SafetensorsWeightStore>) -> Self {
-        let build = || {
+    fn new(
+        source: Arc<SafetensorsWeightStore>,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    ) -> Self {
+        let graph = eredu_runtime::ExecutionGraph::new(
+            vec![eredu_runtime::ExecutionGroupSpec::root("only")],
+            "only",
+        )
+        .unwrap();
+        let layout = eredu_runtime::execution::ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        let build = |original| {
             let source_stream = cpu_stream();
             let device_stream = cpu_stream();
             let runtime =
                 safemlx::PrefillRootsRuntime::prepare_for_stream(&device_stream, &source_stream)
                     .unwrap();
-            let manager = ResidencyManager::new(
-                source.clone(),
-                OffloadPlan::new(
-                    OffloadConfig::new(Some(16), Some(fixture_host_capacity(2)), 1).unwrap(),
-                    [
-                        spec("first", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
-                        spec("second", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
-                    ],
-                )
-                .unwrap(),
+            let tier = if original {
+                MemoryTier::Host
+            } else {
+                MemoryTier::Disk
+            };
+            let plan = OffloadPlan::new(
+                OffloadConfig::new(Some(16), Some(fixture_host_capacity(2)), 1).unwrap(),
                 [
-                    unit(
-                        "first",
-                        [
-                            binding("own_a", "a", TensorSelection::Full, 8)
-                                .with_logical_target("first.owner")
-                                .unwrap(),
-                            WeightBinding::alias("other_b", "second.owner", 8).unwrap(),
-                        ],
-                    ),
-                    unit(
-                        "second",
-                        [
-                            binding("own_b", "b", TensorSelection::Full, 8)
-                                .with_logical_target("second.owner")
-                                .unwrap(),
-                            WeightBinding::alias("other_a", "first.owner", 8).unwrap(),
-                        ],
-                    ),
+                    spec("first", 8, ResidencyPolicy::Cacheable, tier),
+                    spec("second", 8, ResidencyPolicy::Cacheable, tier),
                 ],
-                source_stream,
-                device_stream,
             )
             .unwrap();
-            manager.initialize().unwrap();
+            let units = [
+                unit(
+                    "first",
+                    [
+                        binding("own_a", "a", TensorSelection::Full, 8)
+                            .with_logical_target("first.owner")
+                            .unwrap(),
+                        WeightBinding::alias("other_b", "second.owner", 8).unwrap(),
+                    ],
+                ),
+                unit(
+                    "second",
+                    [
+                        binding("own_b", "b", TensorSelection::Full, 8)
+                            .with_logical_target("second.owner")
+                            .unwrap(),
+                        WeightBinding::alias("other_a", "first.owner", 8).unwrap(),
+                    ],
+                ),
+            ];
+            let manager = if original {
+                ResidencyManager::prepare_original_host(
+                    source.clone().into(),
+                    BTreeMap::new(),
+                    &plan,
+                    &units,
+                    &["only".into()],
+                    &[id("first")],
+                    &layout,
+                    1,
+                    &std::collections::BTreeSet::new(),
+                    None,
+                    &source_stream,
+                    &device_stream,
+                    pool,
+                )
+                .unwrap()
+                .expect("admitted immutable host sources for the alias closure")
+            } else {
+                let manager = ResidencyManager::new(
+                    source.clone(), plan, units, source_stream, device_stream,
+                )
+                .unwrap();
+                manager.initialize().unwrap();
+                manager
+            };
+            if original {
+                manager.inner.validate_pool(pool).unwrap();
+            }
             let host = manager.acquire(&id("first"), MemoryTier::Host).unwrap();
             assert_eq!(host_i32(&host, "own_a"), [1, 2]);
             assert_eq!(host_i32(&host, "other_b"), [3, 4]);
             drop(host);
             (manager, runtime)
         };
-        let (ordinary, ordinary_runtime) = build();
+        let (ordinary, ordinary_runtime) = build(false);
         let mut reference = ordinary
             .acquire_many_with_transfer(&[(id("first"), 1)], MemoryTier::Device)
             .unwrap();
@@ -523,13 +610,7 @@ impl AliasClosureFixture {
         drop(reference);
         drop(ordinary);
         drop(ordinary_runtime);
-        let (manager, runtime) = build();
-        let graph = eredu_runtime::ExecutionGraph::new(
-            vec![eredu_runtime::ExecutionGroupSpec::root("only")],
-            "only",
-        )
-        .unwrap();
-        let layout = eredu_runtime::execution::ExecutionUnitLayout::new(&graph, [1]).unwrap();
+        let (manager, runtime) = build(true);
         let source = manager
             .prepare_original_operation_source(&[id("first")], &layout, 1)
             .unwrap();
@@ -638,6 +719,7 @@ impl AliasClosureFixture {
                 .manager
                 .prepare_source_acquisitions(&roots, &mut scratch, controls.clone())
                 .unwrap();
+            let _graph = copy_bank(observer, self.window.physical_bindings, self.window.bindings);
             let mut transfer = self
                 .manager
                 .acquire_many_with_original_transfer(

@@ -1024,6 +1024,7 @@ fn with_prepared_original_operation_reservation<T>(
 
 #[test]
 fn original_residency_capacity_retry_preserves_cause_and_source_retirement() {
+    let _pool = crate::tests::support::test_utils::initialize_original_sources();
     // These are the actual manager streams. Prepare their persistent workers
     // before the genuine Source role; a Stream constructor alone is not enough.
     let cpu = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);
@@ -1031,7 +1032,7 @@ fn original_residency_capacity_retry_preserves_cause_and_source_retirement() {
     let device_stream = safemlx::Stream::new_with_device(&cpu);
     let native_runtime =
         safemlx::PrefillRootsRuntime::prepare_for_stream(&device_stream, &source_stream).unwrap();
-    with_original_operation_controls(|controls, observer| {
+    with_registered_original_operation_controls(|controls, observer, _pool| {
         crate::backend::runtime::residency::manager::exercise_original_capacity_retry(
             controls,
             observer,
@@ -1156,7 +1157,7 @@ fn original_lease_return_moves_prepared_ids_on_miss_and_warm_and_keeps_request_c
     let mut second_fixture = OriginalOperationFixture::prepare(true);
     let baseline = pool.used_bytes().unwrap();
     let baseline_unquoted = pool.unquoted_owner_count().unwrap();
-    let leases = crate::backend::runtime::residency::manager::LeaseReturnFixture::new();
+    let leases = crate::backend::runtime::residency::manager::LeaseReturnFixture::new(&pool);
     let (first, old_pool) = with_prepared_original_operation_controls(
         None,
         &mut first_fixture,
