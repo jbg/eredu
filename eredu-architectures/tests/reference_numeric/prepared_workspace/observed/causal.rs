@@ -369,6 +369,18 @@ fn cold_rebind_checks_causal_declarations_even_when_group_and_unit_paths_match()
     ));
 }
 
+// Dense row collectors receive ordinary tensor callbacks. Sparse declarations
+// use the routed-unit observer and its flattened token coordinates, exercised
+// by the routed_units conformance fixtures.
+fn tensor_row_declarations(
+    declarations: Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+) -> Vec<eredu_runtime::layered::PrefillObservationDeclaration> {
+    declarations
+        .into_iter()
+        .filter(|declaration| !declaration.flattens_batch_tokens())
+        .collect()
+}
+
 #[derive(Default)]
 struct Rows(BTreeMap<String, NumericTensor>);
 impl ActivationObserver<NumericTensor, Error> for Rows {

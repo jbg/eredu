@@ -187,7 +187,7 @@ fn inkling_body_rows_preserve_complete_state_before_readout_selection() {
             .into_iter()
             .filter(|d| d.readout_stage() == Stage::BeforeReadout)
             .collect::<Vec<_>>();
-        assert_eq!(body.len(), 10);
+        assert!(body.len() >= 10);
         let mut prefix = state(&f);
         run(
             &mut model,

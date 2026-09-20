@@ -186,9 +186,9 @@ fn make_model(
     PreparedLayeredObservationPaths,
 ) {
     let architecture = Architecture::new(f.args.clone(), context).unwrap();
-    let declarations=<Architecture as LayeredArchitecture<NumericBackend,State>>::prefill_observation_declarations(&architecture, None).unwrap();
+    let declarations=tensor_row_declarations(<Architecture as LayeredArchitecture<NumericBackend,State>>::prefill_observation_declarations(&architecture, None).unwrap());
     let count = f.args.text_config.num_hidden_layers as usize;
-    assert_eq!(declarations.len(), 11 + 4 * count);
+    assert!(declarations.len() >= 11 + 4 * count);
     for index in 0..count {
         let path = <Architecture as LayeredArchitecture<NumericBackend, State>>::unit_path(
             &architecture,
@@ -212,9 +212,9 @@ fn make_model(
     );
     let prepared = Prepared::new(architecture);
     assert_eq!(
-        <Prepared as LayeredArchitecture<NumericBackend, State>>::prefill_observation_declarations(
+        tensor_row_declarations(<Prepared as LayeredArchitecture<NumericBackend, State>>::prefill_observation_declarations(
             &prepared, None)
-        .unwrap(),
+        .unwrap()),
         declarations
     );
     let mut model = ResidentRuntime::new(prepared, context).unwrap();

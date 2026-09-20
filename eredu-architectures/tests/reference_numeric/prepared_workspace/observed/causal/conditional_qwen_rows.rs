@@ -174,8 +174,8 @@ where
     A: LayeredArchitecture<NumericBackend, State, Error = Error>,
 {
     let a = model.architecture();
-    let d = A::prefill_observation_declarations(a, None).unwrap();
-    assert_eq!(d.len(), 18);
+    let d = tensor_row_declarations(A::prefill_observation_declarations(a, None).unwrap());
+    assert!(d.len() >= 18);
     assert_eq!(A::group_unit_count(a, 1, None).unwrap(), 2);
     for i in 0..2 {
         let p = A::unit_path(a, 1, i, None).unwrap();

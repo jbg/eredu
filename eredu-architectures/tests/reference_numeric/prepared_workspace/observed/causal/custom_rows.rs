@@ -94,8 +94,8 @@ where
     let vocabulary = args.vocabulary_size();
     let context = NumericContext::default();
     let architecture = CustomModel::<C, P>::new(args, &context).unwrap();
-    let declarations = <CustomModel<C, P> as LayeredArchitecture<NumericBackend, CustomState>>::
-        prefill_observation_declarations(&architecture, None).unwrap();
+    let declarations = tensor_row_declarations(<CustomModel<C, P> as LayeredArchitecture<NumericBackend, CustomState>>::
+        prefill_observation_declarations(&architecture, None).unwrap());
     let mut model = ResidentRuntime::new(architecture, &context).unwrap();
     let paths = model.prepare_observation_paths().unwrap();
     for declaration in &declarations {
@@ -387,7 +387,7 @@ where
     );
     let context = NumericContext::default();
     let architecture = CustomModel::<C, P>::new(args, &context).unwrap();
-    let declarations = <CustomModel<C, P> as LayeredArchitecture<NumericBackend, CustomState>>::prefill_observation_declarations(&architecture, None).unwrap();
+    let declarations = tensor_row_declarations(<CustomModel<C, P> as LayeredArchitecture<NumericBackend, CustomState>>::prefill_observation_declarations(&architecture, None).unwrap());
     let runtime =
         ResidentRuntime::<_, NumericBackend, CustomState>::new(architecture, &context).unwrap();
     let paths = runtime.prepare_observation_paths().unwrap();

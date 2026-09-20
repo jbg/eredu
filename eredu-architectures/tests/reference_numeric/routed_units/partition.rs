@@ -123,7 +123,7 @@ impl Observe {
         coordinates
     }
     fn collect(&mut self, batch: &RoutedUnitBatch<'_, NumericTensor>, effective: bool) {
-        if self.topology.is_some() {
+        {
             let (rows, end) = self
                 .active
                 .as_mut()
@@ -179,7 +179,7 @@ impl RoutedUnitObserver<NumericTensor> for Observe {
         &mut self,
         invocation: &eredu_runtime::RoutedUnitInvocation<'_, NumericTensor>,
     ) -> Result<(), Error> {
-        let topology = self.topology.expect("partition provider lifecycle");
+        let peers = self.topology.map_or(1, |rank| rank.expert_parallel_size());
         if let Some(retained) = &self.retained {
             let declared = retained
                 .routed_observation(&format!("{}.units", self.path))
@@ -193,7 +193,7 @@ impl RoutedUnitObserver<NumericTensor> for Observe {
             );
             assert_eq!(
                 ownership.source_peers,
-                topology.expert_parallel_size() as u64
+                peers as u64
             );
             if let Some(units) = invocation.unit_coordinates {
                 assert_eq!(units, ownership.coordinates.units());
@@ -204,16 +204,16 @@ impl RoutedUnitObserver<NumericTensor> for Observe {
             .iter()
             .map(|n| *n as usize)
             .product();
-        if topology.expert_parallel_size() > 1 {
+        if peers > 1 {
             let origins = invocation.origins.expect("actual received tags");
             assert_eq!(origins.capture_coordinates().row_count(), rows);
             assert_eq!(
                 origins.capture_coordinates().peer_count(),
-                topology.expert_parallel_size()
+                peers
             );
         } else {
             assert!(invocation.origins.is_none());
-            assert!(invocation.unit_coordinates.is_some());
+            assert_eq!(invocation.unit_coordinates.is_some(), self.topology.is_some());
             assert_eq!(rows, self.source_tokens);
         }
         assert!(

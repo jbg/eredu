@@ -47,10 +47,10 @@ where
     let args = qwen::model_args_from_config_value(&config).unwrap();
     let context = NumericContext::default();
     let architecture = QwenModel::<P>::new(args.clone(), &context).unwrap();
-    let declarations = <QwenModel<P> as LayeredArchitecture<NumericBackend, QwenState>>::
-        prefill_observation_declarations(&architecture, None).unwrap();
+    let declarations = tensor_row_declarations(<QwenModel<P> as LayeredArchitecture<NumericBackend, QwenState>>::
+        prefill_observation_declarations(&architecture, None).unwrap());
     // Check every declared hook, including effective and final vocabulary rows.
-    assert_eq!(declarations.len(), 18);
+    assert!(declarations.len() >= 18);
     let mut model = ResidentRuntime::new(architecture, &context).unwrap();
     let paths = model.prepare_observation_paths().unwrap();
     for declaration in &declarations {

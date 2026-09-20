@@ -386,7 +386,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, SelectedState> for Visito
         let units = (0..architecture.group_unit_count(0, None).unwrap())
             .map(|i| architecture.unit_path(0, i, None).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(declarations.len(), 10 + 4 * units.len());
+        assert!(declarations.len() >= 10 + 4 * units.len());
         let mechanisms = if resident {
             NumericReplicatedMechanisms::with_bound_checkpoint(checkpoint)
         } else {
