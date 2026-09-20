@@ -786,6 +786,14 @@ its source account stays with the same completion/recovery owner after the slot
 wrapper is dropped. Request-funded slots retain their text control guard through
 that same driver. Input capacity is checked before source production, and input
 aliases move directly into the final prepared vector without a temporary vector.
+Cold native invocations admit their selected graph, record, physical-buffer and
+recovery storage through the source pool before creating native owners. They use
+the shared native-role completion driver with that source custody, including on
+callback failure and deferred retirement. An admission rejection retains the
+uncalled invocation; escaped native outputs retain their original accounts.
+Runtime initialization, streams, retained read metadata and dynamic result
+storage remain separately funded prerequisites. A cold root rejects an existing
+original scope; nested work requires the explicit parent relation.
 Stream qualification includes CPU MXFP4's composed quantizer payloads: floating
 codebook distances, reduction/index values, scale intermediates, constants and
 a possible input compaction. Sizing sums potential destinations without assuming

@@ -1,12 +1,14 @@
 use super::*;
+use crate::backend::error::Error;
 use crate::backend::runtime::checkpoint::{
-    bounded_quantization::{BoundedQuantizationTarget, submit_original_affine_tile},
+    bounded_quantization::{submit_original_affine_tile, BoundedQuantizationTarget},
     store::{CheckpointMaterializationError, PreparedEncodedInputPlan, WeightMaterialization},
 };
+use crate::backend::submission_recovery::native_role::{cold, NativeRoleCapacity};
 use eredu_checkpoint::{
-    AffineQuantization,
     recipe::{DerivedWeightRecipe, RecipeDtype},
     store::{MemoryWeightStore, TensorSelection},
+    AffineQuantization,
 };
 use safemlx::{
     CpuAffineQuantizeSubmissionLayout, Device, DeviceType, Dtype, OperationEvent,
@@ -170,13 +172,21 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
         PreparedEncodedInputPlan::new(&read, &runtime, &[2, 64], Dtype::Float32).unwrap();
     let input_bytes = input_plan.required_bytes().unwrap();
     let slot_bytes = ColdMaterializationSlot::required_bytes(shape(1)).unwrap();
-    let pool = WorkingMemoryPool::new(input_bytes + slot_bytes, 0).unwrap();
-    let mut slot = ColdMaterializationSlot::prepare(&pool, shape(1)).unwrap();
+    let pool_cell = std::cell::OnceCell::<WorkingMemoryPool>::new();
+    let role_bytes = std::cell::Cell::new(0);
     let target = BoundedQuantizationTarget::direct("weight", "scales", Some("biases"))
         .unwrap()
         .with_affine_companion_dtype(RecipeDtype::F16)
         .unwrap();
-    with_scope(layout, &runtime, |observer| {
+    let capacity = NativeRoleCapacity {
+        graph: layout.graph_capacity(),
+        records: layout.record_capacity(),
+        backing: layout.physical_capacity(&runtime).unwrap(),
+    };
+    let plan = cold::Plan::new(&runtime, capacity, None, (), |_, context| {
+        let pool = pool_cell.get().unwrap();
+        let observer = context.observer();
+        let mut slot = ColdMaterializationSlot::prepare(pool, shape(1)).unwrap();
         let ready = slot.take(&pool).unwrap();
         drop(slot);
         let mut owner = WeightMaterialization::prepare_original_slot(ready, observer).unwrap();
@@ -187,7 +197,10 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
             .retain_input(input.output().try_prepared_source_array().unwrap())
             .unwrap();
         drop(input);
-        assert_eq!(pool.used_bytes().unwrap(), input_bytes + slot_bytes);
+        assert_eq!(
+            pool.used_bytes().unwrap(),
+            role_bytes.get() + input_bytes + slot_bytes
+        );
         assert_eq!(owner.inputs().as_ptr(), pointer);
         let owner = submit_original_affine_tile(
             owner,
@@ -220,9 +233,25 @@ fn cold_slot_runs_encoded_affine_conversion_without_a_text_request() {
         }
         assert!(outputs.next().is_none());
         drop((outputs, weights));
-        owner.finish().unwrap();
+        Ok(Ok::<_, Error>(owner))
     });
-    crate::backend::submission_recovery::wait_for_retirement(|| pool.used_bytes() == Ok(0));
+    role_bytes.set(plan.required_bytes().unwrap());
+    pool_cell
+        .set(WorkingMemoryPool::new(role_bytes.get() + input_bytes + slot_bytes, 0).unwrap())
+        .unwrap();
+    let pool = pool_cell.get().unwrap();
+    let owner = plan.execute(pool).unwrap().unwrap();
+    // Completed outputs escape the role constructor. Their native owners and
+    // input aliases still retain both source accounts and the physical budget.
+    assert_eq!(
+        pool.used_bytes().unwrap(),
+        role_bytes.get() + input_bytes + slot_bytes
+    );
+    owner.finish().unwrap();
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        safemlx::reclaim_allocation_owners();
+        pool.used_bytes() == Ok(0)
+    });
     assert_eq!(pool.used_bytes().unwrap(), 0);
 }
 

@@ -13,6 +13,7 @@ use safemlx::{
 use std::mem::{size_of, size_of_val};
 
 pub(crate) mod realtime;
+pub(crate) mod cold;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct NativeRoleCapacity {
@@ -145,13 +146,15 @@ pub(crate) fn callback_control_bytes<T,E>(callback_bytes:usize)->Option<usize> {
     sum_controls(&[callback_bytes,size_of::<T>(),size_of::<E>(),size_of::<Result<T,E>>(),
         size_of::<Result<Result<T,E>,eredu_core::BackendFailure>>()])
 }
-/// Both variants borrow an already accepted native backing owner. The
+/// Each variant supplies an already accepted native backing owner. The
 /// prepared variant additionally carries its exact current enclosing scope.
 enum RoleBudget<'a> {
     Text(&'a BankOwner,&'a OriginalTextControlGuard),
     Prepared(&'a OriginalBufferBudget,&'a OriginalScopeObserver),
     // Constructed only by realtime::run from its consumed accepted frame claim.
     Realtime(OriginalBufferBudget),
+    // Constructed only after cold::Plan's actual source-account comparison.
+    Cold(OriginalBufferBudget),
 }
 impl RoleBudget<'_> {
     fn borrow(&self)->Result<OriginalBufferBudget,Error> {
@@ -160,7 +163,7 @@ impl RoleBudget<'_> {
                 let bank=bank.try_borrow().map_err(|_|Error::PrefillScopeReentrant)?;
                 bank.budget_for_controls(controls).cloned().map_err(Error::PrefillControl)
             }
-            Self::Realtime(budget)=>Ok(budget.clone()),
+            Self::Realtime(budget)|Self::Cold(budget)=>Ok(budget.clone()),
             Self::Prepared(budget,parent)=>{
                 if !parent.same_scope(&OriginalScopeObserver::require_current()?) {
                     return Err(parent.domain_error().into());
