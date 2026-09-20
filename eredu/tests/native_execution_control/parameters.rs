@@ -57,6 +57,7 @@ pub(super) fn verify_native_projections<B: ParameterBackend>(
     }
 }
 
+#[track_caller]
 pub(super) fn parameter_logits<
     B: eredu_runtime::execution_control::TextSnapshotBackend
         + eredu_runtime::execution_control::TextSamplingControlBackend
@@ -72,6 +73,7 @@ pub(super) fn parameter_logits<
     parameter_logits_mode(model, prefix, false)
 }
 
+#[track_caller]
 pub(super) fn parameter_logits_mode<
     B: eredu_runtime::execution_control::TextSnapshotBackend
         + eredu_runtime::execution_control::TextSamplingControlBackend
@@ -329,14 +331,11 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
             .into_parts();
     let prefix = [1, 2, 5, 7];
     let other = [7, 5, 2, 1];
-    let baseline = parameter_logits(&mut model, &prefix).0;
-    let other_baseline = parameter_logits(&mut model, &other).0;
     // Independent experimental owners can share the same source artifact.
     let (mut peer, _) =
         LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &root.0, &execution)
             .unwrap()
             .into_parts();
-    assert_eq!(parameter_logits_mode(&mut peer, &prefix, true).0, baseline);
     let peer_facts = peer.parameter_discovery().unwrap();
     let facts = model.parameter_discovery().unwrap();
     let limits = CaptureUsage {
@@ -345,7 +344,6 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
         host_bytes: 16 << 20,
         encoded_bytes: 16 << 20,
     };
-    verify_native_projections(&mut model, limits);
     let specs = [
         ("self_attn.q_proj.weight", false),
         ("self_attn.k_proj.weight", false),
@@ -388,6 +386,29 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
             }
         })
         .collect();
+    // Load every independent owner before inference retains funded cache storage.
+    edit_reference(&reference.0, &edits);
+    let (mut oracle, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &reference.0, &execution)
+            .unwrap()
+            .into_parts();
+    let overflow_fixture = fixture(false);
+    let mut overflowing = edits[1].clone();
+    overflowing.update = ParameterUpdate::Replace {
+        values: vec![f32::MAX; overflowing.update.values().len()],
+    };
+    edit_reference(&overflow_fixture.0, &[overflowing.clone()]);
+    let (mut overflow_model, _) = LoadedModel::load_execution_plan(
+        &MlxBackendFactory::default(),
+        &overflow_fixture.0,
+        &execution,
+    )
+    .unwrap()
+    .into_parts();
+    let baseline = parameter_logits(&mut model, &prefix).0;
+    let other_baseline = parameter_logits(&mut model, &other).0;
+    assert_eq!(parameter_logits_mode(&mut peer, &prefix, true).0, baseline);
+    verify_native_projections(&mut model, limits);
     let before = model
         .query_parameter(
             &facts.identity,
@@ -460,11 +481,6 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
     assert_ne!(modified, baseline);
     assert_ne!(other_modified, other_baseline);
     assert_ne!(modified, other_modified);
-    edit_reference(&reference.0, &edits);
-    let (mut oracle, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &reference.0, &execution)
-            .unwrap()
-            .into_parts();
     assert_eq!(modified, parameter_logits(&mut oracle, &prefix).0);
     assert_eq!(other_modified, parameter_logits(&mut oracle, &other).0);
     let restored = model.remove_parameter_overlay(&active.identity).unwrap();
@@ -480,19 +496,6 @@ fn native_parameter_overlays_are_atomic_input_dependent_and_reversible() {
 
     // Completed native validation rejects the second candidate without publishing
     // the first, fencing a healthy session, or refunding the completed work.
-    let overflow_fixture = fixture(false);
-    let mut overflowing = edits[1].clone();
-    overflowing.update = ParameterUpdate::Replace {
-        values: vec![f32::MAX; overflowing.update.values().len()],
-    };
-    edit_reference(&overflow_fixture.0, &[overflowing.clone()]);
-    let (mut overflow_model, _) = LoadedModel::load_execution_plan(
-        &MlxBackendFactory::default(),
-        &overflow_fixture.0,
-        &execution,
-    )
-    .unwrap()
-    .into_parts();
     let overflow_facts = overflow_model.parameter_discovery().unwrap();
     let before = overflow_model
         .query_parameter(
@@ -599,12 +602,7 @@ pub(super) fn verify_shared_parameter_edits(residency: eredu_core::ResidencyPlan
             .unwrap()
             .values
     };
-    assert_eq!(
-        query(&mut model, &first.id),
-        query(&mut model, &repeated.id)
-    );
     let prefix = [1, 2, 5, 7];
-    let baseline = parameter_logits(&mut model, &prefix).0;
     let edit = ParameterEdit {
         id: "shared-write".into(),
         parameter: first.id.clone(),
@@ -617,6 +615,16 @@ pub(super) fn verify_shared_parameter_edits(residency: eredu_core::ResidencyPlan
         },
         region: region.clone(),
     };
+    edit_reference(&reference.0, &[edit.clone()]);
+    let (mut expected, _) =
+        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &reference.0, &execution)
+            .unwrap()
+            .into_parts();
+    assert_eq!(
+        query(&mut model, &first.id),
+        query(&mut model, &repeated.id)
+    );
+    let baseline = parameter_logits(&mut model, &prefix).0;
     let plan = ParameterOverlayPlan {
         schema_version: PARAMETER_SCHEMA_VERSION,
         base_identity: facts.identity.clone(),
@@ -643,11 +651,6 @@ pub(super) fn verify_shared_parameter_edits(residency: eredu_core::ResidencyPlan
         .unwrap()
         .values;
     assert_eq!(one, two);
-    edit_reference(&reference.0, &[edit]);
-    let (mut expected, _) =
-        LoadedModel::load_execution_plan(&MlxBackendFactory::default(), &reference.0, &execution)
-            .unwrap()
-            .into_parts();
     let changed = parameter_logits_mode(&mut model, &prefix, true).0;
     assert_ne!(changed, baseline);
     assert_eq!(changed, parameter_logits(&mut expected, &prefix).0);
