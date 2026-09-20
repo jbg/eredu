@@ -667,6 +667,8 @@ pub use bulk::{
     DetachedEncodedReadPlan, DetachedEncodedReadSlice, DetachedEncodedReads,
     DetachedReadBuildCause, DetachedReadBuildError, DetachedReadFailure, EncodedReadBatch,
     EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout,
+    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError,
+    PreparedMemoryEncodedRead,
 };
 
 /// Opens one exact admitted SafeTensors source and applies its retained resolution.

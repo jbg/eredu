@@ -1,5 +1,10 @@
 //! Exact immutable memory bytes in the same encoded destination worker.
 use super::*;
+mod plan;
+pub use plan::{
+    MemoryEncodedReadBuildError, MemoryEncodedReadPlan, MemoryEncodedReadPlanError,
+    PreparedMemoryEncodedRead,
+};
 #[derive(Clone)]
 pub(super) struct ReadMemory {
     pub(super) tensor: storage::SourceHandle<MemoryTensor>,
@@ -63,46 +68,14 @@ pub(in crate::store) fn prepare(
     store: &MemoryWeightStore,
     keys: &[String],
 ) -> Result<EncodedReadBatch, StoreError> {
-    let mut batch = EncodedReadBatch {
-        tensors: Vec::with_capacity(keys.len()),
-        shards: Vec::new(),
-        memory: Vec::with_capacity(keys.len()),
-        byte_len: 0,
-        telemetry: None,
-        cache: None,
-    };
-    for key in keys {
-        let tensor = store
-            .tensors
-            .get(key)
-            .ok_or_else(|| StoreError::UnknownTensor { key: key.clone() })?;
-        let length = usize::try_from(tensor.metadata.encoded_byte_len).map_err(|_| {
-            StoreError::Overflow {
-                context: "memory encoded source length".into(),
-            }
-        })?;
-        if length != tensor.bytes.len() {
-            return Err(StoreError::Internal(
-                "memory encoded source geometry differs".into(),
-            ));
-        }
-        let end = batch
-            .byte_len
-            .checked_add(length)
-            .ok_or_else(|| StoreError::Overflow {
-                context: "memory encoded destination".into(),
-            })?;
-        batch.memory.push(ReadMemory {
-            tensor: tensor.clone(),
-            spans: vec![ReadSpan {
-                source: 0..tensor.metadata.encoded_byte_len,
-                destination: batch.byte_len..end,
-            }],
-        });
-        batch.tensors.push(tensor.metadata.clone());
-        batch.byte_len = end;
-    }
-    Ok(batch)
+    let plan =
+        MemoryEncodedReadPlan::new(store, keys).map_err(|error| error.into_ordinary(keys))?;
+    let prepared = plan.construct(()).map_err(|error| {
+        StoreError::Internal(format!(
+            "memory encoded read metadata reserve failed: {error}"
+        ))
+    })?;
+    Ok(prepared.batch)
 }
 
 #[cfg(test)]

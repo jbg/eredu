@@ -867,6 +867,14 @@ allocation is sized from the input occurrence count, including duplicates; names
 and metadata are cloned only when the ordinary owning lookup requests them.
 Borrowed lookup supports finite inference over the same retained entries. The
 catalog supplies no source authority, persistent inference cache or reservation.
+Memory-backed encoded reads inspect their actual immutable store and ordered
+keys before constructing metadata records and source spans. Ordinary reads and
+the runtime-admitted constructor share that worker. Runtime compares the original
+constructor contribution with the cold pool before allocation; completed batches
+and failed reserve prefixes retain its custody after all metadata and source
+handles. The move-only result reads into caller-owned storage without staging or
+read scratch. Existing source payloads and keys retain separate admission; this
+constructor does not establish file-header, recipe-compiler or whole-model fit.
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed
 composition controls have their own source account; each native child keeps its

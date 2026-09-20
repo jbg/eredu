@@ -5,6 +5,9 @@ use std::{
     mem::{size_of, size_of_val},
 };
 
+mod memory_read;
+pub use memory_read::MemoryEncodedReadInitializer;
+
 /// Closed raw accounting custody for a shared native constructor. The producer
 /// retains it through its actual object and queued-control retirement. No public
 /// clone, amount constructor, request authority or physical publication proof.
