@@ -61,7 +61,7 @@ impl super::preparation::PreparedQuantization {
     ) -> Result<ConvertedQuantization, Error> {
         let source = self.source.clone();
         let (store, plan) = self.materialize_with_plan(conversion_stream)?;
-        Ok(ConvertedQuantization::new(source, plan, store))
+        Ok(ConvertedQuantization::new(source, plan, store, None))
     }
 
     fn materialize_with_plan(

@@ -976,6 +976,8 @@ pub enum DerivedWeightRecipe {
     },
 }
 
+mod input_size;
+
 /// Borrowed visits of actual recipe source occurrences, preserving order and
 /// repetitions. Join events describe topology; callers own their storage policy.
 /// No source authorization, acquisition, backend behavior or fit is implied.

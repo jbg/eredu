@@ -1168,8 +1168,20 @@ ordinary read callback. Missing entries and catalog mismatches preserve ordered
 occurrence diagnostics; unqualified custom sources remain unsupported by this
 closed constructor.
 
-Cold declarations, candidate recipes, overlay/result storage and the enclosing
-prepared-manager handoff remain separate admission responsibilities.
+The CPU encoded conversion initializer borrows the source and transform plan
+until host metadata admission succeeds. Its configurable estimate uses concrete
+catalog names, materialization provenance, recipe declarations and selected
+borrowed metadata; it does not open lazy headers or read tensor payloads while
+sizing. Shared catalog branches may contribute repeatedly to this conservative
+input measure. The estimate covers cold clones, collision/inference scratch,
+conversion provenance and retained plan/root overhead. Output-buffer publication
+metadata is reserved separately with each buffer. These are planning estimates,
+not retained-byte measurements or process memory ceilings.
+The initializer runs the common cold and tile workers. Its completed handoff and
+materialized source share metadata custody, including surviving opaque identities;
+failure diagnostics retain the initializer account. Native resources, tile work,
+original source/header birth and model-manager construction retain their own
+admission requirements.
 
 A CPU tile resource owner composes the admitted process allocator and scheduler
 with two distinct registered source streams and their admitted workers. Fixed

@@ -588,6 +588,7 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
     assert!(resources.validate_pool(&foreign).is_err());
     assert_eq!(foreign.used_bytes().unwrap(), 0);
     assert_eq!(pool.used_bytes().unwrap(), persistent);
+    check_cold_metadata_refusals(&pool, &resources, persistent);
     assert_ne!(
         resources.streams()[0].get_index().unwrap(),
         resources.streams()[1].get_index().unwrap()
@@ -629,22 +630,30 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                     ],
                 )
                 .unwrap();
-                let prepared = ColdQuantization::prepare(source.into(), plan)
-                    .unwrap()
-                    .allocate_original(
-                        &pool,
-                        eredu_runtime::working_memory::DependencyMemoryPolicy::default(),
-                        resources.streams()[0],
-                    )
-                    .unwrap();
-                let with_outputs = pool.used_bytes().unwrap();
-                assert!(with_outputs > persistent);
-                // Source birth, recipe and overlay metadata remain fixture prerequisites.
-                // Runtime, workers, compiled reads, native tiles, queue/cleanup and final
-                // memory-tensor buffers use their admitted constructors here.
-                let (result, _) = prepared.materialize_cpu_encoded(&pool, &resources).unwrap();
-                assert_eq!(result.report().source_tiles, 8);
-                assert_eq!(result.report().peak_in_flight_tiles, expected_slots);
+                let source = source.into();
+                let metadata_policy = eredu_runtime::working_memory::DependencyMemoryPolicy::default();
+                let conversion = admission::ColdConversion {
+                    source: &source, plan: &plan, pool: &pool, resources: &resources, metadata_policy,
+                };
+                let metadata_bytes = WorkingMemoryPool::shared_native_initialization_required_bytes(&conversion).unwrap();
+                let companion_bytes = 16 * plan.targets()[0].affine_companion_bytes();
+                let output_bytes: u64 = [
+                    ("weight", [8, 8], 256),
+                    ("scales", [8, 2], companion_bytes),
+                    ("biases", [8, 2], companion_bytes),
+                ].into_iter().map(|(name, shape, bytes)| {
+                    WorkingMemoryPool::memory_tensor_buffer_quote(name, &shape, bytes, metadata_policy)
+                        .unwrap().total_bytes()
+                }).sum();
+                let with_outputs = persistent + metadata_bytes + output_bytes;
+                // Original source/header birth remains a fixture prerequisite.
+                // The initializer admits cold clones, inference/provenance metadata,
+                // conversion and the completed handoff through the common worker.
+                let result = conversion.prepare().unwrap();
+                result.validate(&source, &plan).unwrap();
+                let (source, report) = result.into_parts();
+                assert_eq!(report.source_tiles, 8);
+                assert_eq!(report.peak_in_flight_tiles, expected_slots);
                 let expected_words = (0..64)
                     .flat_map(|n| {
                         (if n % 2 == 0 {
@@ -655,15 +664,15 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                         .to_le_bytes()
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(bytes(result.source(), "weight"), expected_words);
+                assert_eq!(bytes(source.as_ref(), "weight"), expected_words);
                 assert_eq!(
-                    bytes(result.source(), "scales"),
+                    bytes(source.as_ref(), "scales"),
                     (0..16)
                         .flat_map(|_| encode(companion_dtype, -1.0))
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
-                    bytes(result.source(), "biases"),
+                    bytes(source.as_ref(), "biases"),
                     (0..16)
                         .flat_map(|_| encode(companion_dtype, 15.0))
                         .collect::<Vec<_>>()
@@ -673,8 +682,7 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                     pool.used_bytes() == Ok(with_outputs)
                 });
                 assert_eq!(pool.used_bytes().unwrap(), with_outputs);
-                let (source, _) = result.into_parts();
-                let source = eredu_checkpoint::store::RetainedCheckpointSource::from_materialized(source);
+                let identity = source.identity();
                 let catalog = source.source_keys().into_iter().map(|key| {
                     let row = eredu_checkpoint::store::PreparedTensorSource {
                         metadata: source.source_metadata(&key).unwrap(),
@@ -688,7 +696,13 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
                 let keys = [String::from("weight")];
                 let read = eredu_checkpoint::store::MemoryEncodedReadPlan::from_source(&source, &keys)
                     .unwrap().unwrap().construct(()).unwrap();
+                let selected_output_bytes = WorkingMemoryPool::memory_tensor_buffer_quote(
+                    "weight", &[8, 8], 256, metadata_policy,
+                ).unwrap().total_bytes();
                 drop(source);
+                assert_eq!(pool.used_bytes().unwrap(), persistent + metadata_bytes + selected_output_bytes);
+                drop(identity);
+                assert_eq!(pool.used_bytes().unwrap(), persistent + selected_output_bytes);
                 let mut output = vec![0; expected_words.len()];
                 read.read_into(&mut output).unwrap();
                 assert_eq!(output, expected_words);
@@ -706,6 +720,53 @@ fn admitted_cpu_resources_drive_tiles_without_ordinary_runtime_setup() {
     assert_eq!(pool.used_bytes().unwrap(), persistent - controls);
     assert!(pool.used_bytes().unwrap() > baseline);
     println!("ADMITTED_CPU_TILES_OK");
+}
+
+fn check_cold_metadata_refusals(
+    pool: &WorkingMemoryPool,
+    resources: &cpu_resources::CpuTileResources,
+    persistent: u64,
+) {
+    use eredu_runtime::working_memory::{DependencyMemoryPolicy, SharedNativeInitializer};
+    let source = Arc::new(MemoryWeightStore::from_safetensors([
+        ("weight".into(), SafeDtype::F32, vec![1, 32], vec![0; 128]),
+        ("scales".into(), SafeDtype::U8, vec![1], vec![7]),
+    ]).unwrap()).into();
+    let plan = BoundedQuantizationPlan::new(
+        AffineQuantization::new(32, 4).unwrap(), 320,
+        [BoundedQuantizationTarget::direct("weight", "scales", Some("biases")).unwrap()],
+    ).unwrap();
+    let metadata_policy = DependencyMemoryPolicy::default();
+    let conversion = || admission::ColdConversion { source: &source, plan: &plan, pool, resources, metadata_policy };
+    let required = WorkingMemoryPool::shared_native_initialization_required_bytes(&conversion()).unwrap();
+    let short = WorkingMemoryPool::new(required - 1, 0).unwrap();
+    let refusal = admission::ColdConversion { pool: &short, ..conversion() }.prepare().unwrap_err();
+    assert!(matches!(refusal.accounting_failure(), Some(WorkingMemoryError::BudgetExceeded { .. })));
+    assert!(refusal.constructor_failure().is_none());
+    assert_eq!(short.used_bytes().unwrap(), 0);
+    drop(refusal);
+
+    let overflow = admission::ColdConversion {
+        metadata_policy: DependencyMemoryPolicy { fixed_bytes: usize::MAX, bytes_per_input_byte: 1 },
+        ..conversion()
+    }.prepare().unwrap_err();
+    assert!(matches!(overflow.accounting_failure(), Some(WorkingMemoryError::Overflow)));
+    assert_eq!(pool.used_bytes().unwrap(), persistent);
+    drop(overflow);
+
+    let enlarged = admission::ColdConversion {
+        metadata_policy: DependencyMemoryPolicy { fixed_bytes: metadata_policy.fixed_bytes + 123, ..metadata_policy },
+        ..conversion()
+    };
+    assert_eq!(enlarged.required_storage_bytes().unwrap() - conversion().required_storage_bytes().unwrap(), 123);
+    // Known metadata permits admission, then ordinary cold collision checking
+    // fails. Its formatted cause keeps the original account until error drop.
+    let failure = conversion().prepare().unwrap_err();
+    assert!(matches!(failure.constructor_failure(), Some(admission::ConstructionError::Preparation(Error::Quantization(_)))));
+    assert_eq!(pool.used_bytes().unwrap(), persistent + required);
+    assert_eq!(source.source_diagnostics().unwrap().physical_reads, 0);
+    drop(failure);
+    assert_eq!(pool.used_bytes().unwrap(), persistent);
 }
 
 #[test]

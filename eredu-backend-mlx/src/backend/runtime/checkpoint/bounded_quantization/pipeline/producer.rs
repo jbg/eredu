@@ -89,6 +89,7 @@ impl TileProducer for OrdinaryTileProducer {
 mod cpu_resources;
 mod encoded_affine;
 mod metadata;
+mod admission;
 
 #[cfg(test)]
 mod tests;

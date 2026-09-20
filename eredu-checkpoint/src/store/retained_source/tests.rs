@@ -118,11 +118,6 @@ fn materialized_routes_and_identities_retain_custody_without_pinning_detached_re
         vec![3, 17, 91],
     )])
     .unwrap();
-    let request = RetainedCheckpointSource::materialized_storage_request::<Custody>().unwrap();
-    assert_eq!(
-        request.source_body(),
-        Layout::new::<MaterializedCheckpointSource>()
-    );
     let root = RetainedCheckpointSource::from_materialized_with_custody(
         MaterializedCheckpointSource::new(source, transformed, BTreeSet::new(), BTreeSet::new()),
         Custody {

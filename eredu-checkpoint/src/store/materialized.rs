@@ -14,6 +14,18 @@ pub struct MaterializedCheckpointSource {
     materialized_source_shards: BTreeSet<PathBuf>,
 }
 impl MaterializedCheckpointSource {
+    pub(super) fn materialization_input_bytes(&self) -> Option<usize> {
+        let mut bytes = self.source.materialization_input_bytes()?
+            .checked_add(self.transformed.materialization_input_bytes()?)?;
+        for key in &self.materialized_source_keys {
+            bytes = bytes.checked_add(std::mem::size_of::<String>())?.checked_add(key.len())?;
+        }
+        for path in &self.materialized_source_shards {
+            bytes = bytes.checked_add(std::mem::size_of::<PathBuf>())?
+                .checked_add(path.as_os_str().as_encoded_bytes().len())?;
+        }
+        Some(bytes)
+    }
     /// Publish completed tensors without copying payloads. Input keys and shards
     /// record the original tensors consumed by the materialization plan.
     pub fn new(

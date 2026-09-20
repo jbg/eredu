@@ -57,8 +57,11 @@ pub trait SharedNativeInitializer: Sized {
     type Output;
     /// Fixed cause and every unretired constructor prefix.
     type Error: std::error::Error;
-    /// Complete dynamic producer storage/controls. Fixed static storage already
-    /// charged by the domain is excluded. Unknown qualification must refuse.
+    /// Producer storage and controls, excluding fixed storage already charged
+    /// by the domain. Native resources and fixed buffers require their actual
+    /// qualified contribution; dependency host overhead may use an explicitly
+    /// documented configurable input-derived estimate. Neither an estimate nor
+    /// this constructor qualifies preexisting source/native owners.
     fn required_storage_bytes(&self) -> Result<usize, WorkingMemoryError>;
     /// Exactly one constructor attempt. No fallback, polling or second grant.
     fn initialize(

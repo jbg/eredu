@@ -70,6 +70,13 @@ impl AsRef<dyn CheckpointSource> for RetainedCheckpointSource {
     }
 }
 impl RetainedCheckpointSource {
+    /// Borrowed catalog/provenance input size for materialization metadata
+    /// estimates. This counts declarations, including repeated shared branches,
+    /// without cloning names, preparing headers or touching payloads. It is not
+    /// retained storage or admission authority. Unknown concrete routes refuse.
+    pub fn materialization_input_bytes(&self) -> Option<usize> {
+        super::acquisition::retained_route::input::bytes(self)
+    }
     /// Moves a completed overlay into the same closed source ownership used by
     /// prepared acquisition. Payload reservations stay with the memory tensors.
     pub fn from_materialized(source: super::MaterializedCheckpointSource) -> Self {
@@ -85,11 +92,6 @@ impl RetainedCheckpointSource {
         Self(Owner::Materialized(SourceHandle::new(
             source, Some(SourceControl::new(custody)),
         )))
-    }
-    /// Source allocation and custody controls, excluding dynamic catalogs and
-    /// tensor payloads, which retain their independent admission requirements.
-    pub fn materialized_storage_request<C>() -> Option<SourceErasureStorageRequest> {
-        request::<super::MaterializedCheckpointSource, C>()
     }
     /// Ordinary typed SafeTensors ownership, without constructor custody.
     pub fn from_safetensors(source: SafetensorsWeightStore) -> Self {

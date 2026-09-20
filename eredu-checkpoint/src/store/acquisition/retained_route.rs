@@ -3,6 +3,8 @@ use super::*;
 use crate::store::storage::SourceHandle;
 use std::alloc::Layout;
 
+pub(in crate::store) mod input;
+
 /// Opaque owning route loan. The actual root and every selected child must
 /// return its own built-in owner. Forwarding another owner's loan is rejected.
 pub struct PreparedAcquisitionOwner(Owner);

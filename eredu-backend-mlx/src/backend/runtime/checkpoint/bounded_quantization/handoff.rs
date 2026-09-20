@@ -1,15 +1,19 @@
 //! Completed conversion with its actual source and retained transform plan.
 use super::*;
 use eredu_checkpoint::store::RetainedCheckpointSource;
+use eredu_runtime::working_memory::SharedNativeInitializationCustody;
 
 /// A move-only handoff of one completed overlay. Borrowers share its actual
 /// source identity; validation does not construct or convert another store.
 /// This retains existing custody and grants no new allocation authority.
+#[derive(Debug)]
 pub(crate) struct ConvertedQuantization {
     source: RetainedCheckpointSource,
     plan: BoundedQuantizationPlan,
     store: RetainedCheckpointSource,
     report: WeightMaterializationReport,
+    // The retained plan and the source root can retire independently.
+    _metadata: Option<Arc<SharedNativeInitializationCustody>>,
 }
 
 impl ConvertedQuantization {
@@ -17,13 +21,21 @@ impl ConvertedQuantization {
         source: RetainedCheckpointSource,
         plan: BoundedQuantizationPlan,
         store: QuantizedCheckpoint,
+        metadata: Option<Arc<SharedNativeInitializationCustody>>,
     ) -> Self {
         let (store, report) = store.into_parts();
+        let store = match &metadata {
+            Some(custody) => RetainedCheckpointSource::from_materialized_with_custody(
+                store, Arc::clone(custody),
+            ),
+            None => RetainedCheckpointSource::from_materialized(store),
+        };
         Self {
             source,
             plan,
-            store: RetainedCheckpointSource::from_materialized(store),
+            store,
             report,
+            _metadata: metadata,
         }
     }
 
