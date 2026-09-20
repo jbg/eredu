@@ -106,6 +106,9 @@ and source selection also precede target/draft resource materialization.
 Prepared configuration loans project the typed configuration from the retained
 artifact and verify its identity. Execution eligibility belongs to cold selection;
 borrowing a selected routed configuration does not require dense-model eligibility.
+Composite workspace inspection uses the same input validation as execution.
+Contexts that enforce a metadata allowance require the counted constructor;
+ordinary diagnostic contexts use ordinary admission and confer no funded authority.
 
 Prepared layerwise loading keeps one move-only manager in the shared binding
 slot. The selected dense, routed or composite partition route, including

@@ -411,17 +411,17 @@ fn observed_configured_and_populated_sampling_index_after_full_sequence_without_
         assert_eq!(format!("{sampler:?}"), before);
         assert_eq!(sampler.history_len(), 5);
         assert_eq!(sampler.history_capacity(), 8);
-        assert!(facts.operations.lock().unwrap().iter().any(|op| matches!(
+        let operations = facts.operations.lock().unwrap();
+        assert!(operations.iter().any(|op| matches!(
             &op.kind,
-            WorkspaceOperationKind::Index { selected_axes: 1 }
-        ) && op
-            .inputs
-            .first()
-            .is_some_and(|value| value.shape() == [1, 5, 17])
-            && op
-                .outputs
-                .first()
-                .is_some_and(|value| value.shape() == [1, 17])));
+            WorkspaceOperationKind::StaticSlice { starts, ends, strides }
+                if starts == &[0, 4, 0] && ends == &[1, 5, 17] && strides == &[1, 1, 1]
+        ) && op.inputs.first().is_some_and(|value| value.shape() == [1, 5, 17])
+            && op.outputs.first().is_some_and(|value| value.shape() == [1, 1, 17])));
+        assert!(operations.iter().any(|op| matches!(
+            &op.kind, WorkspaceOperationKind::View("squeeze")
+        ) && op.inputs.first().is_some_and(|value| value.shape() == [1, 1, 17])
+            && op.outputs.first().is_some_and(|value| value.shape() == [1, 17])));
     }
 }
 

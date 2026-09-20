@@ -141,9 +141,14 @@ impl EquationVisitor<'_, '_, '_> {
             let input = PreparedModelInput::new_with_metadata(parts, self.context, |tensor| {
                 TextInspector::identity_with_metadata(tensor, self.context)
             })?;
-            let admitted = A::admit_prepared_input_with_metadata(
-                &admission, &input, &TextInspector, self.context,
-            )?;
+            let admitted = if self.context.uses_checked_metadata() {
+                A::admit_prepared_input_with_metadata(
+                    &admission, &input, &TextInspector, self.context,
+                )?
+            } else {
+                A::admit_prepared_input(&admission, &input, &TextInspector)
+                    .map_err(|cause| self.context.metadata_source(cause))?
+            };
             let input = PreparedCompositeInput::new_with_diagnostic(&input, &admitted, |message| {
                 self.context.metadata_error(format_args!("{message}"))
             })?;
