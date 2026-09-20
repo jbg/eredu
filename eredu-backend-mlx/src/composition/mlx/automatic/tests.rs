@@ -1,6 +1,9 @@
 use super::*;
 use eredu_core::BackendProvider as _;
 
+#[cfg(all(feature = "metal", target_vendor = "apple", not(feature = "cuda")))]
+mod loading;
+
 #[test]
 fn plan_normalization_is_identical_through_native_and_foreign_adapters() {
     let plan = ExecutionPlan::fully_resident(DevicePlan::new("mlx", "cpu:0").unwrap())

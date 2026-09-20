@@ -80,6 +80,7 @@ fn gpu_stream_birth_preserves_short_source_and_factory_accounts_execute_nonzero(
             assert_eq!(short.used_bytes().unwrap(), 0);
             drop(public);
 
+            super::super::router::prepare_before_native_construction();
             let before = pool.used_bytes().unwrap();
             let streams = PreparedExecutionStreams::for_factory(&pool)
                 .unwrap()

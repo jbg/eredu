@@ -193,10 +193,10 @@ fn loaded_aliases(v4: bool) {
     assert!(runtime.session().payload.model.has_published_idle_storage());
     let inventory = runtime.session().payload.retained_idle_storage().unwrap();
     assert_eq!(inventory.decoder_state_bytes().unwrap(), Some(0));
-    assert_eq!(
-        pool.used_bytes().unwrap(),
-        inventory.nonstate_bytes().unwrap().unwrap()
-    );
+    // Loading also retains input-derived source-metadata reservations. The
+    // physical inventory is a lower bound on that combined charge; the exact
+    // helper-only charge and complete source retirement are checked below.
+    assert!(pool.used_bytes().unwrap() >= inventory.nonstate_bytes().unwrap().unwrap());
     drop(inventory);
     let aliases = helpers.clone();
     let helper_bytes: u64 = helper_facts.values().sum();

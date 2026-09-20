@@ -142,7 +142,9 @@ fn complete_fresh_session_publishes_exact_storage_and_releases_loading_authority
     let bytes = idle.nonstate_bytes().unwrap().unwrap();
     assert!(bytes > 0);
     assert!(idle.has_empty_decoder_storage().unwrap());
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    // The pool also retains source-metadata estimates beyond physical storage.
+    let charged = pool.used_bytes().unwrap();
+    assert!(charged >= bytes);
     let frontier = runtime.session().payload.model.erased().state_snapshot();
     assert!(frontier.iter().all(|(position, _)| *position == 0));
     let before = paths::snapshot();
@@ -151,19 +153,29 @@ fn complete_fresh_session_publishes_exact_storage_and_releases_loading_authority
         .publish_initial_idle_storage()
         .unwrap());
     assert_eq!(paths::snapshot(), before);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.used_bytes().unwrap(), charged);
     assert_eq!(
         runtime.session().payload.model.erased().state_snapshot(),
         frontier
     );
+    assert!(matches!(
+        pool.reserve_with_capacity(
+            &InferenceExecutionIdentity::default(),
+            &zero_admission(),
+            charged - 1,
+        ),
+        Err(WorkingMemoryError::CapacityBelowUsage { capacity_bytes, used_bytes })
+            if capacity_bytes == charged - 1 && used_bytes == charged
+    ));
+    assert_eq!(pool.used_bytes().unwrap(), charged);
     let reservation = pool
         .reserve_with_capacity(
             &InferenceExecutionIdentity::default(),
             &zero_admission(),
-            bytes,
+            charged,
         )
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.used_bytes().unwrap(), charged);
     drop((reservation, idle, runtime));
     fully_retired(&stream, &pool);
 }
@@ -178,14 +190,15 @@ fn preexisting_model_owner_clone_remains_excluding_after_local_publication() {
     let idle = runtime.session().payload.retained_idle_storage().unwrap();
     let bytes = idle.nonstate_bytes().unwrap().unwrap();
     assert!(bytes > 0);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    let charged = pool.used_bytes().unwrap();
+    assert!(charged >= bytes);
     assert_excluded(&pool);
     drop(escaped_loading_owner);
     settle(&stream, &pool, 0);
     let reservation = pool
         .reserve(&InferenceExecutionIdentity::default(), &zero_admission())
         .unwrap();
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    assert_eq!(pool.used_bytes().unwrap(), charged);
     drop((reservation, idle, runtime));
     fully_retired(&stream, &pool);
 }

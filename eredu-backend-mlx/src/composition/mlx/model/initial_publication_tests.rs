@@ -67,7 +67,8 @@ fn contended_initial_publication_keeps_actual_loading_owner_and_source_storage()
         pool.unquoted_owner_count().unwrap() == 0
     });
     assert_eq!(pool.unquoted_owner_count().unwrap(), 0);
-    assert_eq!(pool.used_bytes().unwrap(), bytes);
+    // Source-metadata estimates remain charged in addition to physical storage.
+    assert!(pool.used_bytes().unwrap() >= bytes);
     drop((before, after, executable));
     crate::backend::ordinary_retirement::reclaim_all();
     safemlx::reclaim_allocation_owners();
