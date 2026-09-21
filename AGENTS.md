@@ -23,11 +23,8 @@ are applied when building the published crate, without downstream Cargo
 overrides. This exception does not permit patching Rust dependencies.
 
 Use the public APIs of unmodified upstream Rust releases available through crates.io.
-Host-memory policy may reserve input-derived estimates with configurable headroom
-for dependency internals. Label those estimates explicitly; they are not an
-enforceable dependency-wide or process-wide ceiling. Preserve input, cache and
-concurrency limits, reservation lifetimes, and admission for the model, native
-resources and fixed buffers that Eredu controls.
+Missing allocation visibility in those APIs requires an explicit estimate or an
+identified unknown contribution under the memory contract below.
 Local path dependencies between Eredu crates are permitted for workspace
 development only when their versioned dependencies also support publication and
 consumption through crates.io. A successful build inside this workspace is not
@@ -38,6 +35,61 @@ explain the limitation and discuss the architectural tradeoff with the user
 before proceeding. Requirements such as memory accounting or bounded execution
 do not authorize dependency patching. Preserve third-party licenses and provenance
 for any redistributed source.
+
+## Memory contract
+
+Memory requirements distinguish three facts:
+
+- **Accounted allocations:** allocation capacities and lifetimes Eredu controls.
+- **Estimated overhead:** a finite estimated range with its source and estimation
+  basis identified. The upper estimate determines the reserved allowance.
+- **Unknown overhead:** a range of zero to infinity, with its source and the
+  reason no finite estimate is available identified. It must never be reported
+  as zero bytes or omitted from the report.
+
+A configured budget constrains accounted allocations, allowances for finite
+estimates, and separately configured additional headroom. These amounts fitting
+does not establish an enforceable dependency-wide or process-memory ceiling.
+Headroom cannot make unknown overhead finite. Arithmetic overflow and malformed
+declarations remain errors; do not use saturation or an unknown value to hide them.
+
+The runtime policy contract is inherited from the execution context. Applications
+choose their policy without feature flags, alternate builds, or a separate
+execution implementation:
+
+- `AllowUnknownOverhead` is the default. Permit accounted allocations and estimated
+  allowances when they fit, preserve unknown overhead in the report, and emit
+  source-labelled warnings when proceeding with it.
+- `RequireFiniteEstimates` rejects an operation with a required contribution that
+  has no finite estimate. Finite estimates remain estimates, not guaranteed bounds.
+
+Warning delivery is transport-neutral. Reports retain unknown contributions
+regardless of whether the operation is permitted or rejected. A pure policy result
+does not reserve capacity, authenticate a source, or grant execution authority.
+Diagnostic source labels never substitute for storage identities or justify
+deduplicating charges. Contributions must reflect the actual reservation scope,
+shared allocation identities, and simultaneous lifetimes.
+
+Both policies preserve input, cache and concurrency limits, reservation lifetimes,
+source custody, and admission for model storage, native resources and fixed buffers
+Eredu controls. Budget exhaustion, invalid identities, unsupported execution
+mechanisms and unsafe completion states remain errors under both policies. Missing
+ownership or execution evidence is not merely unknown overhead. Controlled and
+uninterrupted execution use the same policy and admission mechanisms.
+
+`eredu-core` owns the neutral contribution types, checked arithmetic, pure policy
+comparison, warning descriptions and typed failures. `eredu-runtime` owns context
+policy propagation, requirement composition, atomic reservation, report custody
+and warning delivery. Backends provide native facts, estimates and identified
+unknown native overhead, and retain native ownership and completion safety. The
+facade and applications select policy and present diagnostics through shared
+orchestration.
+
+The neutral evaluator is independent of inference admission. Current inference
+admission uses `WorkspaceBound`, completeness requirements and unquoted-owner
+exclusion; execution contexts do not apply `MemoryOverheadPolicy`. The
+[architecture guide](doc/backend-architecture.md#memory-contract) describes this
+implementation boundary.
 
 ## Documentation and naming
 

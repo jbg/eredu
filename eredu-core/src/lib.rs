@@ -53,6 +53,8 @@ pub mod inspection;
 pub mod intervention;
 /// Portable decoded-media requests and backend preparation inputs.
 pub mod media;
+/// Accounted allocations, overhead estimates, and pure memory-policy evaluation.
+pub mod memory;
 /// Portable, explicitly requested execution observations.
 pub mod observation;
 /// Backend-generic realtime token-session execution and scheduling.
@@ -153,6 +155,11 @@ pub use capability::{
     check_admission_context_borrowed,
 };
 pub use capability::{ExecutionWorkspaceEstimate, WorkspaceBound};
+pub use memory::{
+    evaluate_memory_requirements, FiniteMemoryEstimate, MemoryContractError, MemoryContribution,
+    MemoryOverheadPolicy, MemoryPolicyDecision, MemoryPolicyEvaluation, MemoryRequirementReport,
+    UnknownMemoryOverhead,
+};
 pub use execution::{
     BackendId, DEFAULT_MAX_CACHED_SHARDS, DevicePlan, DraftPlacementPlan, DraftingPlan,
     EXECUTION_PLAN_SCHEMA_VERSION, ExecutionPlan, ExecutionPlanError, ExpertCachePlan,

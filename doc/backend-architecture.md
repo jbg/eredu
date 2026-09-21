@@ -15,7 +15,9 @@ modified vendored dependencies and private forks are prohibited by the
 Native MLX patches are the explicit exception: Eredu controls their application
 through the `safemlx-sys` native build, including when building the published crate.
 Downstream consumers must not need an Eredu checkout or dependency overrides.
-Rust dependency admission uses public APIs and configurable host-overhead estimates.
+Rust dependency admission uses public APIs. The [memory contract](#memory-contract)
+requires explicit estimates or identified unknown overhead for internal allocations
+whose sizes those APIs do not expose.
 Archive verification and fresh consumers exercise the packaged first-party chain;
 staging registry configuration stays outside the product manifests.
 
@@ -73,7 +75,7 @@ remain confined to the published `safemlx-sys` build.
 | `eredu-gguf` | Framework-independent GGUF reading/writing, exact canonical tensor encodings, validation and bounded conversion. |
 | `eredu-checkpoint` | Backend-neutral schemas, layout recipes, exact prepared source stores, restricted views, leases, provenance, cache policy and resolution guards. |
 | `eredu-text` | Tokenizer/template utilities, protocol parsing and shared text transformations without backend resources. |
-| `eredu-core` | Portable model/session contracts, exact admission comparison, move-only submission authority, generation semantics, discovery, bounded observation and host-metadata funding errors. |
+| `eredu-core` | Portable model/session contracts, exact admission comparison, neutral memory contributions and pure policy evaluation, move-only submission authority, generation semantics, discovery, bounded observation and host-metadata funding errors. |
 | `eredu-nn` | Neutral tensor/parameter/operator contracts and symbolic workspace mechanisms. It may use core's funding errors; core does not depend on NN workspace policy. |
 | `eredu-runtime` | Plan normalization, load/residency policy, capability synthesis, shared execution/lifecycle drivers, sampling, scheduling, resource admission and observation delivery. |
 | `eredu-architectures` | Family configuration, checkpoint naming/schema/topology, module construction, state geometry, semantic parallel plans, processors, selected execution and layer/embedding/output equations. |
@@ -88,6 +90,79 @@ conversion preserves the original typed cause. Backend implementation traits may
 retain their concrete errors internally. Public types have one owning crate;
 the facade does not reproduce backend module trees or dependency-owned aliases.
 Native factories select the implementation for the generic facade.
+
+## Memory contract
+
+`eredu_core::memory` provides borrowed memory contributions, checked aggregation,
+pure policy evaluation and source-labelled warning records. The declaration for
+one reservation scope separates:
+
+| Contribution | Meaning | Budget charge |
+| --- | --- | --- |
+| Accounted | Allocation capacity and lifetime Eredu controls. | Declared accounted bytes. |
+| Estimated | Finite inclusive estimated range with an identified source and basis. Neither endpoint is a guaranteed bound. | Upper estimated endpoint. |
+| Unknown | Range `[0, ∞)` with an identified source and reason no finite estimate is available. | No fabricated finite amount; apply the unknown-overhead policy. |
+
+`FiniteMemoryEstimate` validates ordered `u64` endpoints. A point estimate and an
+explicit zero estimate remain estimates. `MemoryContribution` distinguishes them
+from accounted capacity and unknown overhead. `MemoryRequirementReport` retains
+every contribution in input order and separately exposes accounted bytes, the sum
+of finite estimated ranges, their upper-endpoint allowance, additional headroom,
+the budget charge and all unknown sources.
+
+The charge is the sum of accounted bytes, finite estimate allowances and additional
+headroom. It is not total process memory. A configured budget constrains that
+charge; fitting it does not establish a dependency-wide or process-memory ceiling.
+Unknown overhead remains `[0, ∞)` even when the finite charge is zero or headroom
+is large. Neither allocator telemetry nor a reserve converts an estimate into an
+enforceable allocation bound.
+
+`evaluate_memory_requirements` checks descriptions and all finite sums before
+making a policy decision. Overflow and malformed declarations are errors under
+both policies. A charge above the supplied budget produces `BudgetExceeded`,
+including when unknown entries are present. Equality fits. An absent budget skips
+only that comparison; it does not disable the selected overhead policy.
+
+| `MemoryOverheadPolicy` | Behavior when finite charges fit |
+| --- | --- |
+| `AllowUnknownOverhead` (default) | Return `Permitted`, preserve unknown contributions, and expose a warning for each unknown source. |
+| `RequireFiniteEstimates` | Return `FiniteEstimateRequired` if any required contribution is unknown. Finite estimates remain estimates. |
+
+Every well-formed evaluation retains its report, including rejected evaluations.
+The `warnings()` iterator contains one `UnknownMemoryOverhead` record per unknown
+contribution only when the evaluation permits proceeding. Consumers must emit
+those warnings when proceeding; the contract chooses no logging, stderr or callback
+transport. Unknown entries remain available from the report independently of
+warning delivery or rejection.
+
+The evaluator allocates no report storage and borrows its descriptions. A runtime
+retaining a report must supply the corresponding funded owner. Diagnostic source
+labels are not authenticated storage identities. Repeated labels neither deduplicate
+charges nor merge warnings. Callers establish disjoint contributions for the actual
+reservation scope; shared-allocation credit and lifetime overlap remain matters
+for identity validation, planning and reservation. `Permitted` reserves no capacity
+and grants no submission authority.
+
+The architecture contract places checked arithmetic, contribution types, policy
+comparison, warning descriptions and typed failures in core. Runtime owns context
+policy propagation, contribution composition, atomic reservation, report custody
+and diagnostic delivery. Backends supply native facts, estimates and identified
+unknown overhead while retaining native resource ownership and completion safety.
+Applications select policy and present diagnostics through facade orchestration.
+Policy is inherited from the execution context and shared by controlled and
+uninterrupted execution; it must not select a feature flag, alternate parser or
+inference engine. Both choices preserve input/cache/concurrency limits, reservation
+lifetimes and source custody. Budget exhaustion, invalid identities, unsupported
+mechanisms and unsafe completion states remain errors under both choices.
+
+The pure evaluator is independent of current inference admission. Execution
+contexts do not apply `MemoryOverheadPolicy`; inference uses `WorkspaceBound`,
+completeness requirements and the working-memory pool's unquoted-owner exclusion.
+`DependencyMemoryPolicy` supplies scalar host estimates to its existing reservation
+mechanisms. These producers and reports do not use the three contribution variants,
+and the runtime does not deliver the evaluator's warnings. `UnknownBound` also
+appears in ownership and identity validation: accepting overhead uncertainty must
+not bypass those failures.
 
 ## Loading and session creation
 
@@ -442,10 +517,11 @@ The public validation record retains their exact artifact and commands.
 
 ## Bounded inference ownership
 
-A memory ceiling configures admission over shared mechanisms. It must not select
-another parser or inference engine, adopt preexisting unpriced output, replace an
-unknown bound with a multiplier, or retry without enforcement. Arbitrary external
-callbacks need an explicit bounded contract.
+A memory budget configures admission over shared mechanisms. It must not adopt
+preexisting unpriced output or retry without enforcement. Accounted capacity,
+estimated allowances and unknown overhead have the distinct meanings specified by
+the [memory contract](#memory-contract). Arbitrary external callbacks need an
+explicit resource and ownership contract.
 
 Source compilation, execution workspace, observation quotas, transport credits
 and snapshot retention/cumulative copying are separate resource domains. Plans
@@ -468,8 +544,10 @@ required spans and nonmonotone decode growth remain covered. Quote aliases share
 one immutable funded diagnostic report; mutation of a shared report first pays
 for its independent copy through the existing report worker. Capacity estimates distinguish physical
 backing, native descriptor/graph storage, host preparation and selected residency;
-scalar equality cannot replace source authentication. Unknown required facts
-remain typed refusals before the affected producer.
+scalar equality cannot replace source authentication. Missing identity, ownership,
+geometry or execution evidence remains a typed refusal before the affected
+producer. Current workspace admission also rejects incomplete memory coverage;
+the pure overhead-policy evaluator does not change that admission behavior.
 
 Incremental/residual planning returns the reservation and accepted quote. Admission
 diagnostics are borrowed from that reservation, so a separately returned report
